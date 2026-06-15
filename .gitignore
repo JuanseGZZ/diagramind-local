@@ -1,0 +1,9 @@
+# Binarios y artefactos: se generan por CI y van a GitHub Releases, no al repo.
+descargas/DiagraMind-Local-*
+descargas/*.zip
+diagramind-local.zip
+
+# Artefactos de PyInstaller
+dist/
+build/
+*.spec

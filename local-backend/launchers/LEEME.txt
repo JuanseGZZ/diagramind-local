@@ -1,0 +1,23 @@
+DiagraMind — Backend local (versión script, requiere Python 3)
+================================================================
+
+Esta carpeta contiene el backend local en su forma liviana: el script de
+Python + lanzadores. Necesitás tener Python 3 instalado.
+
+¿No tenés Python? Descargalo gratis: https://www.python.org/downloads/
+(En el instalador de Windows, marcá "Add Python to PATH".)
+
+CÓMO INICIARLO
+--------------
+  Windows : doble clic en  iniciar.bat
+  macOS   : doble clic en  iniciar.command
+            (si dice que no se puede abrir: clic derecho -> Abrir)
+  Linux   : en terminal ->  ./iniciar.command   (o  python3 server.py)
+
+Cuando arranca, vas a ver: "DiagraMind local backend -> http://127.0.0.1:8765".
+Dejá esa ventana abierta y volvé a la web: IA -> Conectar local.
+
+Para detenerlo: cerrá la ventana o apretá Ctrl+C.
+
+¿No querés depender de Python? Usá la versión "Ejecutable (sin Python)" desde
+el mismo botón de descarga en la web.
