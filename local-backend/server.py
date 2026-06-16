@@ -44,7 +44,7 @@ from urllib.parse import urlparse, parse_qs
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.2.2"
+VERSION = "0.3.1"
 
 # Modos del chat (web) → permission-mode de Claude Code.
 PERM_MODE = {
@@ -204,6 +204,9 @@ def run_claude(run, project_dir, message, mode, model, resume):
             cmd, cwd=project_dir,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
+            # Claude Code emite UTF-8; sin esto Windows usa cp1252 y rompe con
+            # acentos/emojis (UnicodeDecodeError) → se muere el worker.
+            encoding="utf-8", errors="replace",
         )
     except Exception as e:
         set_status(run, "error", f"No se pudo lanzar claude: {e}")
@@ -402,6 +405,65 @@ def install_skills(project_dir):
             f.write(content)
 
 
+# ===================== state mirror (watcher) =====================
+# Vigila los tree.json de todos los proyectos por mtime y empuja los cambios por
+# SSE (/state/stream). La web es un espejo en vivo. Cuando la web edita, manda
+# write-through (/state/write) y marcamos el mtime como "ya visto" para no
+# devolverle el eco. Ver doc 19 (Fase 2).
+
+STATE_LOCK = threading.Lock()
+STATE = {}            # pid -> {"mtime": float}   (último mtime visto)
+STATE_LOG = []        # [{seq, id, treeJson, ts}] (cambios para el SSE)
+STATE_SEQ = 0
+STATE_LOG_MAX = 500
+
+
+def _read_tree_file(pid):
+    fp = os.path.join(project_path(pid), "tree.json")
+    if not os.path.exists(fp):
+        return None
+    try:
+        with open(fp, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def _emit_state(pid, content):
+    """Agrega un evento de cambio al log (asume STATE_LOCK tomado)."""
+    global STATE_SEQ
+    STATE_SEQ += 1
+    STATE_LOG.append({"seq": STATE_SEQ, "id": pid, "treeJson": content, "ts": time.time()})
+    if len(STATE_LOG) > STATE_LOG_MAX:
+        del STATE_LOG[: len(STATE_LOG) - STATE_LOG_MAX]
+
+
+def watch_state(interval=0.5):
+    """Thread: detecta cambios de mtime en los tree.json y los emite."""
+    while True:
+        try:
+            pdir = projects_dir()
+            if os.path.isdir(pdir):
+                for name in os.listdir(pdir):
+                    fp = os.path.join(pdir, name, "tree.json")
+                    if not os.path.exists(fp):
+                        continue
+                    try:
+                        mtime = os.path.getmtime(fp)
+                    except OSError:
+                        continue
+                    with STATE_LOCK:
+                        prev = STATE.get(name)
+                        if prev is None or prev["mtime"] != mtime:
+                            content = _read_tree_file(name)
+                            STATE[name] = {"mtime": mtime}
+                            if content is not None:
+                                _emit_state(name, content)
+        except Exception:
+            pass
+        time.sleep(interval)
+
+
 # ===================== HTTP =====================
 
 class Handler(BaseHTTPRequestHandler):
@@ -454,6 +516,10 @@ class Handler(BaseHTTPRequestHandler):
             self._get_tree(q.get("id", [None])[0])
         elif path == "/chat/stream":
             self._stream(q.get("runId", [None])[0])
+        elif path == "/state":
+            self._state_full()
+        elif path == "/state/stream":
+            self._state_stream(q.get("since", [None])[0])
         else:
             self._json(404, {"error": "not found", "path": path})
 
@@ -461,6 +527,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/projects/sync":
             self._sync(self._read_json())
+        elif path == "/state/write":
+            self._state_write(self._read_json())
         elif path == "/chat":
             self._chat(self._read_json())
         elif path == "/chat/cancel":
@@ -497,6 +565,73 @@ class Handler(BaseHTTPRequestHandler):
             return
         with open(fp, "r", encoding="utf-8") as f:
             self._json(200, {"treeJson": f.read()})
+
+    # --- state mirror ---
+    def _state_full(self):
+        """Snapshot completo: todos los proyectos en disco + seq actual."""
+        projects = []
+        pdir = projects_dir()
+        if os.path.isdir(pdir):
+            for name in sorted(os.listdir(pdir)):
+                content = _read_tree_file(name)
+                if content is not None:
+                    projects.append({"id": name, "treeJson": content})
+        with STATE_LOCK:
+            seq = STATE_SEQ
+        self._json(200, {"projects": projects, "seq": seq})
+
+    def _state_stream(self, since):
+        """SSE de larga duración: empuja los cambios de tree.json con seq > since."""
+        try:
+            since = int(since) if since is not None else 0
+        except (TypeError, ValueError):
+            since = 0
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self._cors()
+        self.end_headers()
+
+        last_beat = time.time()
+        try:
+            while True:
+                with STATE_LOCK:
+                    pending = [e for e in STATE_LOG if e["seq"] > since]
+                for ev in pending:
+                    self.wfile.write(f"data: {json.dumps(ev)}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                    since = ev["seq"]
+                if time.time() - last_beat > 15:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    last_beat = time.time()
+                time.sleep(0.2)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _state_write(self, body):
+        """Write-through de la web: escribe tree.json y marca el mtime como ya
+        visto para que el watcher NO devuelva el eco al que lo escribió."""
+        pid = body.get("id")
+        tree_json = body.get("treeJson")
+        if not pid or tree_json is None:
+            self._json(400, {"error": "faltan id o treeJson"})
+            return
+        pdir = project_path(pid)
+        os.makedirs(pdir, exist_ok=True)
+        text = tree_json if isinstance(tree_json, str) else json.dumps(tree_json, ensure_ascii=False, indent=2)
+        fp = os.path.join(pdir, "tree.json")
+        with open(fp, "w", encoding="utf-8") as f:
+            f.write(text)
+        try:
+            mtime = os.path.getmtime(fp)
+            with STATE_LOCK:
+                STATE[os.path.basename(pdir)] = {"mtime": mtime}
+        except OSError:
+            pass
+        self._json(200, {"ok": True})
 
     def _chat(self, body):
         pid = body.get("projectId")
@@ -592,15 +727,27 @@ def main():
                         help=f"puerto (default {DEFAULT_PORT})")
     args = parser.parse_args()
 
+    # En Windows, si stdout es cp1252 (consola/redirección) los print con → o ·
+    # crashean. Forzamos UTF-8 para la salida del propio server.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
     os.makedirs(projects_dir(), exist_ok=True)
     cb = find_claude()
+
+    # watcher del state mirror (poll de mtime → SSE)
+    threading.Thread(target=watch_state, daemon=True).start()
 
     server = ThreadingHTTPServer((HOST, args.port), Handler)
     print(f"DiagraMind local backend v{VERSION} → http://{HOST}:{args.port}")
     print(f"Claude Code: {'OK · ' + (claude_version(cb) or '') if cb else 'NO ENCONTRADO'}")
     print(f"Proyectos en: {projects_dir()}")
     print("Endpoints: GET /health · POST /projects/sync · POST /chat · "
-          "GET /chat/stream · GET /projects/tree · POST /chat/cancel")
+          "GET /chat/stream · GET /projects/tree · POST /chat/cancel · "
+          "GET /state · GET /state/stream · POST /state/write")
     print("Ctrl+C para detener.")
     try:
         server.serve_forever()
