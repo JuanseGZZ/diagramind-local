@@ -44,7 +44,7 @@ from urllib.parse import urlparse, parse_qs
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 # Modos del chat (web) → permission-mode de Claude Code.
 PERM_MODE = {
@@ -60,7 +60,10 @@ SYSTEM_PREAMBLE = (
     "están en las skills del proyecto (diagramind-format y la del tipo de árbol). "
     "Leé esas skills antes de editar. Si tenés que modificar el diagrama, editá "
     "./tree.json IN-PLACE manteniéndolo como JSON válido y respetando el esquema. "
-    "No cambies el id del árbol. Respondé en español."
+    "No cambies el id del árbol. Cuando termines de editar, RELEÉ ./tree.json y "
+    "verificá que es JSON válido y respeta el esquema del tipo (sin campos de más "
+    "ni de menos, ids únicos); si algo está mal, corregilo antes de terminar. "
+    "Respondé en español, breve."
 )
 
 
