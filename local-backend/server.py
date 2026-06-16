@@ -44,7 +44,7 @@ from urllib.parse import urlparse, parse_qs
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 # Modos del chat (web) → permission-mode de Claude Code.
 PERM_MODE = {
@@ -570,9 +570,17 @@ class Handler(BaseHTTPRequestHandler):
             text = tree_json
         else:
             text = json.dumps(tree_json, ensure_ascii=False, indent=2)
-        with open(os.path.join(pdir, "tree.json"), "w", encoding="utf-8") as f:
+        fp = os.path.join(pdir, "tree.json")
+        with open(fp, "w", encoding="utf-8") as f:
             f.write(text)
         install_skills(pdir)
+        # anti-eco: marcar el mtime como ya visto (como /state/write), así la
+        # reconciliación al conectar no rebota por el SSE.
+        try:
+            with STATE_LOCK:
+                STATE[os.path.basename(pdir)] = {"mtime": os.path.getmtime(fp)}
+        except OSError:
+            pass
         self._json(200, {"ok": True, "path": pdir})
 
     def _manifest(self, body):
@@ -595,7 +603,26 @@ class Handler(BaseHTTPRequestHandler):
         # las skills se cargan desde el cwd (la carpeta de proyectos), no de cada
         # proyecto, porque ahora Claude corre con cwd = projects_dir.
         install_skills(pdir)
-        self._json(200, {"ok": True})
+        # podar carpetas HUÉRFANAS: proyectos en disco que la web ya no tiene. El
+        # manifiesto trae la lista completa, así que lo que sobra es basura (árboles
+        # borrados o re-sembrados). Solo tocamos carpetas con tree.json.
+        keep = {safe_pid(p.get("id")) for p in projects if p.get("id")}
+        pruned = []
+        for name in os.listdir(pdir):
+            full = os.path.join(pdir, name)
+            if name == ".claude" or not os.path.isdir(full):
+                continue
+            if name not in keep and os.path.exists(os.path.join(full, "tree.json")):
+                try:
+                    shutil.rmtree(full)
+                    pruned.append(name)
+                    with STATE_LOCK:
+                        STATE.pop(name, None)
+                except OSError:
+                    pass
+        if pruned:
+            print(f"[manifest] podadas {len(pruned)} carpetas huérfanas: {', '.join(pruned)}")
+        self._json(200, {"ok": True, "pruned": pruned})
 
     def _get_tree(self, pid):
         if not pid:
