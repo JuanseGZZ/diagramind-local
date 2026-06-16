@@ -44,7 +44,7 @@ from urllib.parse import urlparse, parse_qs
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.3.1"
+VERSION = "0.5.0"
 
 # Modos del chat (web) → permission-mode de Claude Code.
 PERM_MODE = {
@@ -55,14 +55,23 @@ PERM_MODE = {
 }
 
 SYSTEM_PREAMBLE = (
-    "Estás trabajando dentro de un PROYECTO de DiagraMind. El diagrama vive en "
-    "el archivo ./tree.json (en el directorio de trabajo). Su esquema y reglas "
-    "están en las skills del proyecto (diagramind-format y la del tipo de árbol). "
-    "Leé esas skills antes de editar. Si tenés que modificar el diagrama, editá "
-    "./tree.json IN-PLACE manteniéndolo como JSON válido y respetando el esquema. "
-    "No cambies el id del árbol. Cuando termines de editar, RELEÉ ./tree.json y "
-    "verificá que es JSON válido y respeta el esquema del tipo (sin campos de más "
-    "ni de menos, ids únicos); si algo está mal, corregilo antes de terminar. "
+    "Estás trabajando en un WORKSPACE de DiagraMind que contiene VARIOS proyectos. "
+    "Tu directorio de trabajo es la carpeta de proyectos: ./index.json lista TODOS "
+    "los proyectos [{id, name, type}] y cuál es el foco (focusedId). Cada proyecto "
+    "vive en ./<id>/tree.json. Las skills (diagramind-format y la de cada tipo) "
+    "están en ./.claude/skills; leelas antes de editar.\n\n"
+    "El PROYECTO FOCO es tu objetivo de ESCRITURA por defecto: editá "
+    "./<focusedId>/tree.json IN-PLACE, JSON válido, respetando EXACTAMENTE el "
+    "esquema de SU tipo (cada proyecto puede ser de un tipo distinto: "
+    "cart/freestyle/activities). No cambies el id del árbol. Al terminar, releé el "
+    "archivo y verificá que es JSON válido y cumple el esquema (sin campos de más "
+    "ni de menos, ids únicos); si algo está mal, corregilo.\n\n"
+    "Podés LEER cualquier otro proyecto (./<id>/tree.json, buscalo por nombre en "
+    "./index.json) para basarte en él; escribí en otro proyecto SOLO si el usuario "
+    "te lo pide explícitamente.\n\n"
+    "IMPORTANTE: es UNA conversación continua. Recordás lo que hiciste en turnos "
+    "anteriores aunque el usuario cambie el proyecto foco. Si el usuario se refiere "
+    "a 'eso' o 'lo que agregaste', mirá el historial de la conversación.\n\n"
     "Respondé en español, breve."
 )
 
@@ -86,10 +95,13 @@ def projects_dir():
     return os.path.join(app_dir(), "projects")
 
 
-def project_path(pid):
+def safe_pid(pid):
     # pid viene de la web; sanitizar para que no escape del dir
-    safe = "".join(c for c in str(pid) if c.isalnum() or c in "-_")
-    return os.path.join(projects_dir(), safe or "default")
+    return "".join(c for c in str(pid) if c.isalnum() or c in "-_") or "default"
+
+
+def project_path(pid):
+    return os.path.join(projects_dir(), safe_pid(pid))
 
 
 # ===================== Claude Code CLI =====================
@@ -179,12 +191,18 @@ def set_status(run, status, error=None):
          sessionId=run.get("claude_session_id"))
 
 
-def run_claude(run, project_dir, message, mode, model, resume):
+def run_claude(run, work_dir, message, mode, model, resume, focus_id):
     claude_bin = find_claude()
     if not claude_bin:
         set_status(run, "error", "No se encontró el binario `claude` en esta máquina.")
         return
 
+    # El cwd es la carpeta de TODOS los proyectos (estable por chat), así --resume
+    # sobrevive aunque cambie el foco. El foco se inyecta por turno.
+    focus_note = (
+        f"\n\nFOCO ACTUAL: el proyecto en foco es id={focus_id} → archivo "
+        f"./{safe_pid(focus_id)}/tree.json. Escribí ahí salvo que te pidan otro."
+    )
     perm = PERM_MODE.get(mode, "acceptEdits")
     cmd = [
         claude_bin, "-p", message,
@@ -192,8 +210,8 @@ def run_claude(run, project_dir, message, mode, model, resume):
         "--verbose",                       # requerido por stream-json en -p
         "--model", map_model(model),
         "--permission-mode", perm,
-        "--add-dir", project_dir,
-        "--append-system-prompt", SYSTEM_PREAMBLE,
+        "--add-dir", work_dir,             # la carpeta de proyectos (acceso a todos)
+        "--append-system-prompt", SYSTEM_PREAMBLE + focus_note,
     ]
     if resume:
         cmd += ["--resume", str(resume)]
@@ -201,7 +219,7 @@ def run_claude(run, project_dir, message, mode, model, resume):
     set_status(run, "starting")
     try:
         proc = subprocess.Popen(
-            cmd, cwd=project_dir,
+            cmd, cwd=work_dir,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, bufsize=1,
             # Claude Code emite UTF-8; sin esto Windows usa cp1252 y rompe con
@@ -527,6 +545,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/projects/sync":
             self._sync(self._read_json())
+        elif path == "/projects/manifest":
+            self._manifest(self._read_json())
         elif path == "/state/write":
             self._state_write(self._read_json())
         elif path == "/chat":
@@ -554,6 +574,28 @@ class Handler(BaseHTTPRequestHandler):
             f.write(text)
         install_skills(pdir)
         self._json(200, {"ok": True, "path": pdir})
+
+    def _manifest(self, body):
+        """Escribe <projects>/index.json con la lista de TODOS los proyectos, para
+        que Claude pueda ubicar y leer otros además del foco. La web lo manda con
+        {projects:[{id,name,type}], focusedId}."""
+        projects = body.get("projects")
+        if projects is None:
+            self._json(400, {"error": "falta projects"})
+            return
+        pdir = projects_dir()
+        os.makedirs(pdir, exist_ok=True)
+        manifest = {
+            "projects": projects,
+            "focusedId": body.get("focusedId"),
+            "note": "Cada proyecto está en ./<id>/tree.json (relativo a esta carpeta).",
+        }
+        with open(os.path.join(pdir, "index.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f, ensure_ascii=False, indent=2)
+        # las skills se cargan desde el cwd (la carpeta de proyectos), no de cada
+        # proyecto, porque ahora Claude corre con cwd = projects_dir.
+        install_skills(pdir)
+        self._json(200, {"ok": True})
 
     def _get_tree(self, pid):
         if not pid:
@@ -639,20 +681,22 @@ class Handler(BaseHTTPRequestHandler):
         if not pid or not message:
             self._json(400, {"error": "faltan projectId o message"})
             return
-        pdir = project_path(pid)
-        if not os.path.exists(os.path.join(pdir, "tree.json")):
+        if not os.path.exists(os.path.join(project_path(pid), "tree.json")):
             self._json(409, {"error": "el proyecto no está sincronizado (falta tree.json)"})
             return
 
+        # cwd = carpeta de TODOS los proyectos (estable por chat). Así --resume
+        # sobrevive el cambio de foco → la conversación tiene MEMORIA continua.
+        work_dir = projects_dir()
         web_session = body.get("sessionId")
-        resume = body.get("resume") or SESSION_MAP.get(web_session)
+        resume = body.get("resume") or (SESSION_MAP.get(web_session) if web_session else None)
         mode = body.get("mode") or "auto-edit"
         model = body.get("model")
 
         run = new_run()
 
         def worker():
-            run_claude(run, pdir, message, mode, model, resume)
+            run_claude(run, work_dir, message, mode, model, resume, pid)
             if run.get("claude_session_id") and web_session:
                 SESSION_MAP[web_session] = run["claude_session_id"]
 
