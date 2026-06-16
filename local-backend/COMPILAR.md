@@ -7,7 +7,8 @@ mano. El repo es `JuanseGZZ/diagramind-local` (público).
 ## Sacar una versión nueva
 
 ```bash
-# Parado en externos/ (el repo interno):
+# Parado en la raíz del repo (externos/ en la máquina principal,
+# o el clone de diagramind-local en otra máquina):
 git add -A
 git commit -m "backend: <lo que cambió>"
 git push

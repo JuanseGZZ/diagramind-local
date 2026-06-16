@@ -1,4 +1,4 @@
-# DiagraMind — Backend local
+# DiagraMind — Backend local (server.py)
 
 App de Python que corre en tu máquina y hace de **backend local** para la web de
 DiagraMind. La web lo detecta con el botón **IA → Conectar local**.
@@ -7,41 +7,37 @@ DiagraMind. La web lo detecta con el botón **IA → Conectar local**.
 > está vivo. Más adelante va a exponer endpoints para chatear con Claude Code,
 > generar soft e inyectarlo en la web.
 
-## Dos formas de usarlo
+> El **ciclo de desarrollo y cómo publicar** (cambio → push → build) está en el
+> [README de la raíz](../README.md). Acá van los detalles del server.
 
-La web (botón **IA → Descargar local**) ofrece dos descargas:
+## Tres formas de usarlo (las baja la web)
 
-1. **Ejecutable (sin Python)** — binario standalone. Se baja, se abre con doble
-   clic y listo. No requiere Python. Generado con PyInstaller.
-2. **Script .py (requiere Python)** — `diagramind-local.zip` con `server.py` +
-   lanzadores (`iniciar.command` / `iniciar.bat`). Descarga mínima, pero
-   necesita Python 3 instalado.
+La web (**IA → Descargar local**) ofrece, todas desde los **Releases** del repo:
 
-Los archivos se sirven desde `descargas/` del repo.
+1. **Ejecutable** (sin Python) — binario standalone (PyInstaller). Doble clic.
+2. **Instalador** — baja el ejecutable y lo deja arrancando solo (auto-inicio).
+3. **Script .py** — `diagramind-local.zip` con `server.py` + lanzadores; liviano
+   pero requiere Python 3.
 
-## Correr (modo desarrollo / script)
+## Correr local (para probar mientras desarrollás)
 
 ```bash
-cd local-backend
 python3 server.py            # http://127.0.0.1:8765
 python3 server.py --port 9000
 ```
 
-Dejalo corriendo en una terminal. Después, en la web, abrí **IA → Conectar
-local**: si el server está vivo, el estado pasa a *Conectado*.
+Dejalo corriendo en una terminal. Después, en la web, **IA → Conectar local**: si
+el server está vivo, el estado pasa a *Conectado*. Al cambiar algo, subí
+`VERSION` (la web la muestra) para confirmar que agarró la versión nueva.
 
-## Empaquetar
-
-Los binarios (Win/Mac/Linux) y el `.zip` los compila y publica el **CI** como
-assets de un **GitHub Release**, al pushear un tag `v*`. No se commitean.
+## Compilar local (opcional, debug)
 
 ```bash
-git tag v0.1.1 && git push origin v0.1.1   # dispara el workflow Release
+pip install pyinstaller
+bash build_binary.sh   # binario del SO actual → descargas/ (gitignored)
 ```
 
-Detalle en [COMPILAR.md](COMPILAR.md). Para debug local podés generar el binario
-del SO actual con `pip install pyinstaller && bash build_binary.sh` (queda en
-`descargas/`, gitignored).
+Los binarios oficiales los hace el CI; ver [COMPILAR.md](COMPILAR.md).
 
 ## Endpoints
 
