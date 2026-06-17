@@ -44,7 +44,7 @@ from urllib.parse import urlparse, parse_qs
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.5.1"
+VERSION = "0.7.0"
 
 # Modos del chat (web) → permission-mode de Claude Code.
 PERM_MODE = {
@@ -91,8 +91,42 @@ def app_dir():
     return base
 
 
+def config_path():
+    return os.path.join(app_dir(), "config.json")
+
+
+def _load_config():
+    try:
+        with open(config_path(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+# Raíz donde el conector guarda TODAS las carpetas. Configurable (config.json);
+# default <appdir>/projects. Se cachea para no leer el archivo en cada poll.
+_ROOT = None
+
+
 def projects_dir():
-    return os.path.join(app_dir(), "projects")
+    global _ROOT
+    if _ROOT is None:
+        _ROOT = _load_config().get("root") or os.path.join(app_dir(), "projects")
+    return _ROOT
+
+
+def set_root(path):
+    global _ROOT
+    _ROOT = path
+    os.makedirs(app_dir(), exist_ok=True)
+    cfg = _load_config()
+    cfg["root"] = path
+    with open(config_path(), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
 
 
 def safe_pid(pid):
@@ -100,8 +134,22 @@ def safe_pid(pid):
     return "".join(c for c in str(pid) if c.isalnum() or c in "-_") or "default"
 
 
-def project_path(pid):
-    return os.path.join(projects_dir(), safe_pid(pid))
+def safe_name(name):
+    # nombre de carpeta → dir seguro (legible). Permite espacios.
+    s = "".join(c for c in str(name) if c.isalnum() or c in "-_ ").strip()
+    return s or "default"
+
+
+# Estructura en disco (2 niveles): <root>/<carpeta>/<arbol>/tree.json
+#   <root>/folders.json              ← índice de carpetas
+#   <root>/<carpeta>/index.json      ← índice por carpeta (manifiesto del chat)
+#   <root>/<carpeta>/.claude/skills  ← skills (cwd del chat en esa carpeta)
+def folder_dir(folder):
+    return os.path.join(projects_dir(), safe_name(folder or "Local"))
+
+
+def tree_dir(folder, pid):
+    return os.path.join(folder_dir(folder), safe_pid(pid))
 
 
 # ===================== Claude Code CLI =====================
@@ -191,17 +239,19 @@ def set_status(run, status, error=None):
          sessionId=run.get("claude_session_id"))
 
 
-def run_claude(run, work_dir, message, mode, model, resume, focus_id):
+def run_claude(run, work_dir, message, mode, model, resume, focus_id, folder):
     claude_bin = find_claude()
     if not claude_bin:
         set_status(run, "error", "No se encontró el binario `claude` en esta máquina.")
         return
 
-    # El cwd es la carpeta de TODOS los proyectos (estable por chat), así --resume
-    # sobrevive aunque cambie el foco. El foco se inyecta por turno.
+    # El cwd es la CARPETA del proyecto. Claude trabaja DENTRO de esa carpeta:
+    # ./index.json lista sus proyectos, ./<id>/tree.json es cada árbol.
     focus_note = (
-        f"\n\nFOCO ACTUAL: el proyecto en foco es id={focus_id} → archivo "
-        f"./{safe_pid(focus_id)}/tree.json. Escribí ahí salvo que te pidan otro."
+        f"\n\nESTÁS TRABAJANDO EN LA CARPETA «{folder}». Sus proyectos están en "
+        f"./index.json y cada uno en ./<id>/tree.json. El proyecto en FOCO es "
+        f"id={focus_id} → ./{safe_pid(focus_id)}/tree.json: escribí ahí salvo que "
+        f"el usuario te indique otro proyecto de ESTA carpeta."
     )
     perm = PERM_MODE.get(mode, "acceptEdits")
     cmd = [
@@ -423,6 +473,33 @@ def install_skills(project_dir):
             f.write(content)
 
 
+# ===================== selector nativo de carpeta =====================
+# El navegador no expone la ruta real del sistema; el conector sí. Abrimos un
+# diálogo nativo (tkinter askdirectory) en un SUBPROCESO (Tk no es thread-safe y
+# el server es multi-thread) y devolvemos la ruta absoluta elegida.
+# NOTA: con el binario --onefile (sys.frozen) sys.executable es el binario, no
+# python, así que el subproceso -c no aplica; ahí habría que embeber un modo
+# "--pick-dir". Por ahora (dev: `python server.py`) funciona.
+
+def pick_directory(title="Elegí una carpeta"):
+    script = (
+        "import tkinter, tkinter.filedialog as fd\n"
+        "r = tkinter.Tk(); r.withdraw()\n"
+        "try: r.attributes('-topmost', True)\n"
+        "except Exception: pass\n"
+        "p = fd.askdirectory(title=%r)\n"
+        "print(p or '')\n" % title
+    )
+    try:
+        out = subprocess.run([sys.executable, "-c", script],
+                             capture_output=True, text=True, timeout=300,
+                             encoding="utf-8", errors="replace")
+        path = (out.stdout or "").strip()
+        return path or None
+    except Exception:
+        return None
+
+
 # ===================== state mirror (watcher) =====================
 # Vigila los tree.json de todos los proyectos por mtime y empuja los cambios por
 # SSE (/state/stream). La web es un espejo en vivo. Cuando la web edita, manda
@@ -430,14 +507,18 @@ def install_skills(project_dir):
 # devolverle el eco. Ver doc 19 (Fase 2).
 
 STATE_LOCK = threading.Lock()
-STATE = {}            # pid -> {"mtime": float}   (último mtime visto)
-STATE_LOG = []        # [{seq, id, treeJson, ts}] (cambios para el SSE)
+STATE = {}            # "<folder>/<id>" -> {"mtime": float}   (último mtime visto)
+STATE_LOG = []        # [{seq, folder, id, treeJson, ts}] (cambios para el SSE)
 STATE_SEQ = 0
 STATE_LOG_MAX = 500
 
 
-def _read_tree_file(pid):
-    fp = os.path.join(project_path(pid), "tree.json")
+def _skey(folder, pid):
+    return f"{safe_name(folder)}/{safe_pid(pid)}"
+
+
+def _read_tree_file(folder, pid):
+    fp = os.path.join(tree_dir(folder, pid), "tree.json")
     if not os.path.exists(fp):
         return None
     try:
@@ -447,36 +528,51 @@ def _read_tree_file(pid):
         return None
 
 
-def _emit_state(pid, content):
+def _emit_state(folder, pid, content):
     """Agrega un evento de cambio al log (asume STATE_LOCK tomado)."""
     global STATE_SEQ
     STATE_SEQ += 1
-    STATE_LOG.append({"seq": STATE_SEQ, "id": pid, "treeJson": content, "ts": time.time()})
+    STATE_LOG.append({"seq": STATE_SEQ, "folder": folder, "id": pid,
+                      "treeJson": content, "ts": time.time()})
     if len(STATE_LOG) > STATE_LOG_MAX:
         del STATE_LOG[: len(STATE_LOG) - STATE_LOG_MAX]
 
 
+def iter_disk_trees():
+    """Itera (folder, treeId, fullpath_tree.json) sobre la estructura de 2 niveles."""
+    root = projects_dir()
+    if not os.path.isdir(root):
+        return
+    for fname in os.listdir(root):
+        fdir = os.path.join(root, fname)
+        if not os.path.isdir(fdir) or fname == ".claude":
+            continue
+        # saltar carpetas-legacy "planas" (un tree.json directo no es una carpeta)
+        if os.path.exists(os.path.join(fdir, "tree.json")):
+            continue
+        for tname in os.listdir(fdir):
+            fp = os.path.join(fdir, tname, "tree.json")
+            if os.path.exists(fp):
+                yield fname, tname, fp
+
+
 def watch_state(interval=0.5):
-    """Thread: detecta cambios de mtime en los tree.json y los emite."""
+    """Thread: detecta cambios de mtime en los tree.json (2 niveles) y los emite."""
     while True:
         try:
-            pdir = projects_dir()
-            if os.path.isdir(pdir):
-                for name in os.listdir(pdir):
-                    fp = os.path.join(pdir, name, "tree.json")
-                    if not os.path.exists(fp):
-                        continue
-                    try:
-                        mtime = os.path.getmtime(fp)
-                    except OSError:
-                        continue
-                    with STATE_LOCK:
-                        prev = STATE.get(name)
-                        if prev is None or prev["mtime"] != mtime:
-                            content = _read_tree_file(name)
-                            STATE[name] = {"mtime": mtime}
-                            if content is not None:
-                                _emit_state(name, content)
+            for folder, tid, fp in iter_disk_trees():
+                try:
+                    mtime = os.path.getmtime(fp)
+                except OSError:
+                    continue
+                key = f"{folder}/{tid}"
+                with STATE_LOCK:
+                    prev = STATE.get(key)
+                    if prev is None or prev["mtime"] != mtime:
+                        content = _read_tree_file(folder, tid)
+                        STATE[key] = {"mtime": mtime}
+                        if content is not None:
+                            _emit_state(folder, tid, content)
         except Exception:
             pass
         time.sleep(interval)
@@ -531,13 +627,19 @@ class Handler(BaseHTTPRequestHandler):
                            "version": claude_version(cb) if cb else None},
             })
         elif path == "/projects/tree":
-            self._get_tree(q.get("id", [None])[0])
+            self._get_tree(q.get("id", [None])[0], q.get("folder", [None])[0])
         elif path == "/chat/stream":
             self._stream(q.get("runId", [None])[0])
         elif path == "/state":
             self._state_full()
         elif path == "/state/stream":
             self._state_stream(q.get("since", [None])[0])
+        elif path == "/folders/pick":
+            self._folders_pick(q.get("title", ["Elegí una carpeta"])[0])
+        elif path == "/folders/read":
+            self._folders_read(q.get("path", [None])[0])
+        elif path == "/config":
+            self._json(200, {"root": projects_dir(), "base": app_dir()})
         else:
             self._json(404, {"error": "not found", "path": path})
 
@@ -545,6 +647,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/projects/sync":
             self._sync(self._read_json())
+        elif path == "/config/root":
+            self._config_root(self._read_json())
         elif path == "/projects/manifest":
             self._manifest(self._read_json())
         elif path == "/state/write":
@@ -559,95 +663,150 @@ class Handler(BaseHTTPRequestHandler):
     # --- endpoints -------------------------------------------------------
     def _sync(self, body):
         pid = body.get("id")
+        folder = body.get("folder") or "Local"
         tree_json = body.get("treeJson")
         if not pid or tree_json is None:
             self._json(400, {"error": "faltan id o treeJson"})
             return
-        pdir = project_path(pid)
-        os.makedirs(pdir, exist_ok=True)
-        # tree_json puede venir como string o como objeto
-        if isinstance(tree_json, str):
-            text = tree_json
-        else:
-            text = json.dumps(tree_json, ensure_ascii=False, indent=2)
-        fp = os.path.join(pdir, "tree.json")
+        tdir = tree_dir(folder, pid)              # <root>/<carpeta>/<arbol>
+        os.makedirs(tdir, exist_ok=True)
+        text = tree_json if isinstance(tree_json, str) else json.dumps(tree_json, ensure_ascii=False, indent=2)
+        fp = os.path.join(tdir, "tree.json")
         with open(fp, "w", encoding="utf-8") as f:
             f.write(text)
-        install_skills(pdir)
-        # anti-eco: marcar el mtime como ya visto (como /state/write), así la
-        # reconciliación al conectar no rebota por el SSE.
-        try:
+        install_skills(folder_dir(folder))        # skills a nivel carpeta (cwd del chat)
+        try:                                       # anti-eco: mtime ya visto
             with STATE_LOCK:
-                STATE[os.path.basename(pdir)] = {"mtime": os.path.getmtime(fp)}
+                STATE[_skey(folder, pid)] = {"mtime": os.path.getmtime(fp)}
         except OSError:
             pass
-        self._json(200, {"ok": True, "path": pdir})
+        self._json(200, {"ok": True, "path": tdir})
 
     def _manifest(self, body):
-        """Escribe <projects>/index.json con la lista de TODOS los proyectos, para
-        que Claude pueda ubicar y leer otros además del foco. La web lo manda con
-        {projects:[{id,name,type}], focusedId}."""
-        projects = body.get("projects")
-        if projects is None:
-            self._json(400, {"error": "falta projects"})
+        """Escribe el índice por carpeta (<carpeta>/index.json) + el índice de
+        carpetas (<root>/folders.json), y poda lo que la web ya no tiene. La web lo
+        manda con {folders:[{name, projects:[{id,name,type}]}], focusedFolder, focusedId}."""
+        folders = body.get("folders")
+        if folders is None:
+            self._json(400, {"error": "falta folders"})
             return
-        pdir = projects_dir()
-        os.makedirs(pdir, exist_ok=True)
-        manifest = {
-            "projects": projects,
-            "focusedId": body.get("focusedId"),
-            "note": "Cada proyecto está en ./<id>/tree.json (relativo a esta carpeta).",
-        }
-        with open(os.path.join(pdir, "index.json"), "w", encoding="utf-8") as f:
-            json.dump(manifest, f, ensure_ascii=False, indent=2)
-        # las skills se cargan desde el cwd (la carpeta de proyectos), no de cada
-        # proyecto, porque ahora Claude corre con cwd = projects_dir.
-        install_skills(pdir)
-        # podar carpetas HUÉRFANAS: proyectos en disco que la web ya no tiene. El
-        # manifiesto trae la lista completa, así que lo que sobra es basura (árboles
-        # borrados o re-sembrados). Solo tocamos carpetas con tree.json.
-        keep = {safe_pid(p.get("id")) for p in projects if p.get("id")}
+        root = projects_dir()
+        os.makedirs(root, exist_ok=True)
+        focused_folder = body.get("focusedFolder")
+        keep_folders = set()
+        for f in folders:
+            fname = f.get("name") or "Local"
+            keep_folders.add(safe_name(fname))
+            fdir = folder_dir(fname)
+            os.makedirs(fdir, exist_ok=True)
+            projects = f.get("projects") or []
+            manifest = {
+                "folder": fname,
+                "projects": projects,
+                "focusedId": body.get("focusedId") if fname == focused_folder else None,
+                "note": "Cada proyecto de ESTA carpeta está en ./<id>/tree.json.",
+            }
+            with open(os.path.join(fdir, "index.json"), "w", encoding="utf-8") as fp:
+                json.dump(manifest, fp, ensure_ascii=False, indent=2)
+            install_skills(fdir)
+            # podar árboles que la carpeta ya no tiene
+            keep_t = {safe_pid(p.get("id")) for p in projects if p.get("id")}
+            for tname in os.listdir(fdir):
+                full = os.path.join(fdir, tname)
+                if tname in (".claude", "index.json") or not os.path.isdir(full):
+                    continue
+                if tname not in keep_t and os.path.exists(os.path.join(full, "tree.json")):
+                    try:
+                        shutil.rmtree(full)
+                        with STATE_LOCK:
+                            STATE.pop(f"{safe_name(fname)}/{tname}", None)
+                    except OSError:
+                        pass
+
+        with open(os.path.join(root, "folders.json"), "w", encoding="utf-8") as fp:
+            json.dump({"folders": [{"name": f.get("name")} for f in folders],
+                       "focusedFolder": focused_folder}, fp, ensure_ascii=False, indent=2)
+
+        # podar carpetas que la web ya no tiene. SOLO tocamos dirs que "parecen
+        # nuestros" (tienen index.json o un tree.json directo/legacy) para no borrar
+        # nada ajeno si la raíz es un dir compartido.
         pruned = []
-        for name in os.listdir(pdir):
-            full = os.path.join(pdir, name)
-            if name == ".claude" or not os.path.isdir(full):
+        for name in os.listdir(root):
+            full = os.path.join(root, name)
+            if not os.path.isdir(full) or name == ".claude" or name in keep_folders:
                 continue
-            if name not in keep and os.path.exists(os.path.join(full, "tree.json")):
+            looks_ours = (os.path.exists(os.path.join(full, "index.json"))
+                          or os.path.exists(os.path.join(full, "tree.json")))
+            if looks_ours:
                 try:
                     shutil.rmtree(full)
                     pruned.append(name)
-                    with STATE_LOCK:
-                        STATE.pop(name, None)
                 except OSError:
                     pass
         if pruned:
             print(f"[manifest] podadas {len(pruned)} carpetas huérfanas: {', '.join(pruned)}")
         self._json(200, {"ok": True, "pruned": pruned})
 
-    def _get_tree(self, pid):
+    def _get_tree(self, pid, folder):
         if not pid:
             self._json(400, {"error": "falta id"})
             return
-        fp = os.path.join(project_path(pid), "tree.json")
+        fp = os.path.join(tree_dir(folder or "Local", pid), "tree.json")
         if not os.path.exists(fp):
             self._json(404, {"error": "no hay tree.json para ese proyecto"})
             return
         with open(fp, "r", encoding="utf-8") as f:
             self._json(200, {"treeJson": f.read()})
 
+    # --- config (ruta raíz donde el conector guarda todas las carpetas) ---
+    def _config_root(self, body):
+        path = (body.get("path") or "").strip()
+        if not path:
+            self._json(400, {"error": "falta path"})
+            return
+        set_root(path)
+        self._json(200, {"root": projects_dir()})
+
+    # --- carpetas (selector nativo + lectura) ---
+    def _folders_pick(self, title):
+        """Abre el diálogo nativo y devuelve la ruta elegida (o cancelado)."""
+        path = pick_directory(title or "Elegí una carpeta")
+        if not path:
+            self._json(200, {"cancelled": True})
+            return
+        self._json(200, {"path": path})
+
+    def _folders_read(self, path):
+        """Lee los árboles (<path>/<id>/tree.json) de una carpeta del sistema."""
+        if not path or not os.path.isdir(path):
+            self._json(400, {"error": "ruta inválida"})
+            return
+        projects = []
+        for name in sorted(os.listdir(path)):
+            fp = os.path.join(path, name, "tree.json")
+            if os.path.isfile(fp):
+                try:
+                    with open(fp, "r", encoding="utf-8") as f:
+                        projects.append({"id": name, "name": name, "treeJson": f.read()})
+                except Exception:
+                    pass
+        self._json(200, {"path": path, "projects": projects})
+
     # --- state mirror ---
     def _state_full(self):
-        """Snapshot completo: todos los proyectos en disco + seq actual."""
-        projects = []
-        pdir = projects_dir()
-        if os.path.isdir(pdir):
-            for name in sorted(os.listdir(pdir)):
-                content = _read_tree_file(name)
-                if content is not None:
-                    projects.append({"id": name, "treeJson": content})
+        """Snapshot completo: carpetas → proyectos en disco + seq actual."""
+        by_folder = {}
+        for folder, tid, fp in iter_disk_trees():
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception:
+                continue
+            by_folder.setdefault(folder, []).append({"id": tid, "treeJson": content})
+        folders = [{"name": k, "projects": v} for k, v in sorted(by_folder.items())]
         with STATE_LOCK:
             seq = STATE_SEQ
-        self._json(200, {"projects": projects, "seq": seq})
+        self._json(200, {"folders": folders, "seq": seq})
 
     def _state_stream(self, since):
         """SSE de larga duración: empuja los cambios de tree.json con seq > since."""
@@ -684,48 +843,53 @@ class Handler(BaseHTTPRequestHandler):
         """Write-through de la web: escribe tree.json y marca el mtime como ya
         visto para que el watcher NO devuelva el eco al que lo escribió."""
         pid = body.get("id")
+        folder = body.get("folder") or "Local"
         tree_json = body.get("treeJson")
         if not pid or tree_json is None:
             self._json(400, {"error": "faltan id o treeJson"})
             return
-        pdir = project_path(pid)
-        os.makedirs(pdir, exist_ok=True)
+        tdir = tree_dir(folder, pid)
+        os.makedirs(tdir, exist_ok=True)
         text = tree_json if isinstance(tree_json, str) else json.dumps(tree_json, ensure_ascii=False, indent=2)
-        fp = os.path.join(pdir, "tree.json")
+        fp = os.path.join(tdir, "tree.json")
         with open(fp, "w", encoding="utf-8") as f:
             f.write(text)
         try:
-            mtime = os.path.getmtime(fp)
             with STATE_LOCK:
-                STATE[os.path.basename(pdir)] = {"mtime": mtime}
+                STATE[_skey(folder, pid)] = {"mtime": os.path.getmtime(fp)}
         except OSError:
             pass
         self._json(200, {"ok": True})
 
     def _chat(self, body):
         pid = body.get("projectId")
+        folder = body.get("folder") or "Local"
         message = body.get("message")
         if not pid or not message:
             self._json(400, {"error": "faltan projectId o message"})
             return
-        if not os.path.exists(os.path.join(project_path(pid), "tree.json")):
+        if not os.path.exists(os.path.join(tree_dir(folder, pid), "tree.json")):
             self._json(409, {"error": "el proyecto no está sincronizado (falta tree.json)"})
             return
 
-        # cwd = carpeta de TODOS los proyectos (estable por chat). Así --resume
-        # sobrevive el cambio de foco → la conversación tiene MEMORIA continua.
-        work_dir = projects_dir()
+        # cwd = la CARPETA del proyecto (estable por chat dentro de la carpeta). Así
+        # --resume sobrevive el cambio de foco entre proyectos de la misma carpeta y
+        # Claude "sabe" en qué carpeta labura (su cwd + el focus_note).
+        work_dir = folder_dir(folder)
         web_session = body.get("sessionId")
-        resume = body.get("resume") or (SESSION_MAP.get(web_session) if web_session else None)
+        # la sesión de Claude está atada al cwd (la carpeta), así que el fallback
+        # se cachea por (sesión web, carpeta).
+        skey = f"{web_session}::{safe_name(folder)}" if web_session else None
+        resume = body.get("resume") or (SESSION_MAP.get(skey) if skey else None)
         mode = body.get("mode") or "auto-edit"
         model = body.get("model")
 
         run = new_run()
 
         def worker():
-            run_claude(run, work_dir, message, mode, model, resume, pid)
-            if run.get("claude_session_id") and web_session:
-                SESSION_MAP[web_session] = run["claude_session_id"]
+            run_claude(run, work_dir, message, mode, model, resume, pid, folder)
+            if run.get("claude_session_id") and skey:
+                SESSION_MAP[skey] = run["claude_session_id"]
 
         threading.Thread(target=worker, daemon=True).start()
         self._json(200, {"runId": run["id"]})
