@@ -388,7 +388,11 @@ SKILLS = dict([
         "   `<contador> + 1`, asignalo como id del nodo nuevo y **actualizá el "
         "   contador** a ese valor.\n"
         "4. No cambies el `type` ni mezcles nodos de otro tipo.\n"
-        "5. Conservá los campos existentes de cada nodo (no los borres al editar).",
+        "5. Conservá los campos existentes de cada nodo (no los borres al editar).\n"
+        "6. **Colores**: el campo `color` (en nodos, flechas y cartas) acepta un "
+        "   **string hex** como `\"#e53935\"`, o `null` = color por defecto. SÍ se "
+        "   pueden cambiar: poné el hex en `color`. En freestyle las formas usan "
+        "   `fill`/`stroke` (también hex).",
     ),
     _skill(
         "diagramind-cart",
@@ -452,7 +456,9 @@ SKILLS = dict([
         "  `lastIdCharged`.\n"
         "- **Conectar**: nueva flecha en `flechas` con `fromId`/`toId` de nodos "
         "  existentes; `fromSide`/`toSide` ∈ left/right/top/bottom; subir `lastArrowId`.\n"
-        "- **Forma**: nueva en `formas`; subir `lastShapeId`.\n"
+        "- **Editar nodo**: cambiá `titulo`/`contenido`/`color` (hex) o `x`/`y`/`ancho`/`alto`.\n"
+        "- **Forma**: nueva en `formas`; subir `lastShapeId` (`fill`/`stroke` son hex).\n"
+        "- **Borrar nodo**: quitalo de `nodos` Y borrá las flechas que lo referencian.\n"
         "- No dupliques ids dentro de cada lista.",
     ),
     _skill(
@@ -478,7 +484,10 @@ SKILLS = dict([
         "- **Agregar actividad**: id `lastId + 1`, `seq = seqCounter + 1`; subir "
         "  ambos contadores.\n"
         "- **Precedencia**: nuevo `edge` con ids existentes. **No crees ciclos.**\n"
-        "- Mantené `timeUnit` coherente.",
+        "- **Editar**: cambiá `titulo`/`contenido`/`color` (hex)/`duracion`; `isStart` "
+        "  marca el nodo de arranque.\n"
+        "- **Borrar actividad**: quitala de `nodes` Y borrá los `edges` que la referencian.\n"
+        "- Mantené `timeUnit` coherente (horas/dias/semanas).",
     ),
 ])
 
