@@ -17,6 +17,16 @@ PERM_MODE = {
     "ask": "default",
 }
 
+# Esfuerzo (web) → palabra clave de razonamiento de Claude Code (más palabra = más
+# presupuesto de thinking). low = razonamiento adaptativo por defecto (sin palabra).
+EFFORT_THINK = {
+    "low": "",
+    "medium": "think",
+    "high": "think hard",
+    "xhigh": "think harder",
+    "max": "ultrathink",
+}
+
 
 def find_claude():
     """Resuelve el binario `claude`. OJO: cuando el backend arranca por doble
@@ -102,10 +112,12 @@ class ClaudeAdapter:
     def install_instructions(self, work_dir):
         install_skills(work_dir)
 
-    def build_cmd(self, run, b, message, work_dir, folder, focus_name, mode, model, resume):
+    def build_cmd(self, run, b, message, work_dir, folder, focus_name, mode, model, resume, effort=None):
         perm = PERM_MODE.get(mode, "acceptEdits")
+        kw = EFFORT_THINK.get(effort or "", "")
+        msg = message + (f"\n\n{kw}" if kw else "")   # palabra de thinking según esfuerzo
         cmd = [
-            b, "-p", message, "--output-format", "stream-json", "--verbose",
+            b, "-p", msg, "--output-format", "stream-json", "--verbose",
             "--model", map_model(model), "--permission-mode", perm,
             "--add-dir", work_dir,
             "--append-system-prompt", SYSTEM_PREAMBLE + "\n\n" + _focus_note(folder, focus_name),

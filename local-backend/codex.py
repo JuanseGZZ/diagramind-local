@@ -6,7 +6,7 @@ import tempfile
 
 from runs import emit
 from skills import install_agents_md
-from cli_base import _focus_note, _find_bin, _bin_version
+from cli_base import _headless_prompt, _find_bin, _bin_version
 
 
 class CodexAdapter:
@@ -21,10 +21,10 @@ class CodexAdapter:
     def install_instructions(self, work_dir):
         install_agents_md(work_dir)
 
-    def build_cmd(self, run, b, message, work_dir, folder, focus_name, mode, model, resume):
+    def build_cmd(self, run, b, message, work_dir, folder, focus_name, mode, model, resume, effort=None):
         last = os.path.join(tempfile.gettempdir(), f"codex-last-{run['id']}.txt")
         run["_last_file"] = last
-        prompt = _focus_note(folder, focus_name) + "\n\n" + message
+        prompt = _headless_prompt(folder, focus_name, message)
         cmd = [b, "exec", "--full-auto", "--skip-git-repo-check", "--output-last-message", last]
         if model:
             cmd += ["-m", model]

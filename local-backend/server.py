@@ -541,7 +541,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     last_beat = time.time()
                 time.sleep(0.2)
-        except (BrokenPipeError, ConnectionResetError):
+        except (ConnectionError, OSError):
+            # el cliente cerró la conexión SSE (reconexión normal del mirror) → fin tranquilo
             pass
 
     def _state_write(self, body):
@@ -594,11 +595,12 @@ class Handler(BaseHTTPRequestHandler):
         resume = body.get("resume") or (SESSION_MAP.get(skey) if skey else None)
         mode = body.get("mode") or "auto-edit"
         model = body.get("model")
+        effort = body.get("effort")
 
         run = new_run()
 
         def worker():
-            run_cli(run, adapter, work_dir, message, mode, model, resume, name, folder)
+            run_cli(run, adapter, work_dir, message, mode, model, resume, name, folder, effort)
             if adapter.supports_resume and run.get("claude_session_id") and skey:
                 SESSION_MAP[skey] = run["claude_session_id"]
 
@@ -659,7 +661,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     last_beat = time.time()
                 time.sleep(0.1)
-        except (BrokenPipeError, ConnectionResetError):
+        except (ConnectionError, OSError):
             pass
 
     # log un poco más prolijo

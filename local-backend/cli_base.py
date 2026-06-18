@@ -20,6 +20,28 @@ def _focus_note(folder, focus_name):
     )
 
 
+def _headless_prompt(folder, focus_name, message):
+    """Prompt para los CLIs one-shot (Codex/Gemini): a diferencia de Claude Code, en
+    modo -p son conversacionales y, si no se les ordena con MUCHA fuerza, describen o
+    preguntan en vez de actuar. Por eso la orden imperativa va al principio Y al final."""
+    focus_path = f"./{safe_name(focus_name)}/tree.json"
+    return (
+        "SOS UN AGENTE QUE EDITA ARCHIVOS, NO UN CHAT. En ESTE MISMO TURNO tenés que "
+        f"ABRIR y MODIFICAR el archivo `{focus_path}` con tus herramientas de escritura, "
+        "para cumplir la instrucción del usuario. Está PROHIBIDO terminar sin haber "
+        "editado el archivo, y PROHIBIDO responder con preguntas o pidiendo confirmación.\n\n"
+        + _focus_note(folder, focus_name) +
+        "\n\nREGLAS:\n"
+        f"1. Editá DIRECTAMENTE `{focus_path}` (no describas lo que harías: HACELO).\n"
+        "2. Respetá EXACTAMENTE el esquema de su tipo (está en AGENTS.md) y dejá el JSON válido.\n"
+        "3. Si la instrucción es vaga ('los que quieras', 'algo', 'lo que sea'), DECIDÍ "
+        "   vos y hacelo igual. NO preguntes.\n"
+        "4. Cuando termines, respondé en UNA sola línea qué cambiaste.\n\n"
+        f"INSTRUCCIÓN DEL USUARIO: {message}\n\n"
+        f"AHORA editá `{focus_path}` y aplicá ese cambio. No respondas sin haberlo hecho."
+    )
+
+
 def _find_bin(names):
     """Resuelve un binario probando which() + rutas conocidas (PATH no siempre está
     cuando se arranca por doble clic / LaunchAgent)."""
@@ -47,7 +69,7 @@ def _bin_version(b):
         return None
 
 
-def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, folder):
+def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, folder, effort=None):
     """Núcleo compartido: lanza el CLI, lee stdout línea a línea (cada adaptador
     parsea lo suyo), maneja cancelación y estado terminal."""
     bin_path = adapter.find()
@@ -62,7 +84,7 @@ def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, fo
 
     cmd, env_extra = adapter.build_cmd(
         run, bin_path, message, work_dir, folder, focus_name, mode, model,
-        resume if adapter.supports_resume else None,
+        resume if adapter.supports_resume else None, effort,
     )
     set_status(run, "starting")
     env = os.environ.copy()
