@@ -35,46 +35,24 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+# módulos desacoplados (ver claude.py / codex.py / gemini.py / cli_base.py / etc.)
+from util import safe_name
+from runs import RUNS, RUNS_LOCK, SESSION_MAP, new_run, emit
+from skills import install_skills
+from claude import find_claude, claude_version
+from clis import CLIS, run_cli
+
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.8.0"
-
-# Modos del chat (web) → permission-mode de Claude Code.
-PERM_MODE = {
-    "auto-edit": "acceptEdits",
-    "auto": "acceptEdits",
-    "plan": "plan",
-    "ask": "default",
-}
-
-SYSTEM_PREAMBLE = (
-    "Estás trabajando en un WORKSPACE de DiagraMind que contiene VARIOS proyectos. "
-    "Tu directorio de trabajo es la carpeta de proyectos: ./index.json lista TODOS "
-    "los proyectos [{id, name, type}] y cuál es el foco (focusedId). Cada proyecto "
-    "vive en ./<id>/tree.json. Las skills (diagramind-format y la de cada tipo) "
-    "están en ./.claude/skills; leelas antes de editar.\n\n"
-    "El PROYECTO FOCO es tu objetivo de ESCRITURA por defecto: editá "
-    "./<focusedId>/tree.json IN-PLACE, JSON válido, respetando EXACTAMENTE el "
-    "esquema de SU tipo (cada proyecto puede ser de un tipo distinto: "
-    "cart/freestyle/activities). No cambies el id del árbol. Al terminar, releé el "
-    "archivo y verificá que es JSON válido y cumple el esquema (sin campos de más "
-    "ni de menos, ids únicos); si algo está mal, corregilo.\n\n"
-    "Podés LEER cualquier otro proyecto (./<id>/tree.json, buscalo por nombre en "
-    "./index.json) para basarte en él; escribí en otro proyecto SOLO si el usuario "
-    "te lo pide explícitamente.\n\n"
-    "IMPORTANTE: es UNA conversación continua. Recordás lo que hiciste en turnos "
-    "anteriores aunque el usuario cambie el proyecto foco. Si el usuario se refiere "
-    "a 'eso' o 'lo que agregaste', mirá el historial de la conversación.\n\n"
-    "Respondé en español, breve."
-)
-
+VERSION = "0.9.0"
 
 # ===================== rutas / disco =====================
 
@@ -134,12 +112,6 @@ def safe_pid(pid):
     return "".join(c for c in str(pid) if c.isalnum() or c in "-_") or "default"
 
 
-def safe_name(name):
-    # nombre de carpeta → dir seguro (legible). Permite espacios.
-    s = "".join(c for c in str(name) if c.isalnum() or c in "-_ ").strip()
-    return s or "default"
-
-
 # Estructura en disco (2 niveles): <root>/<carpeta>/<arbol>/tree.json
 #   <root>/folders.json              ← índice de carpetas
 #   <root>/<carpeta>/index.json      ← índice por carpeta (manifiesto del chat)
@@ -172,334 +144,6 @@ def resolve_tree_id(folder, dirname):
 
 
 # ===================== Claude Code CLI =====================
-
-def find_claude():
-    """Resuelve el binario `claude`. OJO: cuando el backend arranca por doble
-    clic / LaunchAgent, ~/.local/bin no está en el PATH, así que probamos rutas
-    conocidas además de which()."""
-    candidates = [shutil.which("claude")]
-    home = os.path.expanduser("~")
-    candidates += [
-        os.path.join(home, ".local", "bin", "claude"),
-        "/usr/local/bin/claude",
-        "/opt/homebrew/bin/claude",
-        os.path.join(home, ".local", "bin", "claude.exe"),
-        os.path.join(os.environ.get("APPDATA", ""), "npm", "claude.cmd"),
-    ]
-    for c in candidates:
-        if c and os.path.exists(c):
-            return c
-    return None
-
-
-def claude_version(claude_bin):
-    try:
-        out = subprocess.run([claude_bin, "--version"], capture_output=True,
-                             text=True, timeout=8)
-        return (out.stdout or out.stderr).strip() or None
-    except Exception:
-        return None
-
-
-def map_model(m):
-    """La web manda ids tipo claude-opus-4-8; el CLI prefiere alias."""
-    if not m:
-        return "sonnet"
-    low = m.lower()
-    if "opus" in low:
-        return "opus"
-    if "haiku" in low:
-        return "haiku"
-    if "sonnet" in low:
-        return "sonnet"
-    return m
-
-
-# ===================== runs (máquina de estados) =====================
-# Un "run" = un turno disparado contra Claude. Estados:
-#   queued → starting → streaming → done | error | cancelled
-# Cada run guarda una lista de eventos con seq incremental para que el SSE pueda
-# reconectar sin perder nada.
-
-RUNS = {}
-RUNS_LOCK = threading.Lock()
-# mapeo  web_session_id → claude_session_id  (para --resume)
-SESSION_MAP = {}
-
-
-def new_run():
-    rid = uuid.uuid4().hex
-    run = {
-        "id": rid,
-        "status": "queued",
-        "events": [],          # [{seq, kind, ...}]
-        "seq": 0,
-        "proc": None,
-        "claude_session_id": None,
-        "error": None,
-    }
-    with RUNS_LOCK:
-        RUNS[rid] = run
-    return run
-
-
-def emit(run, kind, **data):
-    with RUNS_LOCK:
-        run["seq"] += 1
-        ev = {"seq": run["seq"], "kind": kind, **data}
-        run["events"].append(ev)
-
-
-def set_status(run, status, error=None):
-    run["status"] = status
-    if error:
-        run["error"] = error
-    emit(run, "status", status=status, error=error,
-         sessionId=run.get("claude_session_id"))
-
-
-def run_claude(run, work_dir, message, mode, model, resume, focus_name, folder):
-    claude_bin = find_claude()
-    if not claude_bin:
-        set_status(run, "error", "No se encontró el binario `claude` en esta máquina.")
-        return
-
-    # El cwd es la CARPETA. Cada proyecto está en ./<Nombre>/tree.json (por su
-    # NOMBRE real); ./index.json lista los proyectos de la carpeta.
-    focus_note = (
-        f"\n\nESTÁS TRABAJANDO EN LA CARPETA «{folder}». Sus proyectos están en "
-        f"./index.json y cada uno en ./<Nombre>/tree.json. El proyecto en FOCO es "
-        f"«{focus_name}» → ./{safe_name(focus_name)}/tree.json: escribí ahí salvo que "
-        f"el usuario te indique otro proyecto de ESTA carpeta."
-    )
-    perm = PERM_MODE.get(mode, "acceptEdits")
-    cmd = [
-        claude_bin, "-p", message,
-        "--output-format", "stream-json",
-        "--verbose",                       # requerido por stream-json en -p
-        "--model", map_model(model),
-        "--permission-mode", perm,
-        "--add-dir", work_dir,             # la carpeta de proyectos (acceso a todos)
-        "--append-system-prompt", SYSTEM_PREAMBLE + focus_note,
-    ]
-    if resume:
-        cmd += ["--resume", str(resume)]
-
-    set_status(run, "starting")
-    try:
-        proc = subprocess.Popen(
-            cmd, cwd=work_dir,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, bufsize=1,
-            # Claude Code emite UTF-8; sin esto Windows usa cp1252 y rompe con
-            # acentos/emojis (UnicodeDecodeError) → se muere el worker.
-            encoding="utf-8", errors="replace",
-        )
-    except Exception as e:
-        set_status(run, "error", f"No se pudo lanzar claude: {e}")
-        return
-
-    run["proc"] = proc
-    set_status(run, "streaming")
-
-    for line in proc.stdout:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        handle_event(run, obj)
-
-    proc.wait()
-    stderr = (proc.stderr.read() or "").strip()
-
-    if run["status"] == "cancelled":
-        return
-    if proc.returncode and proc.returncode != 0 and run["status"] != "done":
-        set_status(run, "error", stderr or f"claude salió con código {proc.returncode}")
-    elif run["status"] not in ("done", "error"):
-        set_status(run, "done")
-
-
-def handle_event(run, obj):
-    """Traduce los eventos JSONL de Claude Code a eventos simples para la web."""
-    t = obj.get("type")
-
-    if t == "system" and obj.get("subtype") == "init":
-        run["claude_session_id"] = obj.get("session_id")
-        return
-
-    if t == "assistant":
-        for block in (obj.get("message", {}).get("content") or []):
-            if block.get("type") == "text" and block.get("text"):
-                emit(run, "assistant", text=block["text"])
-            elif block.get("type") == "tool_use":
-                emit(run, "tool", name=block.get("name", "tool"))
-        return
-
-    if t == "result":
-        if obj.get("session_id"):
-            run["claude_session_id"] = obj["session_id"]
-        if obj.get("is_error"):
-            set_status(run, "error", obj.get("result") or "Claude devolvió un error.")
-        else:
-            txt = obj.get("result")
-            # algunos turnos sólo traen el texto en el result final
-            if txt and not any(e["kind"] == "assistant" for e in run["events"]):
-                emit(run, "assistant", text=txt)
-            set_status(run, "done")
-        return
-
-
-# ===================== skills del dominio =====================
-# Se instalan en <proyecto>/.claude/skills/<name>/SKILL.md al sincronizar.
-# Claude Code las autocarga. Embebidas acá para que el binario --onefile las
-# tenga sin archivos sueltos.
-
-def _skill(name, description, body):
-    return name, ("---\nname: %s\ndescription: %s\n---\n\n%s\n" %
-                  (name, description, body))
-
-
-SKILLS = dict([
-    _skill(
-        "diagramind-format",
-        "Formato de un proyecto DiagraMind: tree.json, tipos, ids y contadores. "
-        "Leer SIEMPRE antes de editar un diagrama.",
-        "# Formato DiagraMind\n\n"
-        "Un proyecto es un único archivo `tree.json` (el mismo objeto que produce "
-        "`tree.toJson()` en la web). El campo raíz `type` define la estructura:\n\n"
-        "- `cart` → ver `diagramind-cart`\n"
-        "- `freestyle` → ver `diagramind-freestyle`\n"
-        "- `activities` → ver `diagramind-activities`\n\n"
-        "Común a todos:\n"
-        "- `attachments`: mapa `{ \"<aid>\": { \"name\", \"mime\" } }` (adjuntos; "
-        "  los bytes van aparte, NO los toques).\n"
-        "- Campos `lastIdCharged` / `lastId` / `lastArrowId` / etc. son "
-        "  **contadores** del último id usado.\n\n"
-        "## Reglas (importantes)\n"
-        "1. Editá `tree.json` IN-PLACE y dejalo como **JSON válido** (verificá que "
-        "   parsea al terminar).\n"
-        "2. **Respetá EXACTAMENTE los nombres de campo** del esquema del tipo. No "
-        "   inventes ni renombres campos.\n"
-        "3. **Los ids son números enteros.** Al agregar un nodo, usá "
-        "   `<contador> + 1`, asignalo como id del nodo nuevo y **actualizá el "
-        "   contador** a ese valor.\n"
-        "4. No cambies el `type` ni mezcles nodos de otro tipo.\n"
-        "5. Conservá los campos existentes de cada nodo (no los borres al editar).\n"
-        "6. **Colores**: el campo `color` (en nodos, flechas y cartas) acepta un "
-        "   **string hex** como `\"#e53935\"`, o `null` = color por defecto. SÍ se "
-        "   pueden cambiar: poné el hex en `color`. En freestyle las formas usan "
-        "   `fill`/`stroke` (también hex).",
-    ),
-    _skill(
-        "diagramind-cart",
-        "Árbol jerárquico de cartas (tipo `cart`, layouts ltr/organigram).",
-        "# Tipo cart (jerárquico)\n\n"
-        "Árbol de cartas multinivel. Esquema EXACTO de `tree.json`:\n\n"
-        "```json\n"
-        "{\n"
-        "  \"type\": \"cart\",\n"
-        "  \"lastIdCharged\": 3,\n"
-        "  \"attachments\": {},\n"
-        "  \"nodoRaiz\": {\n"
-        "    \"idCarta\": 0,\n"
-        "    \"idPadre\": null,\n"
-        "    \"tituloCarta\": \"Raíz\",\n"
-        "    \"descripcion\": \"texto del cuerpo\",\n"
-        "    \"color\": null,\n"
-        "    \"shape\": \"default\",\n"
-        "    \"collapsed\": false,\n"
-        "    \"listaHijos\": [ /* cartas con la MISMA forma */ ]\n"
-        "  }\n"
-        "}\n"
-        "```\n\n"
-        "## Campos por carta\n"
-        "- `idCarta` (int, único), `idPadre` (int del padre, o null en la raíz).\n"
-        "- `tituloCarta` (str), `descripcion` (str, cuerpo de texto).\n"
-        "- `color` (str|null), `shape` (\"default\"), `collapsed` (bool).\n"
-        "- `listaHijos` (array de cartas).\n\n"
-        "## Editar\n"
-        "- **Agregar hijo**: crear una carta con `idCarta = lastIdCharged + 1` y "
-        "  `idPadre = idCarta del padre`; pushearla a `listaHijos` del padre; "
-        "  subir `lastIdCharged`.\n"
-        "- **Mover**: sacar la carta de un `listaHijos` y ponerla en otro; "
-        "  actualizar su `idPadre`.\n"
-        "- **Borrar**: quitar la carta (con su subárbol) de `listaHijos`.\n"
-        "- OJO: es `nodoRaiz`/`listaHijos`/`idCarta`/`tituloCarta` (NO raiz/hijos/id/titulo).",
-    ),
-    _skill(
-        "diagramind-freestyle",
-        "Canvas libre (tipo `freestyle`): nodos con x/y, flechas y formas.",
-        "# Tipo freestyle (canvas libre)\n\n"
-        "Plano, sin layout automático. Esquema EXACTO:\n\n"
-        "```json\n"
-        "{\n"
-        "  \"type\": \"freestyle\",\n"
-        "  \"lastIdCharged\": 2, \"lastArrowId\": 1, \"lastShapeId\": 0,\n"
-        "  \"attachments\": {},\n"
-        "  \"nodos\":  [{ \"id\":1, \"x\":100, \"y\":80, \"ancho\":160, \"alto\":90,\n"
-        "             \"titulo\":\"\", \"contenido\":\"\", \"color\":null,\n"
-        "             \"type\":\"basic\", \"data\":{} }],\n"
-        "  \"flechas\":[{ \"id\":1, \"fromId\":1, \"toId\":2,\n"
-        "             \"fromSide\":\"right\", \"toSide\":\"left\", \"label\":\"\", \"color\":null }],\n"
-        "  \"formas\": [{ \"id\":1, \"x\":0,\"y\":0,\"ancho\":120,\"alto\":120,\n"
-        "             \"rotation\":0, \"shape\":\"rect\", \"fill\":\"#fff\", \"stroke\":\"#000\",\n"
-        "             \"strokeWidth\":2, \"label\":\"\", \"imageSrc\":\"\",\n"
-        "             \"imgPosX\":50, \"imgPosY\":50, \"imgZoom\":1 }]\n"
-        "}\n"
-        "```\n\n"
-        "## Editar\n"
-        "- **Agregar nodo**: id `lastIdCharged + 1`; x/y/ancho/alto numéricos; subir "
-        "  `lastIdCharged`.\n"
-        "- **Conectar**: nueva flecha en `flechas` con `fromId`/`toId` de nodos "
-        "  existentes; `fromSide`/`toSide` ∈ left/right/top/bottom; subir `lastArrowId`.\n"
-        "- **Editar nodo**: cambiá `titulo`/`contenido`/`color` (hex) o `x`/`y`/`ancho`/`alto`.\n"
-        "- **Forma**: nueva en `formas`; subir `lastShapeId` (`fill`/`stroke` son hex).\n"
-        "- **Borrar nodo**: quitalo de `nodos` Y borrá las flechas que lo referencian.\n"
-        "- No dupliques ids dentro de cada lista.",
-    ),
-    _skill(
-        "diagramind-activities",
-        "Diagrama de actividades (tipo `activities`): precedencias / Gantt.",
-        "# Tipo activities\n\n"
-        "Actividades con precedencias dirigidas. Esquema EXACTO:\n\n"
-        "```json\n"
-        "{\n"
-        "  \"type\": \"activities\",\n"
-        "  \"lastId\": 3, \"seqCounter\": 3, \"timeUnit\": \"dias\",\n"
-        "  \"attachments\": {},\n"
-        "  \"nodes\": [{ \"id\":1, \"titulo\":\"Tarea\", \"contenido\":\"\",\n"
-        "             \"color\":null, \"isStart\":true, \"seq\":1, \"duracion\":2 }],\n"
-        "  \"edges\": [{ \"fromId\":1, \"toId\":2, \"color\":null }]\n"
-        "}\n"
-        "```\n\n"
-        "## Campos\n"
-        "- nodo: `id` (int), `titulo`, `contenido`, `color`, `isStart` (bool), "
-        "  `seq` (orden), `duracion` (en `timeUnit`: horas/dias/semanas).\n"
-        "- `edges`: precedencias dirigidas `fromId → toId`.\n\n"
-        "## Editar\n"
-        "- **Agregar actividad**: id `lastId + 1`, `seq = seqCounter + 1`; subir "
-        "  ambos contadores.\n"
-        "- **Precedencia**: nuevo `edge` con ids existentes. **No crees ciclos.**\n"
-        "- **Editar**: cambiá `titulo`/`contenido`/`color` (hex)/`duracion`; `isStart` "
-        "  marca el nodo de arranque.\n"
-        "- **Borrar actividad**: quitala de `nodes` Y borrá los `edges` que la referencian.\n"
-        "- Mantené `timeUnit` coherente (horas/dias/semanas).",
-    ),
-])
-
-
-def install_skills(project_dir):
-    skills_dir = os.path.join(project_dir, ".claude", "skills")
-    for name, content in SKILLS.items():
-        d = os.path.join(skills_dir, name)
-        os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as f:
-            f.write(content)
-
 
 # ===================== selector nativo de carpeta =====================
 # El navegador no expone la ruta real del sistema; el conector sí. Abrimos un
@@ -664,9 +308,16 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(parsed.query)
 
         if path == "/health":
+            clis = []
+            for a in CLIS.values():
+                b = a.find()
+                clis.append({"key": a.key, "label": a.label, "available": bool(b),
+                             "version": a.version(b) if b else None, "resume": a.supports_resume})
             cb = find_claude()
             self._json(200, {
                 "status": "ok", "name": NAME, "version": VERSION,
+                "clis": clis,
+                # compat: campo claude suelto (clientes viejos)
                 "claude": {"available": bool(cb),
                            "version": claude_version(cb) if cb else None},
             })
@@ -931,10 +582,15 @@ class Handler(BaseHTTPRequestHandler):
         # --resume sobrevive el cambio de foco entre proyectos de la misma carpeta y
         # Claude "sabe" en qué carpeta labura (su cwd + el focus_note).
         work_dir = folder_dir(folder)
+        cli_key = body.get("cli") or "claude"
+        adapter = CLIS.get(cli_key)
+        if not adapter:
+            self._json(400, {"error": f"CLI desconocido: {cli_key}"})
+            return
         web_session = body.get("sessionId")
-        # la sesión de Claude está atada al cwd (la carpeta), así que el fallback
-        # se cachea por (sesión web, carpeta).
-        skey = f"{web_session}::{safe_name(folder)}" if web_session else None
+        # la sesión (resume) está atada al cwd (la carpeta) y al CLI; se cachea por
+        # (sesión web, carpeta, cli). Solo aplica a los CLIs que soportan --resume.
+        skey = f"{web_session}::{safe_name(folder)}::{cli_key}" if web_session else None
         resume = body.get("resume") or (SESSION_MAP.get(skey) if skey else None)
         mode = body.get("mode") or "auto-edit"
         model = body.get("model")
@@ -942,8 +598,8 @@ class Handler(BaseHTTPRequestHandler):
         run = new_run()
 
         def worker():
-            run_claude(run, work_dir, message, mode, model, resume, name, folder)
-            if run.get("claude_session_id") and skey:
+            run_cli(run, adapter, work_dir, message, mode, model, resume, name, folder)
+            if adapter.supports_resume and run.get("claude_session_id") and skey:
                 SESSION_MAP[skey] = run["claude_session_id"]
 
         threading.Thread(target=worker, daemon=True).start()

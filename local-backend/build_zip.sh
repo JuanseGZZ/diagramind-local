@@ -9,7 +9,9 @@ OUT="$ROOT"
 STAGE="$(mktemp -d)/diagramind-local"
 
 mkdir -p "$STAGE" "$OUT"
-cp "$HERE/server.py" "$STAGE/"
+# server.py es el entry point pero importa módulos hermanos (runs/skills/cli_base/
+# claude/codex/gemini/clis/util) → copiamos TODOS los .py, no solo server.py.
+cp "$HERE"/*.py "$STAGE/"
 cp "$HERE/launchers/iniciar.command" "$STAGE/"
 cp "$HERE/launchers/iniciar.bat" "$STAGE/"
 cp "$HERE/launchers/LEEME.txt" "$STAGE/"
