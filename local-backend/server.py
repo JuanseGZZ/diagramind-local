@@ -30,6 +30,7 @@ Detener: Ctrl+C
 """
 
 import argparse
+import base64
 import json
 import os
 import shutil
@@ -43,7 +44,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # módulos desacoplados (ver claude.py / codex.py / gemini.py / cli_base.py / etc.)
-from util import safe_name
+from util import safe_name, safe_file_name
 from runs import RUNS, RUNS_LOCK, SESSION_MAP, new_run, emit
 from skills import install_skills
 from claude import find_claude, claude_version
@@ -52,7 +53,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 
 # ===================== rutas / disco =====================
 
@@ -124,6 +125,38 @@ def folder_dir(folder):
 # la web) se resuelve para el mirror leyendo el index.json de la carpeta.
 def tree_dir(folder, name):
     return os.path.join(folder_dir(folder), safe_name(name))
+
+
+# ===================== adjuntos del chat (tempFiles) =====================
+# Los archivos que el usuario arrastra/sube en el chat se guardan en una carpeta
+# temporal DENTRO del proyecto (<root>/<carpeta>/<proyecto>/tempFiles/), así Claude
+# los lee con una ruta relativa a su cwd (la carpeta). Viven como mucho TEMP_TTL_DAYS
+# días: cada subida (y el arranque) barre los vencidos. Ver doc 18 / 19 (uploads).
+TEMP_DIRNAME = "tempFiles"
+TEMP_TTL_DAYS = 10
+TEMP_TTL_SECS = TEMP_TTL_DAYS * 24 * 3600
+
+
+def temp_dir(folder, name):
+    return os.path.join(tree_dir(folder, name), TEMP_DIRNAME)
+
+
+def sweep_temp_files():
+    """Borra adjuntos con más de TEMP_TTL_DAYS días en TODOS los tempFiles/."""
+    now = time.time()
+    root = projects_dir()
+    if not os.path.isdir(root):
+        return
+    for dirpath, dirnames, filenames in os.walk(root):
+        if os.path.basename(dirpath) != TEMP_DIRNAME:
+            continue
+        for fn in filenames:
+            fp = os.path.join(dirpath, fn)
+            try:
+                if now - os.path.getmtime(fp) > TEMP_TTL_SECS:
+                    os.remove(fp)
+            except OSError:
+                pass
 
 
 def read_folder_index(folder):
@@ -342,6 +375,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/projects/sync":
             self._sync(self._read_json())
+        elif path == "/files/upload":
+            self._files_upload(self._read_json())
         elif path == "/folders/reveal":
             self._folders_reveal(self._read_json())
         elif path == "/config/root":
@@ -378,6 +413,37 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
         self._json(200, {"ok": True, "path": tdir})
+
+    def _files_upload(self, body):
+        """Recibe adjuntos del chat (base64) y los guarda en el tempFiles/ del
+        proyecto. Devuelve las rutas RELATIVAS a la carpeta (cwd del chat) para que
+        la web se las pase a Claude. Los archivos viven como mucho TEMP_TTL_DAYS días."""
+        folder = body.get("folder") or "Local"
+        name = body.get("name") or body.get("id")
+        files = body.get("files")
+        if not name or not isinstance(files, list):
+            self._json(400, {"error": "faltan name o files"})
+            return
+        tmp = temp_dir(folder, name)
+        os.makedirs(tmp, exist_ok=True)
+        saved = []
+        for f in files:
+            try:
+                data = base64.b64decode(f.get("dataB64") or "")
+            except Exception:
+                continue
+            fname = safe_file_name(f.get("name") or "archivo")
+            dest = os.path.join(tmp, fname)
+            if os.path.exists(dest):                  # no pisar uno previo del mismo nombre
+                stem, ext = os.path.splitext(fname)
+                fname = f"{stem}-{uuid.uuid4().hex[:6]}{ext}"
+                dest = os.path.join(tmp, fname)
+            with open(dest, "wb") as out:
+                out.write(data)
+            rel = f"{safe_name(name)}/{TEMP_DIRNAME}/{fname}"   # relativo al cwd (la carpeta)
+            saved.append({"name": f.get("name"), "path": rel, "bytes": len(data)})
+        sweep_temp_files()                            # de paso, barrer los vencidos
+        self._json(200, {"ok": True, "files": saved, "ttlDays": TEMP_TTL_DAYS})
 
     def _manifest(self, body):
         """Escribe el índice por carpeta (<carpeta>/index.json) + el índice de
@@ -685,6 +751,7 @@ def main():
 
     os.makedirs(projects_dir(), exist_ok=True)
     cb = find_claude()
+    sweep_temp_files()                       # limpiar adjuntos vencidos al arrancar
 
     # watcher del state mirror (poll de mtime → SSE)
     threading.Thread(target=watch_state, daemon=True).start()
@@ -693,8 +760,8 @@ def main():
     print(f"DiagraMind local backend v{VERSION} → http://{HOST}:{args.port}")
     print(f"Claude Code: {'OK · ' + (claude_version(cb) or '') if cb else 'NO ENCONTRADO'}")
     print(f"Proyectos en: {projects_dir()}")
-    print("Endpoints: GET /health · POST /projects/sync · POST /chat · "
-          "GET /chat/stream · GET /projects/tree · POST /chat/cancel · "
+    print("Endpoints: GET /health · POST /projects/sync · POST /files/upload · "
+          "POST /chat · GET /chat/stream · GET /projects/tree · POST /chat/cancel · "
           "GET /state · GET /state/stream · POST /state/write")
     print("Ctrl+C para detener.")
     try:
