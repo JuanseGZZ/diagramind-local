@@ -31,8 +31,10 @@ Detener: Ctrl+C
 
 import argparse
 import base64
+import hmac
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -53,7 +55,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.10.0"
+VERSION = "0.11.0"
 
 # ===================== rutas / disco =====================
 
@@ -72,6 +74,44 @@ def app_dir():
 
 def config_path():
     return os.path.join(app_dir(), "config.json")
+
+
+# ===================== token de acceso (auth local) =====================
+# Aunque el server escucha SOLO en 127.0.0.1, el CORS es abierto: cualquier web
+# que abras en el navegador podría pegarle al backend. Un token random corta eso.
+# Se guarda en <app_dir>/token.txt: si no existe se genera al azar; si existe se
+# usa. La web lo manda en cada request (?token= o header X-DiagraMind-Token).
+_TOKEN = None
+
+
+def token_path():
+    return os.path.join(app_dir(), "token.txt")
+
+
+def get_token():
+    global _TOKEN
+    if _TOKEN is None:
+        _TOKEN = _load_or_create_token()
+    return _TOKEN
+
+
+def _load_or_create_token():
+    p = token_path()
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            t = f.read().strip()
+        if t:
+            return t
+    except Exception:
+        pass
+    t = secrets.token_urlsafe(24)
+    try:
+        os.makedirs(app_dir(), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(t + "\n")
+    except OSError:
+        pass
+    return t
 
 
 def _load_config():
@@ -308,7 +348,17 @@ class Handler(BaseHTTPRequestHandler):
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-DiagraMind-Token")
+
+    # --- auth: token en ?token= o header X-DiagraMind-Token ---
+    def _req_token(self):
+        t = parse_qs(urlparse(self.path).query).get("token", [None])[0]
+        if not t:
+            t = self.headers.get("X-DiagraMind-Token")
+        return t or ""
+
+    def _auth_ok(self):
+        return hmac.compare_digest(self._req_token(), get_token())
 
     def _json(self, code, payload):
         body = json.dumps(payload).encode("utf-8")
@@ -341,6 +391,9 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(parsed.query)
 
         if path == "/health":
+            # /health es PÚBLICO (la web lo usa para detectar el server). No
+            # devuelve el token; solo dice que se requiere y si el que mandaron
+            # (si mandaron alguno) es válido.
             clis = []
             for a in CLIS.values():
                 b = a.find()
@@ -349,12 +402,19 @@ class Handler(BaseHTTPRequestHandler):
             cb = find_claude()
             self._json(200, {
                 "status": "ok", "name": NAME, "version": VERSION,
+                "auth": True, "authOk": self._auth_ok(),
                 "clis": clis,
                 # compat: campo claude suelto (clientes viejos)
                 "claude": {"available": bool(cb),
                            "version": claude_version(cb) if cb else None},
             })
-        elif path == "/projects/tree":
+            return
+
+        if not self._auth_ok():
+            self._json(401, {"error": "unauthorized"})
+            return
+
+        if path == "/projects/tree":
             self._get_tree(q.get("name", q.get("id", [None]))[0], q.get("folder", [None])[0])
         elif path == "/chat/stream":
             self._stream(q.get("runId", [None])[0])
@@ -373,6 +433,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if not self._auth_ok():
+            self._json(401, {"error": "unauthorized"})
+            return
         if path == "/projects/sync":
             self._sync(self._read_json())
         elif path == "/files/upload":
@@ -752,6 +815,7 @@ def main():
     os.makedirs(projects_dir(), exist_ok=True)
     cb = find_claude()
     sweep_temp_files()                       # limpiar adjuntos vencidos al arrancar
+    tok = get_token()                        # cargar/crear el token de acceso
 
     # watcher del state mirror (poll de mtime → SSE)
     threading.Thread(target=watch_state, daemon=True).start()
@@ -760,6 +824,8 @@ def main():
     print(f"DiagraMind local backend v{VERSION} → http://{HOST}:{args.port}")
     print(f"Claude Code: {'OK · ' + (claude_version(cb) or '') if cb else 'NO ENCONTRADO'}")
     print(f"Proyectos en: {projects_dir()}")
+    print(f"Contraseña (token) de acceso: {tok}")
+    print(f"  (guardada en {token_path()} — la web te la va a pedir al conectar)")
     print("Endpoints: GET /health · POST /projects/sync · POST /files/upload · "
           "POST /chat · GET /chat/stream · GET /projects/tree · POST /chat/cancel · "
           "GET /state · GET /state/stream · POST /state/write")
