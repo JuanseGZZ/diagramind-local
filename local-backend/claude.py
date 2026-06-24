@@ -120,6 +120,10 @@ class ClaudeAdapter:
             b, "-p", msg, "--output-format", "stream-json", "--verbose",
             "--model", map_model(model), "--permission-mode", perm,
             "--add-dir", work_dir,
+            # WebFetch/WebSearch nativas quedan deshabilitadas: en el modo object los
+            # fetches del diagrama se corren con el mecanismo `runReq` (ver skill),
+            # NO con la tool genérica de Claude (no usaría el body/headers/proxy ni se vería).
+            "--disallowedTools", "WebFetch", "WebSearch",
             "--append-system-prompt", SYSTEM_PREAMBLE + "\n\n" + _focus_note(folder, focus_name),
         ]
         if resume:

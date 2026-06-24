@@ -20,6 +20,11 @@ SYSTEM_PREAMBLE = (
     "Podés LEER cualquier otro proyecto (./<id>/tree.json, buscalo por nombre en "
     "./index.json) para basarte en él; escribí en otro proyecto SOLO si el usuario "
     "te lo pide explícitamente.\n\n"
+    "EJECUTAR FETCHES (proyectos tipo object): para 'correr/probar' un nodo Fetch o "
+    "Ráfaga del diagrama NO uses WebFetch ni curl/Bash (están deshabilitadas a propósito): "
+    "editá el `tree.json` poniendo un `runReq` nuevo en el `data` del nodo, guardá y terminá "
+    "tu turno; la app lo ejecuta y te devuelve el resultado en el próximo turno. Ver la "
+    "skill diagramind-object.\n\n"
     "IMPORTANTE: es UNA conversación continua. Recordás lo que hiciste en turnos "
     "anteriores aunque el usuario cambie el proyecto foco. Si el usuario se refiere "
     "a 'eso' o 'lo que agregaste', mirá el historial de la conversación.\n\n"
@@ -257,7 +262,21 @@ SKILLS = dict([
         "- Atributo referencia LLENO en un objeto = una flecha `value` (NO va en `valores`).\n"
         "- Si una clase tiene un atributo `{ref:X}`, agregá también la flecha `tiene` clase→X con ese `attrId`.\n"
         "- Herencia: seteá `padre` Y agregá la flecha `hereda`. El objeto hereda los atributos efectivos (cadena de padres): usá esos `attrId`.\n"
-        "- El `titulo` NO es dato del JSON: el JSON sale de los atributos + las flechas.",
+        "- El `titulo` NO es dato del JSON: el JSON sale de los atributos + las flechas.\n\n"
+        "## Ejecutar un Fetch / Ráfaga (testear endpoints)\n"
+        "**MUY IMPORTANTE — NO uses tu herramienta `WebFetch` ni `Bash`/`curl` para "
+        "ejecutar un nodo Fetch del diagrama.** Esas herramientas NO arman el body desde "
+        "el grafo de objetos, NO respetan el method/headers del nodo, NO pasan por el "
+        "proxy del conector (CORS) y NO se ven en el canvas. La ÚNICA forma correcta de "
+        "correr un nodo `objfetch`/`objburst` es por su estado:\n"
+        "1. Poné en el `data` del nodo un campo `runReq` con una marca NUEVA (ej. un "
+        "timestamp o un número distinto al anterior).\n"
+        "2. GUARDÁ el `tree.json` y **terminá tu turno** (NO uses sleeps ni loops de espera).\n"
+        "3. La app ejecuta el nodo y te devuelve el resultado (status + body + webhook) en "
+        "el PRÓXIMO turno AUTOMÁTICAMENTE. También queda en el nodo como `data.lastResponse`.\n"
+        "Para re-ejecutar, cambiá de nuevo `runReq`. Podés pedir varios nodos a la vez "
+        "(varios `runReq`). Si te piden 'ejecutar/probar un fetch' de un proyecto object, "
+        "esto es lo que tenés que hacer — nunca WebFetch.",
     ),
 ])
 
