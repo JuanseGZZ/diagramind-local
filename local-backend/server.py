@@ -38,9 +38,12 @@ import secrets
 import shutil
 import subprocess
 import sys
+import ssl
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -55,7 +58,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 
 # ===================== rutas / disco =====================
 
@@ -452,6 +455,8 @@ class Handler(BaseHTTPRequestHandler):
             self._chat(self._read_json())
         elif path == "/chat/cancel":
             self._cancel(parse_qs(urlparse(self.path).query).get("runId", [None])[0])
+        elif path == "/fetch":
+            self._proxy_fetch(self._read_json())
         else:
             self._json(404, {"error": "not found", "path": path})
 
@@ -752,6 +757,49 @@ class Handler(BaseHTTPRequestHandler):
         emit(run, "status", status="cancelled")
         self._json(200, {"ok": True})
 
+    # --- proxy de fetch (resuelve CORS: el request lo hace el server, no el browser) ---
+    def _proxy_fetch(self, body):
+        """Hace un request HTTP server-side y devuelve la respuesta. Lo usa el modo
+        object para mandar fetches sin chocar con CORS (el browser no puede). Una
+        respuesta HTTP (incluido 4xx/5xx) es ok=True con su status/body; un error de
+        red/DNS es ok=False con el mensaje."""
+        url = (body.get("url") or "").strip()
+        method = (body.get("method") or "GET").upper()
+        raw_headers = body.get("headers") or {}
+        data = body.get("body")
+        if not url:
+            self._json(400, {"error": "falta url"})
+            return
+
+        hdrs = {}
+        if isinstance(raw_headers, list):          # [{k,v}]
+            for hh in raw_headers:
+                if isinstance(hh, dict) and hh.get("k"):
+                    hdrs[hh["k"]] = hh.get("v", "")
+        elif isinstance(raw_headers, dict):        # {k:v}
+            hdrs = {str(k): ("" if v is None else str(v)) for k, v in raw_headers.items()}
+
+        payload = None
+        if data is not None and method not in ("GET", "HEAD"):
+            payload = data.encode("utf-8") if isinstance(data, str) else json.dumps(data).encode("utf-8")
+
+        try:
+            req = urllib.request.Request(url, data=payload, method=method, headers=hdrs)
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+                text = resp.read().decode("utf-8", errors="replace")
+                self._json(200, {"ok": True, "status": resp.status,
+                                 "statusText": getattr(resp, "reason", "") or "", "body": text})
+        except urllib.error.HTTPError as e:
+            try:
+                text = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                text = ""
+            self._json(200, {"ok": True, "status": e.code,
+                             "statusText": getattr(e, "reason", "") or "", "body": text})
+        except Exception as e:
+            self._json(200, {"ok": False, "error": str(e)})
+
     def _stream(self, rid):
         with RUNS_LOCK:
             run = RUNS.get(rid)
@@ -828,7 +876,7 @@ def main():
     print(f"  (guardada en {token_path()} — la web te la va a pedir al conectar)")
     print("Endpoints: GET /health · POST /projects/sync · POST /files/upload · "
           "POST /chat · GET /chat/stream · GET /projects/tree · POST /chat/cancel · "
-          "GET /state · GET /state/stream · POST /state/write")
+          "GET /state · GET /state/stream · POST /state/write · POST /fetch")
     print("Ctrl+C para detener.")
     try:
         server.serve_forever()
