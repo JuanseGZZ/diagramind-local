@@ -1,0 +1,46 @@
+"""Bodies pydantic de las requests/responses (auth + users)."""
+
+from pydantic import BaseModel, Field
+
+# ---- auth ----
+
+class LoginBody(BaseModel):
+    username: str
+    password: str
+
+
+class RefreshBody(BaseModel):
+    refresh: str
+
+
+class ChangePasswordBody(BaseModel):
+    # current es opcional: en el primer ingreso (must_change_pw) se permite sin el viejo
+    current: str | None = None
+    newPassword: str = Field(min_length=6)
+
+
+# ---- users (admin) ----
+
+class CreateUserBody(BaseModel):
+    username: str = Field(min_length=1)
+    role: str = "viewer"          # admin | editor | viewer
+
+
+class SetRoleBody(BaseModel):
+    role: str                     # admin | editor | viewer
+
+
+class SetAclBody(BaseModel):
+    folderId: str
+    permission: str               # none | read | write
+
+
+# ---- folders / projects (namespace canónico) ----
+
+class CreateFolderBody(BaseModel):
+    name: str = Field(min_length=1)
+
+
+class CreateProjectBody(BaseModel):
+    folderId: str
+    name: str = Field(min_length=1)
