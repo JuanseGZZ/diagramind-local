@@ -16,9 +16,14 @@ El borrado con autoría (§F) y el `GET /repo` del dashboard llegan en el paso 4
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from auth import current_user, require_admin
-from models import CreateFolderBody, CreateProjectBody
+from models import CreateFolderBody, CreateProjectBody, IdBody
 from projects import read_tree
 import store
+
+
+def _can_delete(user: dict, created_by) -> bool:
+    """§F: borrar sólo el **creador** o un **admin**."""
+    return user["role"] == "admin" or created_by == user["id"]
 
 router = APIRouter(tags=["content"])
 
@@ -62,3 +67,31 @@ def project_tree(id: str = Query(...), user: dict = Depends(current_user)):
     if store.project_permission(user, id) == "none":
         raise HTTPException(status_code=403, detail="no access to project")
     return {"tree": read_tree(id)}
+
+
+@router.post("/projects/delete")
+def delete_project(body: IdBody, user: dict = Depends(current_user)):
+    proj = store.get_project(body.id)
+    if not proj:
+        raise HTTPException(status_code=404, detail="project not found")
+    if not _can_delete(user, proj["created_by"]):
+        raise HTTPException(status_code=403, detail="only the creator or an admin can delete")
+    store.delete_project(body.id)
+    return {"ok": True}
+
+
+@router.post("/folders/delete")
+def delete_folder(body: IdBody, user: dict = Depends(current_user)):
+    folder = store.get_folder(body.id)
+    if not folder:
+        raise HTTPException(status_code=404, detail="folder not found")
+    if not _can_delete(user, folder["created_by"]):
+        raise HTTPException(status_code=403, detail="only the creator or an admin can delete")
+    store.delete_folder(body.id)
+    return {"ok": True}
+
+
+@router.get("/repo")
+def repo(_: dict = Depends(require_admin)):
+    """Árbol completo (carpetas + proyectos) para el dashboard."""
+    return {"folders": store.repo_tree()}

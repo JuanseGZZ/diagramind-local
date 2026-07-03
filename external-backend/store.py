@@ -12,6 +12,7 @@ Permisos (§3): ACL por carpeta `none|read|write`. Sin fila = `none` (ni ve la c
 
 import re
 import secrets
+import shutil
 
 from db import connect
 from config import REPO_ROOT
@@ -104,9 +105,43 @@ def project_reldir(pid: str) -> str | None:
 
 
 def delete_project(pid: str) -> bool:
+    """Borra el proyecto (row + dir en disco). Recuperable vía git una vez que el
+    versionado esté (§8); por ahora saca el working tree del proyecto."""
+    rel = project_reldir(pid)
     with connect() as c:
         r = c.execute("DELETE FROM projects WHERE id=?", (pid,))
-        return r.rowcount > 0
+        deleted = r.rowcount > 0
+    if deleted and rel:
+        shutil.rmtree(REPO_ROOT / rel, ignore_errors=True)
+    return deleted
+
+
+def delete_folder(fid: str) -> bool:
+    """Borra la carpeta: ACL de esa carpeta + proyectos (cascade) + dir en disco."""
+    f = get_folder(fid)
+    if not f:
+        return False
+    with connect() as c:
+        c.execute("DELETE FROM acl WHERE folder_id=?", (fid,))     # ACL no tiene FK cascade
+        c.execute("DELETE FROM folders WHERE id=?", (fid,))        # projects caen por FK cascade
+    shutil.rmtree(REPO_ROOT / f["dirname"], ignore_errors=True)
+    return True
+
+
+def repo_tree() -> list[dict]:
+    """Árbol completo (carpetas + sus proyectos) para el dashboard (§4)."""
+    out = []
+    for f in list_folders():
+        projs = list_projects(f["id"])
+        out.append({
+            "id": f["id"], "name": f["name"], "dirname": f["dirname"],
+            "createdBy": f["created_by"], "createdAt": f["created_at"],
+            "projects": [{
+                "id": p["id"], "name": p["name"], "dirname": p["dirname"],
+                "createdBy": p["created_by"], "createdAt": p["created_at"],
+            } for p in projs],
+        })
+    return out
 
 
 # ---------------- permisos ----------------

@@ -26,7 +26,7 @@ cambiarla.
 | `DMC_HOST` | `127.0.0.1` | host |
 | `DMC_PORT` | `8770` | puerto |
 
-## Endpoints (pasos 1–3)
+## Endpoints (pasos 1–4)
 
 | Método | Ruta | Quién | Qué |
 |---|---|---|---|
@@ -42,6 +42,9 @@ cambiarla.
 | POST | `/projects` | write | crear proyecto en una carpeta |
 | GET | `/projects?folderId=` | read | listar proyectos de una carpeta |
 | GET | `/projects/tree?id=` | read | lectura inicial del `tree.json` |
+| POST | `/projects/delete` | creador/admin | borrar proyecto (§F) |
+| POST | `/folders/delete` | creador/admin | borrar carpeta (+ sus proyectos) |
+| GET | `/repo` | admin | árbol completo (carpetas + proyectos) para el dashboard |
 | WS | `/ws?ticket=` | sesión | mirror realtime: `open`/`edit`/`cursor`/`close` (§5) |
 
 Auth: `Authorization: Bearer <access>`. Access corto (15 min), refresh largo (30 d)
