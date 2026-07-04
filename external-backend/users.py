@@ -52,6 +52,22 @@ def create_user(body: CreateUserBody, _: dict = Depends(require_admin)):
     return {"id": uid, "username": body.username, "role": body.role, "tempPassword": temp}
 
 
+@router.post("/{uid}/reset-password")
+def reset_password(uid: int, _: dict = Depends(require_admin)):
+    """Resetea la contraseña de un usuario: nueva temporal (se devuelve UNA vez),
+    obliga a cambiarla al entrar e invalida todas sus sesiones."""
+    temp = random_password()
+    with connect() as c:
+        r = c.execute(
+            "UPDATE users SET password_hash=?, must_change_pw=1, token_version=token_version+1 WHERE id=?",
+            (hash_password(temp), uid),
+        )
+        if r.rowcount == 0:
+            raise HTTPException(status_code=404, detail="user not found")
+        c.execute("UPDATE refresh_tokens SET revoked=1 WHERE user_id=?", (uid,))
+    return {"tempPassword": temp}
+
+
 @router.post("/{uid}/role")
 def set_role(uid: int, body: SetRoleBody, _: dict = Depends(require_admin)):
     if body.role not in ROLES:

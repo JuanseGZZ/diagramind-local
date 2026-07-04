@@ -58,7 +58,11 @@ async def lifespan(app: FastAPI):
     init_db()
     bootstrap_admin()
     root = init_repo()
-    print(f"[connector] {config.NAME} v{config.VERSION} — root git: {root}", flush=True)
+    print(f"[connector] {config.NAME} v{config.VERSION}", flush=True)
+    print(f"  home:      {config.HOME}", flush=True)
+    print(f"             (en Mac, ~/Library está oculta en Finder: Cmd+Shift+G para ir)", flush=True)
+    print(f"  root git:  {root}", flush=True)
+    print(f"  dashboard: http://{config.HOST}:{config.PORT}/dashboard/", flush=True)
     yield
 
 
@@ -98,5 +102,40 @@ _DASH = Path(__file__).resolve().parent / "dashboard"
 app.mount("/dashboard", StaticFiles(directory=str(_DASH), html=True), name="dashboard")
 
 
+def reset_password_cli(username: str) -> None:
+    """Recuperación LOCAL de contraseña (p.ej. admin que se la olvidó): genera una
+    nueva aleatoria, invalida todas las sesiones y re-habilita al usuario. Requiere
+    shell en la máquina del server — ese es el modelo de seguridad (quien tiene
+    acceso al disco ya es dueño del conector)."""
+    config.ensure_home()
+    init_db()
+    with connect() as c:
+        row = c.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+        if not row:
+            print(f"[connector] el usuario {username!r} no existe")
+            return
+        pw = random_password()
+        c.execute(
+            "UPDATE users SET password_hash=?, must_change_pw=1, disabled=0, "
+            "token_version=token_version+1 WHERE id=?",
+            (hash_password(pw), row["id"]),
+        )
+        c.execute("UPDATE refresh_tokens SET revoked=1 WHERE user_id=?", (row["id"],))
+    if username == "admin":
+        config.ADMIN_PW_PATH.write_text(pw, encoding="utf-8")
+    print(f"[connector] contraseña reseteada para {username!r}: {pw}")
+    print("  Al entrar va a pedir cambiarla. Todas las sesiones viejas quedaron invalidadas.")
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host=config.HOST, port=config.PORT)
+    import argparse
+    ap = argparse.ArgumentParser(description=f"{config.NAME} v{config.VERSION}")
+    ap.add_argument(
+        "--reset-password", metavar="USER", nargs="?", const="admin", default=None,
+        help="resetea la contraseña de un usuario (sin valor: admin) y sale",
+    )
+    args = ap.parse_args()
+    if args.reset_password:
+        reset_password_cli(args.reset_password)
+    else:
+        uvicorn.run(app, host=config.HOST, port=config.PORT)

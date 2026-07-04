@@ -15,6 +15,19 @@ import time
 import bcrypt
 import jwt
 
+# Trampa conocida: existe OTRO paquete PyPI llamado "jwt" (GehirnInc) que NO tiene
+# jwt.encode(). Si el server corre con un Python que lo tenga (p.ej. el del sistema
+# en vez del .venv), el login revienta con un 500 críptico. Cortar acá con un
+# mensaje claro.
+if not hasattr(jwt, "encode"):
+    raise SystemExit(
+        "[connector] El módulo 'jwt' importado NO es PyJWT "
+        f"(vino de {getattr(jwt, '__file__', '?')}).\n"
+        "  Probablemente estés usando el Python del sistema en vez del venv.\n"
+        "  Corré:  .venv/bin/python server.py\n"
+        "  (o en ese Python: pip uninstall jwt && pip install PyJWT)"
+    )
+
 from config import ACCESS_TTL, JWT_ALG, REFRESH_TTL, get_secret
 
 

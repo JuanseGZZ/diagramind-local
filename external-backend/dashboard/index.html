@@ -177,6 +177,14 @@ async function renderUsers() {
         const roleSel=el("select"); ["viewer","editor","admin"].forEach(x=>roleSel.append(el("option",{value:x,textContent:x,selected:x===u.role})));
         roleSel.addEventListener("change",()=>jpost(`/users/${u.id}/role`,{role:roleSel.value}).catch(alertErr));
         const acl=el("button",{textContent:"ACL"}); acl.addEventListener("click",()=>editAcl(u,repo));
+        const rpw=el("button",{textContent:"Reset pw"});
+        rpw.addEventListener("click",async()=>{
+          if(!confirm(`¿Resetear la contraseña de ${u.username}? Se invalidan sus sesiones.`)) return;
+          try{ const d=await jpost(`/users/${u.id}/reset-password`,{});
+            cmsg.innerHTML=`<span class="ok">Contraseña de <b>${u.username}</b> reseteada.</span> Temporal: <b>${d.tempPassword}</b>`;
+            renderUsersTable(); }
+          catch(e){ alertErr(e); }
+        });
         const dis=el("button",{textContent:u.disabled?"Habilitar":"Deshabilitar"});
         dis.addEventListener("click",async()=>{ await api(`/users/${u.id}/disabled?disabled=${u.disabled?"false":"true"}`,{method:"POST"}); renderUsersTable(); });
         const del=el("button",{className:"danger",textContent:"✕"});
@@ -185,7 +193,7 @@ async function renderUsers() {
           el("td",{},[el("b",{textContent:u.username}), u.mustChangePassword?el("span",{className:"pill",style:"margin-left:6px",textContent:"debe cambiar pw"}):null]),
           el("td",{},roleSel),
           el("td",{},el("span",{className:u.disabled?"err":"ok",textContent:u.disabled?"deshabilitado":"activo"})),
-          el("td",{},el("div",{className:"row"},[acl,dis,del])),
+          el("td",{},el("div",{className:"row"},[acl,rpw,dis,del])),
         ]));
       }
       tbl.innerHTML=""; tbl.append(t);
