@@ -21,7 +21,7 @@ cambiarla.
 
 | Env | Default | Qué |
 |---|---|---|
-| `DMC_HOME` | `./.dmc` | dir base (db, secreto, repo) |
+| `DMC_HOME` | appdir del SO (mac: `~/Library/Application Support/DiagraMind-Connector`) | dir base (db, secreto, repo). **Nunca dentro del workspace**: si el estado vive en la carpeta del proyecto, un dev-server con live-reload (VSCode Live Server) recarga la página con cada escritura de la sqlite → loop de "F5 infinito" al conectar. Un `.dmc` legacy junto al script se migra solo. |
 | `DMC_ROOT` | `<HOME>/repo` | root del conector = repo git |
 | `DMC_HOST` | `127.0.0.1` | host |
 | `DMC_PORT` | `8770` | puerto |
