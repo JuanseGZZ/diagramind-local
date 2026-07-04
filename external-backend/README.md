@@ -26,7 +26,7 @@ cambiarla.
 | `DMC_HOST` | `127.0.0.1` | host |
 | `DMC_PORT` | `8770` | puerto |
 
-## Endpoints (pasos 1–4)
+## Endpoints (pasos 1–5)
 
 | Método | Ruta | Quién | Qué |
 |---|---|---|---|
@@ -45,7 +45,16 @@ cambiarla.
 | POST | `/projects/delete` | creador/admin | borrar proyecto (§F) |
 | POST | `/folders/delete` | creador/admin | borrar carpeta (+ sus proyectos) |
 | GET | `/repo` | admin | árbol completo (carpetas + proyectos) para el dashboard |
+| GET | `/versions/status?id=` | read | ¿cambios sin guardar? + HEAD + estado GitHub |
+| POST | `/versions/commit` | write | **Guardar** (commit; auto-push si GitHub conectado) |
+| GET | `/versions/log?id=` | read | historial del proyecto |
+| GET | `/versions/diff?id=&a=&b=` | read | diff (sin `a`: HEAD vs working) |
+| POST | `/versions/rollback` | write | restaura a un commit + difunde al room |
+| GET/POST | `/github/*` | admin | connect / status / push / disconnect |
 | WS | `/ws?ticket=` | sesión | mirror realtime: `open`/`edit`/`cursor`/`close` (§5) |
+| GET | `/dashboard/` | admin (en la UI) | dashboard estático: usuarios/ACL + repo + versiones + GitHub |
+
+El **dashboard** de administración está en `http://<host>:<port>/dashboard/` (`/` redirige ahí).
 
 Auth: `Authorization: Bearer <access>`. Access corto (15 min), refresh largo (30 d)
 con **rotación**; cambiar password o deshabilitar **invalida todo** (`token_version`).

@@ -48,3 +48,21 @@ class CreateProjectBody(BaseModel):
 
 class IdBody(BaseModel):
     id: str
+
+
+# ---- versionado (git) ----
+
+class CommitBody(BaseModel):
+    id: str
+    message: str | None = None
+
+
+class RollbackBody(BaseModel):
+    id: str
+    commit: str
+
+
+class GithubConnectBody(BaseModel):
+    remoteUrl: str
+    token: str
+    branch: str = "main"

@@ -98,6 +98,18 @@ class RoomManager:
 manager = RoomManager()
 
 
+async def push_canonical(pid: str) -> None:
+    """Difunde el estado canónico del proyecto a su room (tras un cambio hecho fuera
+    del WS, p.ej. un rollback de versionado). Bumpea el seq. No-op si no hay room."""
+    room = manager.rooms.get(pid)
+    if not room:
+        return
+    async with room.lock:
+        room.seq += 1
+        await manager.broadcast(pid, {"t": "state", "projectId": pid,
+                                      "tree": read_tree(pid), "seq": room.seq})
+
+
 async def _send(ws: WebSocket, msg: dict) -> None:
     await ws.send_text(json.dumps(msg))
 

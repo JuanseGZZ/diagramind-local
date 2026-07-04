@@ -8,10 +8,13 @@ Correr:  .venv/bin/python server.py       (o: uvicorn server:app)
 """
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 import config
 from auth import router as auth_router
@@ -21,6 +24,7 @@ from gitrepo import init_repo
 from realtime import router as realtime_router
 from security import hash_password, random_password
 from users import router as users_router
+from versions import router as versions_router
 
 
 def bootstrap_admin() -> None:
@@ -79,7 +83,19 @@ def health():
 app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(content_router)    # REST folders/projects (namespace + permisos)
+app.include_router(versions_router)   # versionado git + GitHub
 app.include_router(realtime_router)   # WebSocket /ws (realtime mirror)
+
+
+@app.get("/")
+def root():
+    return RedirectResponse(url="/dashboard/")
+
+
+# Dashboard estático (admin): usuarios/ACL + repo + versiones + GitHub.
+# El JS llama a los mismos endpoints REST (mismo origen). Ver dashboard/index.html.
+_DASH = Path(__file__).resolve().parent / "dashboard"
+app.mount("/dashboard", StaticFiles(directory=str(_DASH), html=True), name="dashboard")
 
 
 if __name__ == "__main__":

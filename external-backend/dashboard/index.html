@@ -1,0 +1,337 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>DiagraMind Connector — Dashboard</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: #0f0f14; color: #e5e7eb; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 18px; border-bottom: 1px solid #26262e; background: #15151b; position: sticky; top: 0; }
+  header h1 { font-size: 15px; margin: 0; font-weight: 700; }
+  header .sp { flex: 1; }
+  header .who { opacity: .7; font-size: 13px; }
+  button { font: inherit; border: 1px solid #3b3b46; background: #22222b; color: #e5e7eb; border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  button:hover { background: #2b2b36; }
+  button.primary { background: #2563eb; border-color: #2563eb; }
+  button.danger { background: #3a1d1d; border-color: #5b2a2a; }
+  input, select { font: inherit; background: #0b0b10; border: 1px solid #3b3b46; color: #e5e7eb; border-radius: 6px; padding: 6px 8px; }
+  nav { display: flex; gap: 4px; padding: 8px 18px; border-bottom: 1px solid #26262e; background: #12121a; }
+  nav button.tab { background: transparent; border: none; padding: 6px 12px; border-radius: 6px; opacity: .7; }
+  nav button.tab.active { background: #22222b; opacity: 1; }
+  main { padding: 18px; max-width: 1000px; }
+  .card { background: #15151b; border: 1px solid #26262e; border-radius: 10px; padding: 14px; margin-bottom: 16px; }
+  .card h2 { margin: 0 0 10px; font-size: 14px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #22222b; font-size: 13px; vertical-align: middle; }
+  th { opacity: .6; font-weight: 600; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .muted { opacity: .55; }
+  .pill { font-size: 11px; padding: 1px 7px; border-radius: 999px; border: 1px solid #3b3b46; }
+  .err { color: #f87171; }
+  .ok { color: #34d399; }
+  pre { background: #0b0b10; border: 1px solid #26262e; border-radius: 8px; padding: 10px; overflow: auto; max-height: 340px; font-size: 12px; }
+  .diff .add { color: #34d399; } .diff .del { color: #f87171; } .diff .hh { color: #60a5fa; }
+  #login { max-width: 340px; margin: 60px auto; }
+  .hidden { display: none; }
+  .grow { flex: 1; min-width: 0; }
+</style>
+</head>
+<body>
+
+<div id="login" class="card">
+  <h2>Iniciar sesión</h2>
+  <div class="row" style="flex-direction:column; align-items:stretch">
+    <input id="lg-user" placeholder="Usuario" autocomplete="username" />
+    <input id="lg-pass" type="password" placeholder="Contraseña" autocomplete="current-password" />
+    <div id="lg-newpw-wrap" class="hidden">
+      <input id="lg-newpw" type="password" placeholder="Nueva contraseña (primer ingreso)" style="width:100%" />
+    </div>
+    <button class="primary" id="lg-btn">Entrar</button>
+    <div id="lg-msg" class="err"></div>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <header>
+    <h1>🔌 DiagraMind Connector</h1>
+    <span class="pill" id="hd-ver"></span>
+    <div class="sp"></div>
+    <span class="who" id="hd-who"></span>
+    <button id="hd-logout">Salir</button>
+  </header>
+  <nav>
+    <button class="tab active" data-tab="users">Usuarios</button>
+    <button class="tab" data-tab="repo">Repo</button>
+    <button class="tab" data-tab="versions">Versiones</button>
+    <button class="tab" data-tab="github">GitHub</button>
+  </nav>
+  <main>
+    <div id="tab-users" class="tabpane"></div>
+    <div id="tab-repo" class="tabpane hidden"></div>
+    <div id="tab-versions" class="tabpane hidden"></div>
+    <div id="tab-github" class="tabpane hidden"></div>
+  </main>
+</div>
+
+<script>
+const $ = (s, r=document) => r.querySelector(s);
+const el = (t, p={}, kids=[]) => { const n=document.createElement(t); Object.assign(n,p); for(const k of [].concat(kids)) if(k!=null) n.append(k); return n; };
+let TOK = null;   // {access, refresh, role, username}
+
+// ---------- API ----------
+async function api(path, { method="GET", body=null, auth=true } = {}) {
+  const doit = () => fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json", ...(auth && TOK ? { Authorization: "Bearer " + TOK.access } : {}) },
+    body: body != null ? JSON.stringify(body) : undefined,
+  });
+  let r = await doit();
+  if (r.status === 401 && auth && TOK?.refresh) {
+    const rr = await fetch("/auth/refresh", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ refresh: TOK.refresh }) });
+    if (rr.ok) { const d = await rr.json(); TOK = { ...TOK, access:d.access, refresh:d.refresh, role:d.role }; save(); r = await doit(); }
+  }
+  return r;
+}
+async function jget(path){ const r=await api(path); if(!r.ok) throw new Error((await r.json().catch(()=>({}))).detail||r.status); return r.json(); }
+async function jpost(path, body){ const r=await api(path,{method:"POST",body}); if(!r.ok) throw new Error((await r.json().catch(()=>({}))).detail||r.status); return r.json(); }
+
+function save(){ sessionStorage.setItem("dashTok", JSON.stringify(TOK)); }
+function load(){ try { TOK = JSON.parse(sessionStorage.getItem("dashTok")); } catch { TOK = null; } }
+
+// ---------- login ----------
+$("#lg-btn").addEventListener("click", doLogin);
+$("#lg-pass").addEventListener("keydown", e => { if(e.key==="Enter") doLogin(); });
+async function doLogin() {
+  const username = $("#lg-user").value.trim(), password = $("#lg-pass").value;
+  $("#lg-msg").textContent = "";
+  try {
+    const r = await fetch("/auth/login", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify({ username, password }) });
+    if (!r.ok) throw new Error("Credenciales inválidas");
+    let d = await r.json();
+    TOK = { access:d.access, refresh:d.refresh, role:d.role, username };
+    if (d.mustChangePassword) {
+      $("#lg-newpw-wrap").classList.remove("hidden");
+      const np = $("#lg-newpw").value;
+      if (!np) { $("#lg-msg").textContent = "Definí una nueva contraseña."; return; }
+      d = await jpost("/auth/change-password", { newPassword: np });
+      TOK = { access:d.access, refresh:d.refresh, role:d.role, username };
+    }
+    if (TOK.role !== "admin") throw new Error("Solo administradores acceden al dashboard.");
+    save(); enterApp();
+  } catch (e) { $("#lg-msg").textContent = e.message; }
+}
+
+$("#hd-logout").addEventListener("click", () => { TOK=null; sessionStorage.removeItem("dashTok"); location.reload(); });
+
+async function enterApp() {
+  $("#login").classList.add("hidden");
+  $("#app").classList.remove("hidden");
+  $("#hd-who").textContent = `${TOK.username} · admin`;
+  try { const h = await (await fetch("/health")).json(); $("#hd-ver").textContent = "v"+h.version; } catch {}
+  showTab("users");
+}
+
+// ---------- tabs ----------
+document.querySelectorAll("nav .tab").forEach(b => b.addEventListener("click", () => showTab(b.dataset.tab)));
+function showTab(name) {
+  document.querySelectorAll("nav .tab").forEach(b => b.classList.toggle("active", b.dataset.tab===name));
+  document.querySelectorAll(".tabpane").forEach(p => p.classList.add("hidden"));
+  $("#tab-"+name).classList.remove("hidden");
+  ({ users:renderUsers, repo:renderRepo, versions:renderVersions, github:renderGithub })[name]();
+}
+
+// ---------- Usuarios ----------
+async function renderUsers() {
+  const pane = $("#tab-users"); pane.innerHTML = "Cargando…";
+  let users, repo;
+  try { users = (await jget("/users")).users; repo = (await jget("/repo")).folders; }
+  catch(e){ pane.innerHTML = `<div class="err">${e.message}</div>`; return; }
+  pane.innerHTML = "";
+
+  const create = el("div", { className:"card" });
+  create.append(el("h2",{textContent:"Crear usuario"}));
+  const cu=el("input",{placeholder:"usuario"}), cr=el("select");
+  ["viewer","editor","admin"].forEach(x=>cr.append(el("option",{value:x,textContent:x})));
+  const cmsg=el("div",{className:"muted"});
+  const cbtn=el("button",{className:"primary",textContent:"Crear"});
+  cbtn.addEventListener("click", async ()=>{
+    if(!cu.value.trim()) return;
+    try{ const d=await jpost("/users",{username:cu.value.trim(),role:cr.value});
+      cmsg.innerHTML=`<span class="ok">Creado.</span> Contraseña temporal: <b>${d.tempPassword}</b>`; cu.value=""; renderUsersTable(); }
+    catch(e){ cmsg.innerHTML=`<span class="err">${e.message}</span>`; }
+  });
+  create.append(el("div",{className:"row"},[cu,cr,cbtn]), cmsg);
+  pane.append(create);
+
+  const tableCard = el("div",{className:"card"});
+  tableCard.append(el("h2",{textContent:"Usuarios"}));
+  const tbl = el("div"); tableCard.append(tbl); pane.append(tableCard);
+  const aclCard = el("div",{className:"card hidden",id:"acl-card"}); pane.append(aclCard);
+
+  function renderUsersTable(){
+    jget("/users").then(({users})=>{
+      const t=el("table"); t.append(el("tr",{},[["Usuario","Rol","Estado","Acciones"].map(h=>el("th",{textContent:h}))].flat()));
+      for(const u of users){
+        const roleSel=el("select"); ["viewer","editor","admin"].forEach(x=>roleSel.append(el("option",{value:x,textContent:x,selected:x===u.role})));
+        roleSel.addEventListener("change",()=>jpost(`/users/${u.id}/role`,{role:roleSel.value}).catch(alertErr));
+        const acl=el("button",{textContent:"ACL"}); acl.addEventListener("click",()=>editAcl(u,repo));
+        const dis=el("button",{textContent:u.disabled?"Habilitar":"Deshabilitar"});
+        dis.addEventListener("click",async()=>{ await api(`/users/${u.id}/disabled?disabled=${u.disabled?"false":"true"}`,{method:"POST"}); renderUsersTable(); });
+        const del=el("button",{className:"danger",textContent:"✕"});
+        del.addEventListener("click",async()=>{ if(confirm(`¿Borrar a ${u.username}?`)){ await api(`/users/${u.id}`,{method:"DELETE"}); renderUsersTable(); } });
+        t.append(el("tr",{},[
+          el("td",{},[el("b",{textContent:u.username}), u.mustChangePassword?el("span",{className:"pill",style:"margin-left:6px",textContent:"debe cambiar pw"}):null]),
+          el("td",{},roleSel),
+          el("td",{},el("span",{className:u.disabled?"err":"ok",textContent:u.disabled?"deshabilitado":"activo"})),
+          el("td",{},el("div",{className:"row"},[acl,dis,del])),
+        ]));
+      }
+      tbl.innerHTML=""; tbl.append(t);
+    }).catch(e=>tbl.innerHTML=`<div class="err">${e.message}</div>`);
+  }
+  renderUsersTable();
+
+  async function editAcl(u, folders){
+    const card=$("#acl-card"); card.classList.remove("hidden"); card.innerHTML="";
+    card.append(el("h2",{textContent:`ACL de ${u.username}`}));
+    let current=[]; try{ current=(await jget(`/users/${u.id}/acl`)).acl; }catch{}
+    const cmap=Object.fromEntries(current.map(a=>[a.folderId,a.permission]));
+    if(folders.length===0) card.append(el("div",{className:"muted",textContent:"No hay carpetas."}));
+    for(const f of folders){
+      const sel=el("select"); ["none","read","write"].forEach(p=>sel.append(el("option",{value:p,textContent:p,selected:p===(cmap[f.id]||"none")})));
+      sel.addEventListener("change",()=>jpost(`/users/${u.id}/acl`,{folderId:f.id,permission:sel.value}).catch(alertErr));
+      card.append(el("div",{className:"row",style:"padding:4px 0"},[el("span",{className:"grow",textContent:f.name}),sel]));
+    }
+    card.scrollIntoView({behavior:"smooth"});
+  }
+}
+
+// ---------- Repo ----------
+async function renderRepo(){
+  const pane=$("#tab-repo"); pane.innerHTML="Cargando…";
+  let folders; try{ folders=(await jget("/repo")).folders; }catch(e){ pane.innerHTML=`<div class="err">${e.message}</div>`; return; }
+  pane.innerHTML="";
+  const mk=el("div",{className:"card"});
+  mk.append(el("h2",{textContent:"Crear carpeta"}));
+  const ni=el("input",{placeholder:"nombre de la carpeta"});
+  const nb=el("button",{className:"primary",textContent:"Crear"});
+  nb.addEventListener("click",async()=>{ if(!ni.value.trim())return; try{ await jpost("/folders",{name:ni.value.trim()}); ni.value=""; renderRepo(); }catch(e){alertErr(e);} });
+  mk.append(el("div",{className:"row"},[ni,nb])); pane.append(mk);
+
+  for(const f of folders){
+    const c=el("div",{className:"card"});
+    const head=el("div",{className:"row"},[
+      el("h2",{className:"grow",style:"margin:0",textContent:`📁 ${f.name}`}),
+      el("span",{className:"pill",textContent:f.id}),
+    ]);
+    const delF=el("button",{className:"danger",textContent:"Borrar carpeta"});
+    delF.addEventListener("click",async()=>{ if(confirm(`¿Borrar la carpeta ${f.name} y sus proyectos?`)){ await jpost("/folders/delete",{id:f.id}); renderRepo(); } });
+    head.append(delF); c.append(head);
+    if(f.projects.length===0) c.append(el("div",{className:"muted",style:"padding:6px 0",textContent:"(sin proyectos)"}));
+    const t=el("table");
+    for(const p of f.projects){
+      const del=el("button",{className:"danger",textContent:"✕"});
+      del.addEventListener("click",async()=>{ if(confirm(`¿Borrar el proyecto ${p.name}?`)){ await jpost("/projects/delete",{id:p.id}); renderRepo(); } });
+      t.append(el("tr",{},[
+        el("td",{},el("b",{textContent:p.name})),
+        el("td",{},el("span",{className:"muted",textContent:p.id})),
+        el("td",{className:"muted",textContent:p.createdAt||""}),
+        el("td",{},del),
+      ]));
+    }
+    if(f.projects.length) c.append(t);
+    pane.append(c);
+  }
+}
+
+// ---------- Versiones ----------
+async function renderVersions(){
+  const pane=$("#tab-versions"); pane.innerHTML="Cargando…";
+  let folders; try{ folders=(await jget("/repo")).folders; }catch(e){ pane.innerHTML=`<div class="err">${e.message}</div>`; return; }
+  pane.innerHTML="";
+  const sel=el("select");
+  sel.append(el("option",{value:"",textContent:"— elegí un proyecto —"}));
+  for(const f of folders) for(const p of f.projects) sel.append(el("option",{value:p.id,textContent:`${f.name} / ${p.name}`}));
+  const card=el("div",{className:"card"});
+  card.append(el("h2",{textContent:"Historial"}), el("div",{className:"row"},[sel]));
+  const out=el("div"); card.append(out); pane.append(card);
+  sel.addEventListener("change",()=>loadLog(sel.value,out));
+}
+async function loadLog(pid, out){
+  out.innerHTML="";
+  if(!pid) return;
+  let st, commits;
+  try{ st=await jget("/versions/status?id="+pid); commits=(await jget("/versions/log?id="+pid)).commits; }
+  catch(e){ out.innerHTML=`<div class="err">${e.message}</div>`; return; }
+  out.append(el("div",{className:"row",style:"margin:8px 0"},[
+    el("span",{className:st.hasChanges?"err":"ok",textContent:st.hasChanges?"● cambios sin guardar":"● todo guardado"}),
+    el("span",{className:"muted",textContent:"HEAD "+(st.head||"").slice(0,8)}),
+  ]));
+  if(commits.length===0){ out.append(el("div",{className:"muted",textContent:"Sin commits."})); return; }
+  const t=el("table");
+  t.append(el("tr",{},["Commit","Autor","Fecha","Mensaje",""].map(h=>el("th",{textContent:h}))));
+  const diffBox=el("pre",{className:"diff hidden"});
+  for(let i=0;i<commits.length;i++){
+    const c=commits[i], parent=commits[i+1];
+    const view=el("button",{textContent:"diff"});
+    view.addEventListener("click",async()=>{
+      const d=await jget(`/versions/diff?id=${pid}`+(parent?`&a=${parent.commit}&b=${c.commit}`:`&a=${c.commit}`));
+      diffBox.classList.remove("hidden"); diffBox.innerHTML=colorDiff(d.diff||"(sin cambios)");
+      diffBox.scrollIntoView({behavior:"smooth"});
+    });
+    const rb=el("button",{textContent:"rollback"});
+    rb.addEventListener("click",async()=>{ if(confirm(`¿Restaurar a ${c.commit.slice(0,8)}?`)){ await jpost("/versions/rollback",{id:pid,commit:c.commit}); loadLog(pid,out); } });
+    t.append(el("tr",{},[
+      el("td",{},el("span",{className:"muted",textContent:c.commit.slice(0,8)})),
+      el("td",{textContent:c.author}),
+      el("td",{className:"muted",textContent:(c.date||"").slice(0,16)}),
+      el("td",{className:"grow",textContent:c.message}),
+      el("td",{},el("div",{className:"row"},[view,rb])),
+    ]));
+  }
+  out.append(t, diffBox);
+}
+function colorDiff(txt){
+  return txt.split("\n").map(l=>{
+    const e=l.replace(/[&<>]/g,ch=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[ch]));
+    if(l.startsWith("+")&&!l.startsWith("+++")) return `<span class="add">${e}</span>`;
+    if(l.startsWith("-")&&!l.startsWith("---")) return `<span class="del">${e}</span>`;
+    if(l.startsWith("@@")) return `<span class="hh">${e}</span>`;
+    return e;
+  }).join("\n");
+}
+
+// ---------- GitHub ----------
+async function renderGithub(){
+  const pane=$("#tab-github"); pane.innerHTML="Cargando…";
+  let st; try{ st=await jget("/github/status"); }catch(e){ pane.innerHTML=`<div class="err">${e.message}</div>`; return; }
+  pane.innerHTML="";
+  const c=el("div",{className:"card"});
+  c.append(el("h2",{textContent:"GitHub"}),
+    el("div",{className:"row",style:"margin-bottom:8px"},[
+      el("span",{className:st.connected?"ok":"muted",textContent:st.connected?`● conectado — ${st.remoteUrl} (${st.branch})`:"● no conectado"}),
+    ]));
+  const url=el("input",{placeholder:"https://github.com/user/repo.git",value:st.remoteUrl||"",style:"width:100%"});
+  const tok=el("input",{placeholder:"token (ghp_…)",type:"password",style:"width:100%"});
+  const br=el("input",{placeholder:"rama",value:st.branch||"main",style:"width:120px"});
+  const save=el("button",{className:"primary",textContent:"Conectar / actualizar"});
+  save.addEventListener("click",async()=>{ try{ await jpost("/github/connect",{remoteUrl:url.value.trim(),token:tok.value.trim(),branch:br.value.trim()||"main"}); renderGithub(); }catch(e){alertErr(e);} });
+  const push=el("button",{textContent:"Push ahora"});
+  const pmsg=el("div",{className:"muted"});
+  push.addEventListener("click",async()=>{ pmsg.textContent="Pusheando…"; try{ const r=await jpost("/github/push",{}); pmsg.innerHTML=r.ok?`<span class="ok">Push OK</span>`:`<span class="err">${r.detail||"falló"}</span>`; }catch(e){ pmsg.innerHTML=`<span class="err">${e.message}</span>`; } });
+  const disc=el("button",{className:"danger",textContent:"Desconectar"});
+  disc.addEventListener("click",async()=>{ await jpost("/github/disconnect",{}); renderGithub(); });
+  c.append(el("div",{className:"row",style:"flex-direction:column;align-items:stretch;gap:8px"},[url,tok,el("div",{className:"row"},[br,save,push,disc])]), pmsg);
+  pane.append(c);
+}
+
+function alertErr(e){ alert(e.message||e); }
+
+// ---------- boot ----------
+load();
+if (TOK?.access) { (async()=>{ try{ await jget("/repo"); enterApp(); }catch{ TOK=null; } })(); }
+</script>
+</body>
+</html>
