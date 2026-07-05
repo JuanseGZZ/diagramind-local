@@ -66,3 +66,26 @@ class GithubConnectBody(BaseModel):
     remoteUrl: str
     token: str
     branch: str = "main"
+
+
+# ---- modo editor (doc 27) ----
+
+class EditorTargetBody(BaseModel):
+    projectId: str
+    path: str
+
+
+class FsWriteBody(BaseModel):
+    projectId: str
+    path: str
+    content: str
+
+
+class FsPathBody(BaseModel):
+    projectId: str
+    path: str
+
+
+class FsExecBody(BaseModel):
+    projectId: str
+    cmd: str

@@ -51,6 +51,7 @@ from urllib.parse import urlparse, parse_qs
 # módulos desacoplados (ver claude.py / codex.py / gemini.py / cli_base.py / etc.)
 from util import safe_name, safe_file_name
 from runs import RUNS, RUNS_LOCK, SESSION_MAP, new_run, emit
+import editorfs
 from skills import install_skills
 from claude import find_claude, claude_version
 from clis import CLIS, run_cli
@@ -58,7 +59,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.12.0"
+VERSION = "0.13.0"   # modo editor: /editor/target + /fs/* (doc 27)
 
 # ===================== rutas / disco =====================
 
@@ -431,6 +432,16 @@ class Handler(BaseHTTPRequestHandler):
             self._folders_read(q.get("path", [None])[0])
         elif path == "/config":
             self._json(200, {"root": projects_dir(), "base": app_dir()})
+        # --- modo editor (doc 27; contrato unificado con el conector externo) ---
+        elif path == "/editor/target":
+            self._json(200, {"path": editorfs.get_target(app_dir(), q.get("projectId", [None])[0])})
+        elif path == "/fs/tree":
+            self._json(*editorfs.fs_tree(app_dir(), q.get("projectId", [None])[0], q.get("dir", [""])[0]))
+        elif path == "/fs/read":
+            self._json(*editorfs.fs_read(app_dir(), q.get("projectId", [None])[0], q.get("path", [None])[0]))
+        elif path == "/fs/grep":
+            self._json(*editorfs.fs_grep(app_dir(), q.get("projectId", [None])[0],
+                                         q.get("q", [None])[0], q.get("glob", [""])[0]))
         else:
             self._json(404, {"error": "not found", "path": path})
 
@@ -457,6 +468,22 @@ class Handler(BaseHTTPRequestHandler):
             self._cancel(parse_qs(urlparse(self.path).query).get("runId", [None])[0])
         elif path == "/fetch":
             self._proxy_fetch(self._read_json())
+        # --- modo editor (doc 27) ---
+        elif path == "/editor/target":
+            b = self._read_json()
+            self._json(*editorfs.set_target(app_dir(), b.get("projectId"), b.get("path")))
+        elif path == "/fs/write":
+            b = self._read_json()
+            self._json(*editorfs.fs_write(app_dir(), b.get("projectId"), b.get("path"), b.get("content")))
+        elif path == "/fs/mkdir":
+            b = self._read_json()
+            self._json(*editorfs.fs_mkdir(app_dir(), b.get("projectId"), b.get("path")))
+        elif path == "/fs/delete":
+            b = self._read_json()
+            self._json(*editorfs.fs_delete(app_dir(), b.get("projectId"), b.get("path")))
+        elif path == "/fs/exec":
+            b = self._read_json()
+            self._json(*editorfs.fs_exec(app_dir(), b.get("projectId"), b.get("cmd")))
         else:
             self._json(404, {"error": "not found", "path": path})
 

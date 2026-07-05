@@ -71,6 +71,11 @@ CREATE TABLE IF NOT EXISTS projects (
   created_at TEXT    NOT NULL DEFAULT (datetime('now')),
   UNIQUE (folder_id, dirname)
 );
+
+CREATE TABLE IF NOT EXISTS editor_targets (
+  project_id TEXT    PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  target     TEXT    NOT NULL                        -- dir REAL que abre el modo editor (doc 27)
+);
 """
 
 
