@@ -21,7 +21,9 @@ class CodexAdapter:
     def install_instructions(self, work_dir):
         install_agents_md(work_dir)
 
-    def build_cmd(self, run, b, message, work_dir, folder, focus_name, mode, model, resume, effort=None):
+    def build_cmd(self, run, b, message, work_dir, folder, focus_name, mode, model, resume,
+                  effort=None, editor_target=None):
+        # editor_target no aplica: los proyectos editor van solo con Claude Code (v1)
         last = os.path.join(tempfile.gettempdir(), f"codex-last-{run['id']}.txt")
         run["_last_file"] = last
         prompt = _headless_prompt(folder, focus_name, message)

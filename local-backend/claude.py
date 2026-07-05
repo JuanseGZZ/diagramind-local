@@ -7,7 +7,7 @@ import subprocess
 
 from runs import emit, set_status
 from skills import install_skills, SYSTEM_PREAMBLE
-from cli_base import _focus_note
+from cli_base import _focus_note, _editor_note
 
 # Modos del chat (web) → permission-mode de Claude Code.
 PERM_MODE = {
@@ -112,10 +112,14 @@ class ClaudeAdapter:
     def install_instructions(self, work_dir):
         install_skills(work_dir)
 
-    def build_cmd(self, run, b, message, work_dir, folder, focus_name, mode, model, resume, effort=None):
+    def build_cmd(self, run, b, message, work_dir, folder, focus_name, mode, model, resume,
+                  effort=None, editor_target=None):
         perm = PERM_MODE.get(mode, "acceptEdits")
         kw = EFFORT_THINK.get(effort or "", "")
         msg = message + (f"\n\n{kw}" if kw else "")   # palabra de thinking según esfuerzo
+        # foco editor (doc 27): Claude trabaja DIRECTO en la carpeta target
+        focus = (_editor_note(folder, focus_name, editor_target) if editor_target
+                 else _focus_note(folder, focus_name))
         cmd = [
             b, "-p", msg, "--output-format", "stream-json", "--verbose",
             "--model", map_model(model), "--permission-mode", perm,
@@ -124,8 +128,10 @@ class ClaudeAdapter:
             # fetches del diagrama se corren con el mecanismo `runReq` (ver skill),
             # NO con la tool genérica de Claude (no usaría el body/headers/proxy ni se vería).
             "--disallowedTools", "WebFetch", "WebSearch",
-            "--append-system-prompt", SYSTEM_PREAMBLE + "\n\n" + _focus_note(folder, focus_name),
+            "--append-system-prompt", SYSTEM_PREAMBLE + "\n\n" + focus,
         ]
+        if editor_target:
+            cmd += ["--add-dir", editor_target]
         if resume:
             cmd += ["--resume", str(resume)]
         return cmd, {}

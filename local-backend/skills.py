@@ -14,9 +14,12 @@ SYSTEM_PREAMBLE = (
     "El PROYECTO FOCO es tu objetivo de ESCRITURA por defecto: editá "
     "./<focusedId>/tree.json IN-PLACE, JSON válido, respetando EXACTAMENTE el "
     "esquema de SU tipo (cada proyecto puede ser de un tipo distinto: "
-    "cart/freestyle/treeQuestionary/activities/object). No cambies el id del árbol. Al terminar, releé el "
+    "cart/freestyle/treeQuestionary/activities/object/editor). No cambies el id del árbol. Al terminar, releé el "
     "archivo y verificá que es JSON válido y cumple el esquema (sin campos de más "
     "ni de menos, ids únicos); si algo está mal, corregilo.\n\n"
+    "EXCEPCIÓN — proyectos tipo `editor`: NO son diagramas; su tree.json es un "
+    "puntero {type, target} a una CARPETA REAL (ver diagramind-editor). Si el foco "
+    "es un editor, trabajá directo sobre esa carpeta y NO toques su tree.json.\n\n"
     "Podés LEER cualquier otro proyecto (./<id>/tree.json, buscalo por nombre en "
     "./index.json) para basarte en él; escribí en otro proyecto SOLO si el usuario "
     "te lo pide explícitamente.\n\n"
@@ -49,7 +52,8 @@ SKILLS = dict([
         "- `freestyle` → ver `diagramind-freestyle`\n"
         "- `treeQuestionary` → ver `diagramind-treequestionary`\n"
         "- `activities` → ver `diagramind-activities`\n"
-        "- `object` → ver `diagramind-object`\n\n"
+        "- `object` → ver `diagramind-object`\n"
+        "- `editor` → ver `diagramind-editor` (NO es un diagrama: apunta a una carpeta real)\n\n"
         "Común a todos:\n"
         "- `attachments`: mapa `{ \"<aid>\": { \"name\", \"mime\" } }` (adjuntos; "
         "  los bytes van aparte, NO los toques).\n"
@@ -283,6 +287,26 @@ SKILLS = dict([
         "Para re-ejecutar, cambiá de nuevo `runReq`. Podés pedir varios nodos a la vez "
         "(varios `runReq`). Si te piden 'ejecutar/probar un fetch' de un proyecto object, "
         "esto es lo que tenés que hacer — nunca WebFetch.",
+    ),
+    _skill(
+        "diagramind-editor",
+        "Tipo `editor`: el proyecto abre una CARPETA REAL (no es un diagrama). "
+        "Leer si el proyecto en foco es tipo editor.",
+        "# Tipo editor (carpeta real)\n\n"
+        "Un proyecto `editor` (doc 27) abre una **carpeta real** de la máquina. Su "
+        "`tree.json` es solo un puntero:\n\n"
+        "```json\n"
+        "{ \"type\": \"editor\", \"target\": \"/ruta/a/la/carpeta\" }\n"
+        "```\n\n"
+        "## Reglas\n"
+        "1. **NO edites su `tree.json`** (ni metas nodos ahí): los archivos del "
+        "   proyecto NO viven en el workspace, viven en el `target`.\n"
+        "2. Cuando el foco es un editor, el chat te da **acceso directo al target** "
+        "   (la ruta exacta viene en tu system prompt): trabajá sobre esos archivos "
+        "   con tus herramientas normales (leer / editar / bash).\n"
+        "3. Los esquemas diagramind-* (ids, contadores, tipos de nodo) **no aplican** "
+        "   a estos proyectos: es código/archivos comunes.\n"
+        "4. Los demás proyectos del workspace siguen las reglas de siempre.",
     ),
 ])
 

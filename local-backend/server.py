@@ -59,7 +59,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.13.0"   # modo editor: /editor/target + /fs/* (doc 27)
+VERSION = "0.14.0"   # modo editor fase 3: chat con --add-dir al target (doc 27)
 
 # ===================== rutas / disco =====================
 
@@ -740,6 +740,20 @@ class Handler(BaseHTTPRequestHandler):
             self._json(409, {"error": "el proyecto no está sincronizado (falta tree.json)"})
             return
 
+        # proyectos tipo `editor` (doc 27, fase 3): el trabajo real es su carpeta
+        # target — el CLI la recibe (--add-dir en Claude). Sin target no hay chat.
+        editor_target = None
+        try:
+            with open(os.path.join(tree_dir(folder, name), "tree.json"), encoding="utf-8") as f:
+                is_editor = json.load(f).get("type") == "editor"
+        except Exception:
+            is_editor = False
+        if is_editor:
+            editor_target = editorfs.get_target(app_dir(), pid)
+            if not editor_target:
+                self._json(409, {"error": "el proyecto editor no tiene carpeta asignada (elegí la ubicación en la web)"})
+                return
+
         # cwd = la CARPETA del proyecto (estable por chat dentro de la carpeta). Así
         # --resume sobrevive el cambio de foco entre proyectos de la misma carpeta y
         # Claude "sabe" en qué carpeta labura (su cwd + el focus_note).
@@ -761,7 +775,8 @@ class Handler(BaseHTTPRequestHandler):
         run = new_run()
 
         def worker():
-            run_cli(run, adapter, work_dir, message, mode, model, resume, name, folder, effort)
+            run_cli(run, adapter, work_dir, message, mode, model, resume, name, folder,
+                    effort, editor_target)
             if adapter.supports_resume and run.get("claude_session_id") and skey:
                 SESSION_MAP[skey] = run["claude_session_id"]
 

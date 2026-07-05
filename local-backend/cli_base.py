@@ -20,6 +20,19 @@ def _focus_note(folder, focus_name):
     )
 
 
+def _editor_note(folder, focus_name, target):
+    """Nota de foco cuando el proyecto es tipo `editor` (doc 27): el trabajo real es
+    la carpeta target (accesible por --add-dir), NO el tree.json del mirror."""
+    return (
+        f"ESTÁS TRABAJANDO EN LA CARPETA «{folder}». El proyecto en FOCO, "
+        f"«{focus_name}», es un proyecto EDITOR: abre la carpeta real «{target}» y "
+        f"tenés acceso directo a ella. Trabajá DIRECTAMENTE sobre los archivos de "
+        f"esa carpeta con tus herramientas normales (leer/editar/bash). NO toques "
+        f"./{safe_name(focus_name)}/tree.json (es solo un puntero {{type, target}}) "
+        f"y los esquemas diagramind-* NO aplican a este proyecto."
+    )
+
+
 def _headless_prompt(folder, focus_name, message):
     """Prompt para los CLIs one-shot (Codex/Gemini): a diferencia de Claude Code, en
     modo -p son conversacionales y, si no se les ordena con MUCHA fuerza, describen o
@@ -69,9 +82,12 @@ def _bin_version(b):
         return None
 
 
-def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, folder, effort=None):
+def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, folder,
+            effort=None, editor_target=None):
     """Núcleo compartido: lanza el CLI, lee stdout línea a línea (cada adaptador
-    parsea lo suyo), maneja cancelación y estado terminal."""
+    parsea lo suyo), maneja cancelación y estado terminal.
+    `editor_target`: si el foco es un proyecto tipo `editor`, la carpeta real que
+    abre (el adaptador decide qué hacer; Claude Code le suma --add-dir)."""
     bin_path = adapter.find()
     if not bin_path:
         set_status(run, "error",
@@ -84,7 +100,7 @@ def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, fo
 
     cmd, env_extra = adapter.build_cmd(
         run, bin_path, message, work_dir, folder, focus_name, mode, model,
-        resume if adapter.supports_resume else None, effort,
+        resume if adapter.supports_resume else None, effort, editor_target,
     )
     set_status(run, "starting")
     env = os.environ.copy()
