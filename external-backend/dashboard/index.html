@@ -55,7 +55,7 @@
 
 <div id="app" class="hidden">
   <header>
-    <h1>🔌 DiagraMind Connector</h1>
+    <h1>DiagraMind Connector</h1>
     <span class="pill" id="hd-ver"></span>
     <div class="sp"></div>
     <span class="who" id="hd-who"></span>
@@ -231,7 +231,7 @@ async function renderRepo(){
   for(const f of folders){
     const c=el("div",{className:"card"});
     const head=el("div",{className:"row"},[
-      el("h2",{className:"grow",style:"margin:0",textContent:`📁 ${f.name}`}),
+      el("h2",{className:"grow",style:"margin:0",textContent:f.name}),
       el("span",{className:"pill",textContent:f.id}),
     ]);
     const delF=el("button",{className:"danger",textContent:"Borrar carpeta"});
