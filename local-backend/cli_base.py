@@ -33,6 +33,24 @@ def _editor_note(folder, focus_name, target):
     )
 
 
+def _editor_relay_note(folder, focus_name):
+    """Nota de foco para un editor cuyo target vive en un CONECTOR EXTERNO: los
+    archivos NO están en esta máquina; se opera con las tools MCP mcp__dmfs__*."""
+    return (
+        f"ESTÁS TRABAJANDO EN LA CARPETA «{folder}». El proyecto en FOCO, "
+        f"«{focus_name}», es un proyecto EDITOR cuyo contenido vive en un CONECTOR "
+        f"EXTERNO: sus archivos NO están en este disco. Para explorarlos y editarlos "
+        f"usá EXCLUSIVAMENTE las tools MCP del server «dmfs» (mcp__dmfs__fs_tree, "
+        f"fs_read, fs_write, fs_mkdir, fs_rename, fs_delete, fs_grep, fs_exec), con "
+        f"rutas RELATIVAS a la raíz del proyecto. Flujo típico: fs_tree para "
+        f"orientarte → fs_grep/fs_read para entender → fs_write con el archivo "
+        f"COMPLETO para editar. fs_exec requiere ser admin del conector (si da 403, "
+        f"no insistas). NO uses tus herramientas locales de archivos para este "
+        f"proyecto: ./{safe_name(focus_name)}/tree.json es solo un puntero y los "
+        f"esquemas diagramind-* no aplican."
+    )
+
+
 def _headless_prompt(folder, focus_name, message):
     """Prompt para los CLIs one-shot (Codex/Gemini): a diferencia de Claude Code, en
     modo -p son conversacionales y, si no se les ordena con MUCHA fuerza, describen o
@@ -83,11 +101,12 @@ def _bin_version(b):
 
 
 def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, folder,
-            effort=None, editor_target=None):
+            effort=None, editor_target=None, editor_relay=None):
     """Núcleo compartido: lanza el CLI, lee stdout línea a línea (cada adaptador
     parsea lo suyo), maneja cancelación y estado terminal.
-    `editor_target`: si el foco es un proyecto tipo `editor`, la carpeta real que
-    abre (el adaptador decide qué hacer; Claude Code le suma --add-dir)."""
+    `editor_target`: si el foco es un editor LOCAL, la carpeta real que abre
+    (Claude Code le suma --add-dir). `editor_relay`: si el foco es un editor
+    EXTERNO, {url, token, projectId} del conector (Claude Code lo opera vía MCP)."""
     bin_path = adapter.find()
     if not bin_path:
         set_status(run, "error",
@@ -100,7 +119,7 @@ def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, fo
 
     cmd, env_extra = adapter.build_cmd(
         run, bin_path, message, work_dir, folder, focus_name, mode, model,
-        resume if adapter.supports_resume else None, effort, editor_target,
+        resume if adapter.supports_resume else None, effort, editor_target, editor_relay,
     )
     set_status(run, "starting")
     env = os.environ.copy()

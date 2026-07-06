@@ -59,7 +59,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.15.0"   # modo editor fase 4: /fs/rename (doc 27)
+VERSION = "0.16.0"   # modo editor fase 4: chat local sobre editores EXTERNOS vía MCP (doc 27)
 
 # ===================== rutas / disco =====================
 
@@ -743,9 +743,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(409, {"error": "el proyecto no está sincronizado (falta tree.json)"})
             return
 
-        # proyectos tipo `editor` (doc 27, fase 3): el trabajo real es su carpeta
-        # target — el CLI la recibe (--add-dir en Claude). Sin target no hay chat.
+        # proyectos tipo `editor` (doc 27): con target LOCAL el CLI recibe la carpeta
+        # (--add-dir); si el target vive en un conector EXTERNO, la web manda
+        # `editorRelay` {url, token} y Claude opera el /fs por MCP (fase 4).
         editor_target = None
+        editor_relay = None
         try:
             with open(os.path.join(tree_dir(folder, name), "tree.json"), encoding="utf-8") as f:
                 is_editor = json.load(f).get("type") == "editor"
@@ -753,7 +755,10 @@ class Handler(BaseHTTPRequestHandler):
             is_editor = False
         if is_editor:
             editor_target = editorfs.get_target(app_dir(), pid)
-            if not editor_target:
+            relay = body.get("editorRelay")
+            if not editor_target and isinstance(relay, dict) and relay.get("url") and relay.get("token"):
+                editor_relay = {"url": relay["url"], "token": relay["token"], "projectId": pid}
+            if not editor_target and not editor_relay:
                 self._json(409, {"error": "el proyecto editor no tiene carpeta asignada (elegí la ubicación en la web)"})
                 return
 
@@ -779,7 +784,7 @@ class Handler(BaseHTTPRequestHandler):
 
         def worker():
             run_cli(run, adapter, work_dir, message, mode, model, resume, name, folder,
-                    effort, editor_target)
+                    effort, editor_target, editor_relay)
             if adapter.supports_resume and run.get("claude_session_id") and skey:
                 SESSION_MAP[skey] = run["claude_session_id"]
 
@@ -892,6 +897,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # modo MCP (doc 27, fase 4): re-ejecución de este mismo binario/script como
+    # MCP server stdio de fs para editores EXTERNOS (lo lanza Claude Code).
+    if "--mcp-fs" in sys.argv:
+        import editor_mcp
+        editor_mcp.main()
+        return
+
     parser = argparse.ArgumentParser(description="DiagraMind backend local")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"puerto (default {DEFAULT_PORT})")

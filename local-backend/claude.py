@@ -4,10 +4,24 @@ import json
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
 
 from runs import emit, set_status
 from skills import install_skills, SYSTEM_PREAMBLE
-from cli_base import _focus_note, _editor_note
+from cli_base import _focus_note, _editor_note, _editor_relay_note
+
+# tools del MCP fs de editores externos (editor_mcp.py) — para --allowedTools
+MCP_FS_TOOLS = ["fs_tree", "fs_read", "fs_write", "fs_mkdir", "fs_rename",
+                "fs_delete", "fs_grep", "fs_exec"]
+
+
+def _self_cmd():
+    """Comando que re-ejecuta este backend (binario onefile o `python server.py`)."""
+    if getattr(sys, "frozen", False):
+        return {"command": sys.executable, "args": ["--mcp-fs"]}
+    server_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server.py")
+    return {"command": sys.executable, "args": [server_py, "--mcp-fs"]}
 
 # Modos del chat (web) → permission-mode de Claude Code.
 PERM_MODE = {
@@ -113,13 +127,17 @@ class ClaudeAdapter:
         install_skills(work_dir)
 
     def build_cmd(self, run, b, message, work_dir, folder, focus_name, mode, model, resume,
-                  effort=None, editor_target=None):
+                  effort=None, editor_target=None, editor_relay=None):
         perm = PERM_MODE.get(mode, "acceptEdits")
         kw = EFFORT_THINK.get(effort or "", "")
         msg = message + (f"\n\n{kw}" if kw else "")   # palabra de thinking según esfuerzo
-        # foco editor (doc 27): Claude trabaja DIRECTO en la carpeta target
-        focus = (_editor_note(folder, focus_name, editor_target) if editor_target
-                 else _focus_note(folder, focus_name))
+        # foco editor (doc 27): target LOCAL → acceso directo; target EXTERNO → MCP
+        if editor_relay:
+            focus = _editor_relay_note(folder, focus_name)
+        elif editor_target:
+            focus = _editor_note(folder, focus_name, editor_target)
+        else:
+            focus = _focus_note(folder, focus_name)
         cmd = [
             b, "-p", msg, "--output-format", "stream-json", "--verbose",
             "--model", map_model(model), "--permission-mode", perm,
@@ -132,6 +150,25 @@ class ClaudeAdapter:
         ]
         if editor_target:
             cmd += ["--add-dir", editor_target]
+        if editor_relay:
+            # editor EXTERNO: MCP server stdio (este mismo backend con --mcp-fs) con
+            # las credenciales del conector. El config va a un temp file 0600 (tiene
+            # el token) que se borra en finalize().
+            mcp = {"mcpServers": {"dmfs": {
+                **_self_cmd(),
+                "env": {
+                    "DMFS_URL": editor_relay["url"],
+                    "DMFS_TOKEN": editor_relay["token"],
+                    "DMFS_PROJECT": editor_relay["projectId"],
+                },
+            }}}
+            fd, cfg = tempfile.mkstemp(prefix=f"dmfs-mcp-{run['id']}-", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(mcp, f)
+            os.chmod(cfg, 0o600)
+            run["_mcp_cfg"] = cfg
+            allowed = ",".join(f"mcp__dmfs__{t}" for t in MCP_FS_TOOLS)
+            cmd += ["--mcp-config", cfg, "--allowedTools", allowed]
         if resume:
             cmd += ["--resume", str(resume)]
         return cmd, {}
@@ -144,4 +181,9 @@ class ClaudeAdapter:
         handle_event(run, obj)
 
     def finalize(self, run):
-        pass
+        cfg = run.pop("_mcp_cfg", None)     # borrar el config MCP (tiene el token)
+        if cfg:
+            try:
+                os.remove(cfg)
+            except OSError:
+                pass

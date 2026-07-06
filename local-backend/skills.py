@@ -301,12 +301,18 @@ SKILLS = dict([
         "## Reglas\n"
         "1. **NO edites su `tree.json`** (ni metas nodos ahí): los archivos del "
         "   proyecto NO viven en el workspace, viven en el `target`.\n"
-        "2. Cuando el foco es un editor, el chat te da **acceso directo al target** "
-        "   (la ruta exacta viene en tu system prompt): trabajá sobre esos archivos "
-        "   con tus herramientas normales (leer / editar / bash).\n"
-        "3. Los esquemas diagramind-* (ids, contadores, tipos de nodo) **no aplican** "
+        "2. Editor **LOCAL**: el chat te da **acceso directo al target** (la ruta "
+        "   exacta viene en tu system prompt): trabajá sobre esos archivos con tus "
+        "   herramientas normales (leer / editar / bash).\n"
+        "3. Editor **EXTERNO** (el target vive en un conector): los archivos NO "
+        "   están en este disco — usá las tools MCP del server «dmfs» "
+        "   (mcp__dmfs__fs_tree / fs_read / fs_write / fs_mkdir / fs_rename / "
+        "   fs_delete / fs_grep / fs_exec), con rutas relativas a la raíz del "
+        "   proyecto. Para editar: fs_read → modificá → fs_write con el archivo "
+        "   COMPLETO. Tu system prompt te dice cuál de los dos casos es.\n"
+        "4. Los esquemas diagramind-* (ids, contadores, tipos de nodo) **no aplican** "
         "   a estos proyectos: es código/archivos comunes.\n"
-        "4. Los demás proyectos del workspace siguen las reglas de siempre.",
+        "5. Los demás proyectos del workspace siguen las reglas de siempre.",
     ),
 ])
 
