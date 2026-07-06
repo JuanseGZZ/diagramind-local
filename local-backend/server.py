@@ -52,6 +52,7 @@ from urllib.parse import urlparse, parse_qs
 from util import safe_name, safe_file_name
 from runs import RUNS, RUNS_LOCK, SESSION_MAP, new_run, emit
 import editorfs
+import sourcever
 from skills import install_skills
 from claude import find_claude, claude_version
 from clis import CLIS, run_cli
@@ -59,7 +60,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.16.0"   # modo editor fase 4: chat local sobre editores EXTERNOS vía MCP (doc 27)
+VERSION = "0.17.0"   # modo editor fase 4: source versions por proyecto (/sv/*, doc 27)
 
 # ===================== rutas / disco =====================
 
@@ -210,6 +211,28 @@ def read_folder_index(folder):
             return json.load(f)
     except Exception:
         return {}
+
+
+# Source Versions del modo editor (doc 27): el sv_dir vive DENTRO del directorio
+# del proyecto en la carpeta de proyectos (viaja/cae con el proyecto). El pid se
+# resuelve a (carpeta, nombre) escaneando los index.json de las carpetas.
+def sv_context(pid):
+    """(err, sv_dir, target) para las operaciones /sv del proyecto editor `pid`."""
+    target = editorfs.get_target(app_dir(), pid)
+    if not target:
+        return (400, {"error": "editor target not set"}), None, None
+    try:
+        folders = os.listdir(projects_dir())
+    except OSError:
+        folders = []
+    for folder in folders:
+        if not os.path.isdir(os.path.join(projects_dir(), folder)):
+            continue
+        for p in read_folder_index(folder).get("projects", []):
+            if p.get("id") == pid:
+                svd = os.path.join(tree_dir(folder, p.get("name") or pid), "source-versions")
+                return None, svd, target
+    return (409, {"error": "el proyecto no está sincronizado (falta en el index de su carpeta)"}), None, None
 
 
 def resolve_tree_id(folder, dirname):
@@ -373,6 +396,13 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _sv(self, fn):
+        """Corre una operación de sourcever y traduce SvError → HTTP."""
+        try:
+            self._json(200, fn())
+        except sourcever.SvError as e:
+            self._json(e.code, {"error": e.msg})
+
     def _read_json(self):
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
@@ -442,6 +472,26 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/fs/grep":
             self._json(*editorfs.fs_grep(app_dir(), q.get("projectId", [None])[0],
                                          q.get("q", [None])[0], q.get("glob", [""])[0]))
+        # --- source versions del modo editor (doc 27, fase 4) ---
+        elif path == "/sv/list":
+            err, svd, _t = sv_context(q.get("projectId", [None])[0])
+            if err:
+                self._json(*err)
+            else:
+                self._json(200, {"versions": sourcever.sv_list(svd)})
+        elif path == "/sv/status":
+            err, svd, target = sv_context(q.get("projectId", [None])[0])
+            if err:
+                self._json(*err)
+            else:
+                self._sv(lambda: sourcever.sv_status(svd, target))
+        elif path == "/sv/diff":
+            err, svd, target = sv_context(q.get("projectId", [None])[0])
+            if err:
+                self._json(*err)
+            else:
+                self._sv(lambda: sourcever.sv_diff(svd, target, q.get("id", [None])[0],
+                                                   q.get("path", [None])[0]))
         else:
             self._json(404, {"error": "not found", "path": path})
 
@@ -487,6 +537,21 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/fs/exec":
             b = self._read_json()
             self._json(*editorfs.fs_exec(app_dir(), b.get("projectId"), b.get("cmd")))
+        # --- source versions del modo editor (doc 27, fase 4) ---
+        elif path == "/sv/save":
+            b = self._read_json()
+            err, svd, target = sv_context(b.get("projectId"))
+            if err:
+                self._json(*err)
+            else:
+                self._sv(lambda: sourcever.sv_save(svd, target, b.get("author"), b.get("note")))
+        elif path == "/sv/restore":
+            b = self._read_json()
+            err, svd, target = sv_context(b.get("projectId"))
+            if err:
+                self._json(*err)
+            else:
+                self._sv(lambda: sourcever.sv_restore(svd, target, b.get("id"), b.get("author")))
         else:
             self._json(404, {"error": "not found", "path": path})
 

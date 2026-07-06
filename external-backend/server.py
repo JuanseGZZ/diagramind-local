@@ -20,6 +20,7 @@ import config
 from auth import router as auth_router
 from content import router as content_router
 from fs import router as fs_router
+from sv import router as sv_router
 from db import connect, init_db
 from gitrepo import init_repo
 from realtime import router as realtime_router
@@ -90,6 +91,7 @@ app.include_router(users_router)
 app.include_router(content_router)    # REST folders/projects (namespace + permisos)
 app.include_router(versions_router)   # versionado git + GitHub
 app.include_router(fs_router)         # modo editor: /editor/target + /fs/* (doc 27)
+app.include_router(sv_router)         # modo editor: source versions /sv/* (doc 27, fase 4)
 app.include_router(realtime_router)   # WebSocket /ws (realtime mirror)
 
 

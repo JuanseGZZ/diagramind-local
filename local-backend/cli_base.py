@@ -45,7 +45,10 @@ def _editor_relay_note(folder, focus_name):
         f"rutas RELATIVAS a la raíz del proyecto. Flujo típico: fs_tree para "
         f"orientarte → fs_grep/fs_read para entender → fs_write con el archivo "
         f"COMPLETO para editar. fs_exec requiere ser admin del conector (si da 403, "
-        f"no insistas). NO uses tus herramientas locales de archivos para este "
+        f"no insistas). ANTES de una tanda de cambios guardá una VERSIÓN con "
+        f"mcp__dmfs__sv_save({{note}}) — permite deshacer lo tuyo; sv_list muestra el "
+        f"historial y sv_restore vuelve a una versión SOLO si el usuario lo pide. "
+        f"NO uses tus herramientas locales de archivos para este "
         f"proyecto: ./{safe_name(focus_name)}/tree.json es solo un puntero y los "
         f"esquemas diagramind-* no aplican."
     )

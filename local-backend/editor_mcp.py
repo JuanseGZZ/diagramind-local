@@ -72,6 +72,21 @@ TOOLS = [
         "description": "Ejecuta un comando de shell con cwd en el target del proyecto (timeout 60s). Requiere ser ADMIN del conector (403 → no insistas).",
         "inputSchema": _schema({"cmd": _STR}, ["cmd"]),
     },
+    {
+        "name": "sv_save",
+        "description": "Guarda una VERSIÓN (snapshot de todos los archivos) del proyecto. Usala ANTES de una tanda de cambios para que el usuario pueda volver atrás. Queda firmada como hecha por la IA.",
+        "inputSchema": _schema({"note": {"type": "string", "description": "nota corta (ej. 'antes de refactorizar X')"}}, []),
+    },
+    {
+        "name": "sv_list",
+        "description": "Lista las versiones guardadas del proyecto ({id, ts, author, note, count}).",
+        "inputSchema": _schema({}, []),
+    },
+    {
+        "name": "sv_restore",
+        "description": "Vuelve TODOS los archivos del proyecto a una versión guardada (con snapshot de seguridad automático previo). Solo si el usuario lo pide.",
+        "inputSchema": _schema({"id": {"type": "string", "description": "id de la versión (de sv_list)"}}, ["id"]),
+    },
 ]
 
 
@@ -119,6 +134,12 @@ def call_tool(name, args):
         out, err = _http("GET", f"/fs/grep?projectId={pid}&q={q(args.get('q') or '')}&glob={q(args.get('glob') or '')}")
     elif name == "fs_exec":
         out, err = _http("POST", "/fs/exec", {"projectId": PROJECT, "cmd": args.get("cmd")})
+    elif name == "sv_save":
+        out, err = _http("POST", "/sv/save", {"projectId": PROJECT, "note": args.get("note") or "", "author": "IA"})
+    elif name == "sv_list":
+        out, err = _http("GET", f"/sv/list?projectId={pid}")
+    elif name == "sv_restore":
+        out, err = _http("POST", "/sv/restore", {"projectId": PROJECT, "id": args.get("id"), "author": "IA"})
     else:
         return f"tool desconocida: {name}", True
     if err:

@@ -96,3 +96,15 @@ class FsRenameBody(BaseModel):
 class FsExecBody(BaseModel):
     projectId: str
     cmd: str
+
+
+class SvSaveBody(BaseModel):
+    projectId: str
+    note: str | None = None
+    author: str | None = None    # anotación (p.ej. "IA"); el autor real es el del token
+
+
+class SvRestoreBody(BaseModel):
+    projectId: str
+    id: str
+    author: str | None = None

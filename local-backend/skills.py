@@ -309,7 +309,10 @@ SKILLS = dict([
         "   (mcp__dmfs__fs_tree / fs_read / fs_write / fs_mkdir / fs_rename / "
         "   fs_delete / fs_grep / fs_exec), con rutas relativas a la raíz del "
         "   proyecto. Para editar: fs_read → modificá → fs_write con el archivo "
-        "   COMPLETO. Tu system prompt te dice cuál de los dos casos es.\n"
+        "   COMPLETO. Tu system prompt te dice cuál de los dos casos es. Además "
+        "   tenés VERSIONES del proyecto: mcp__dmfs__sv_save({note}) ANTES de una "
+        "   tanda de cambios (queda firmado como IA), sv_list para el historial y "
+        "   sv_restore({id}) para volver atrás SOLO si el usuario lo pide.\n"
         "4. Los esquemas diagramind-* (ids, contadores, tipos de nodo) **no aplican** "
         "   a estos proyectos: es código/archivos comunes.\n"
         "5. Los demás proyectos del workspace siguen las reglas de siempre.",
