@@ -59,7 +59,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.14.0"   # modo editor fase 3: chat con --add-dir al target (doc 27)
+VERSION = "0.15.0"   # modo editor fase 4: /fs/rename (doc 27)
 
 # ===================== rutas / disco =====================
 
@@ -478,6 +478,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/fs/mkdir":
             b = self._read_json()
             self._json(*editorfs.fs_mkdir(app_dir(), b.get("projectId"), b.get("path")))
+        elif path == "/fs/rename":
+            b = self._read_json()
+            self._json(*editorfs.fs_rename(app_dir(), b.get("projectId"), b.get("from"), b.get("to")))
         elif path == "/fs/delete":
             b = self._read_json()
             self._json(*editorfs.fs_delete(app_dir(), b.get("projectId"), b.get("path")))

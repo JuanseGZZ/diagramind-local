@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 import store
 from auth import current_user, require_admin
 from db import connect
-from models import EditorTargetBody, FsExecBody, FsPathBody, FsWriteBody
+from models import EditorTargetBody, FsExecBody, FsPathBody, FsRenameBody, FsWriteBody
 
 router = APIRouter(tags=["editor"])
 
@@ -154,6 +154,27 @@ def fs_delete(body: FsPathBody, user: dict = Depends(current_user)):
         shutil.rmtree(p, ignore_errors=True)
     elif os.path.exists(p):
         os.remove(p)
+    return {"ok": True}
+
+
+@router.post("/fs/rename")
+def fs_rename(body: FsRenameBody, user: dict = Depends(current_user)):
+    """Renombra/mueve DENTRO del target (os.rename: atómico, sirve para dirs y
+    binarios). No pisa destinos existentes."""
+    _need(user, body.projectId, "write")
+    base, src = _resolve(body.projectId, body.from_)
+    _, dst = _resolve(body.projectId, body.to)
+    if src == base:
+        raise HTTPException(status_code=400, detail="cannot rename the target root")
+    if not os.path.exists(src):
+        raise HTTPException(status_code=404, detail="source not found")
+    if os.path.exists(dst):
+        raise HTTPException(status_code=409, detail="destination already exists")
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        os.rename(src, dst)
+    except OSError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {"ok": True}
 
 

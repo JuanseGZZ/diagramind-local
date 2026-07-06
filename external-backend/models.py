@@ -86,6 +86,13 @@ class FsPathBody(BaseModel):
     path: str
 
 
+class FsRenameBody(BaseModel):
+    # `from` es keyword de Python → campo `from_` con alias (el wire manda "from")
+    projectId: str
+    from_: str = Field(alias="from")
+    to: str
+
+
 class FsExecBody(BaseModel):
     projectId: str
     cmd: str

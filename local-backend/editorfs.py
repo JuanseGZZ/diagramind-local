@@ -130,6 +130,29 @@ def fs_delete(app_dir, pid, rel):
     return 200, {"ok": True}
 
 
+def fs_rename(app_dir, pid, rel_from, rel_to):
+    """Renombra/mueve un archivo o directorio DENTRO del target (os.rename: atómico,
+    sirve para dirs y binarios). No pisa destinos existentes."""
+    err, base, src = _resolve(app_dir, pid, rel_from)
+    if err:
+        return err
+    err, _, dst = _resolve(app_dir, pid, rel_to)
+    if err:
+        return err
+    if src == base:
+        return 400, {"error": "cannot rename the target root"}
+    if not os.path.exists(src):
+        return 404, {"error": "source not found"}
+    if os.path.exists(dst):
+        return 409, {"error": "destination already exists"}
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        os.rename(src, dst)
+    except OSError as e:
+        return 400, {"error": str(e)}
+    return 200, {"ok": True}
+
+
 def fs_grep(app_dir, pid, q, glob):
     err, base, _ = _resolve(app_dir, pid, ".")
     if err:
