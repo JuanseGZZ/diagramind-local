@@ -87,6 +87,21 @@ TOOLS = [
         "description": "Vuelve TODOS los archivos del proyecto a una versión guardada (con snapshot de seguridad automático previo). Solo si el usuario lo pide.",
         "inputSchema": _schema({"id": {"type": "string", "description": "id de la versión (de sv_list)"}}, ["id"]),
     },
+    {
+        "name": "gh_push",
+        "description": "Con GitHub conectado en el proyecto: commit de todos los cambios + push al repo. El commit queda anotado como hecho por la IA. Usala si el usuario pide subir/pushear.",
+        "inputSchema": _schema({"message": {"type": "string", "description": "mensaje del commit"}}, []),
+    },
+    {
+        "name": "gh_pull",
+        "description": "Con GitHub conectado: trae del remoto (con snapshot de seguridad previo). Sin `ref` = lo último; con `ref` (sha de gh_log) = los archivos de esa versión. Solo si el usuario lo pide.",
+        "inputSchema": _schema({"ref": {"type": "string", "description": "sha/ref anterior (opcional)"}}, []),
+    },
+    {
+        "name": "gh_log",
+        "description": "Últimos commits del repo del proyecto ({sha, author, ts, msg}).",
+        "inputSchema": _schema({}, []),
+    },
 ]
 
 
@@ -140,6 +155,12 @@ def call_tool(name, args):
         out, err = _http("GET", f"/sv/list?projectId={pid}")
     elif name == "sv_restore":
         out, err = _http("POST", "/sv/restore", {"projectId": PROJECT, "id": args.get("id"), "author": "IA"})
+    elif name == "gh_push":
+        out, err = _http("POST", "/svgit/push", {"projectId": PROJECT, "message": args.get("message") or "", "author": "IA"})
+    elif name == "gh_pull":
+        out, err = _http("POST", "/svgit/pull", {"projectId": PROJECT, "ref": args.get("ref") or None, "author": "IA"})
+    elif name == "gh_log":
+        out, err = _http("GET", f"/svgit/log?projectId={pid}")
     else:
         return f"tool desconocida: {name}", True
     if err:

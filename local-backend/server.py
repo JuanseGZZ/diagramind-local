@@ -53,6 +53,7 @@ from util import safe_name, safe_file_name
 from runs import RUNS, RUNS_LOCK, SESSION_MAP, new_run, emit
 import editorfs
 import sourcever
+import svgit
 from skills import install_skills
 from claude import find_claude, claude_version
 from clis import CLIS, run_cli
@@ -60,7 +61,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.17.0"   # modo editor fase 4: source versions por proyecto (/sv/*, doc 27)
+VERSION = "0.18.0"   # modo editor fase 4: GitHub por proyecto (/svgit/*, doc 27)
 
 # ===================== rutas / disco =====================
 
@@ -211,6 +212,33 @@ def read_folder_index(folder):
             return json.load(f)
     except Exception:
         return {}
+
+
+# Conexión GitHub POR proyecto editor (doc 27, fase 4). El token nunca entra al
+# repo: vive en <app_dir>/editor_github.json (0600) y se inyecta en la URL.
+def _gh_path():
+    return os.path.join(app_dir(), "editor_github.json")
+
+
+def gh_conn_read():
+    try:
+        with open(_gh_path(), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def gh_conn_write(data):
+    with open(_gh_path(), "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    try:
+        os.chmod(_gh_path(), 0o600)
+    except OSError:
+        pass
+
+
+def gh_conn_of(pid):
+    return gh_conn_read().get(pid or "")
 
 
 # Source Versions del modo editor (doc 27): el sv_dir vive DENTRO del directorio
@@ -403,6 +431,15 @@ class Handler(BaseHTTPRequestHandler):
         except sourcever.SvError as e:
             self._json(e.code, {"error": e.msg})
 
+    def _gh(self, fn):
+        """Corre una operación de svgit y traduce GitError/SvError → HTTP."""
+        try:
+            self._json(200, fn())
+        except svgit.GitError as e:
+            self._json(e.code, {"error": e.msg})
+        except sourcever.SvError as e:
+            self._json(e.code, {"error": e.msg})
+
     def _read_json(self):
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
@@ -492,6 +529,22 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._sv(lambda: sourcever.sv_diff(svd, target, q.get("id", [None])[0],
                                                    q.get("path", [None])[0]))
+        # --- GitHub por proyecto editor (doc 27, fase 4) ---
+        elif path == "/svgit/status":
+            pid = q.get("projectId", [None])[0]
+            target = editorfs.get_target(app_dir(), pid)
+            if not target:
+                self._json(400, {"error": "editor target not set"})
+            else:
+                self._gh(lambda: svgit.gh_status(gh_conn_of(pid), target))
+        elif path == "/svgit/log":
+            pid = q.get("projectId", [None])[0]
+            target = editorfs.get_target(app_dir(), pid)
+            if not target:
+                self._json(400, {"error": "editor target not set"})
+            else:
+                self._gh(lambda: svgit.gh_log(gh_conn_of(pid), target,
+                                              int(q.get("n", ["20"])[0])))
         else:
             self._json(404, {"error": "not found", "path": path})
 
@@ -552,6 +605,46 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(*err)
             else:
                 self._sv(lambda: sourcever.sv_restore(svd, target, b.get("id"), b.get("author")))
+        # --- GitHub por proyecto editor (doc 27, fase 4) ---
+        elif path == "/svgit/connect":
+            b = self._read_json()
+            pid = b.get("projectId")
+            if not pid or not b.get("remoteUrl"):
+                self._json(400, {"error": "faltan projectId o remoteUrl"})
+                return
+            if not editorfs.get_target(app_dir(), pid):
+                self._json(400, {"error": "editor target not set"})
+                return
+            data = gh_conn_read()
+            data[pid] = {"remoteUrl": b["remoteUrl"].strip(),
+                         "token": (b.get("token") or "").strip(),
+                         "branch": (b.get("branch") or "main").strip() or "main"}
+            gh_conn_write(data)
+            self._json(200, svgit.gh_status(data[pid], editorfs.get_target(app_dir(), pid)))
+        elif path == "/svgit/disconnect":
+            b = self._read_json()
+            data = gh_conn_read()
+            data.pop(b.get("projectId") or "", None)
+            gh_conn_write(data)
+            self._json(200, {"ok": True})
+        elif path == "/svgit/push":
+            b = self._read_json()
+            pid = b.get("projectId")
+            target = editorfs.get_target(app_dir(), pid)
+            if not target:
+                self._json(400, {"error": "editor target not set"})
+            else:
+                by_ai = (b.get("author") or "") == "IA"
+                self._gh(lambda: svgit.gh_push(gh_conn_of(pid), target, b.get("message"),
+                                               "IA (DiagraMinder)" if by_ai else "usuario", by_ai))
+        elif path == "/svgit/pull":
+            b = self._read_json()
+            err, svd, target = sv_context(b.get("projectId"))
+            if err:
+                self._json(*err)
+            else:
+                self._gh(lambda: svgit.gh_pull(gh_conn_of(b.get("projectId")), target,
+                                               b.get("ref"), svd, b.get("author") or "usuario"))
         else:
             self._json(404, {"error": "not found", "path": path})
 

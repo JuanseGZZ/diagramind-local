@@ -312,7 +312,10 @@ SKILLS = dict([
         "   COMPLETO. Tu system prompt te dice cuál de los dos casos es. Además "
         "   tenés VERSIONES del proyecto: mcp__dmfs__sv_save({note}) ANTES de una "
         "   tanda de cambios (queda firmado como IA), sv_list para el historial y "
-        "   sv_restore({id}) para volver atrás SOLO si el usuario lo pide.\n"
+        "   sv_restore({id}) para volver atrás SOLO si el usuario lo pide. Si el "
+        "   proyecto tiene GitHub conectado: gh_push({message}) commitea+pushea "
+        "   (anotado como IA), gh_log lista commits y gh_pull({ref?}) trae lo "
+        "   último o una versión — push/pull SOLO a pedido del usuario.\n"
         "4. Los esquemas diagramind-* (ids, contadores, tipos de nodo) **no aplican** "
         "   a estos proyectos: es código/archivos comunes.\n"
         "5. Los demás proyectos del workspace siguen las reglas de siempre.",

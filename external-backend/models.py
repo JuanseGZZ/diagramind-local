@@ -108,3 +108,26 @@ class SvRestoreBody(BaseModel):
     projectId: str
     id: str
     author: str | None = None
+
+
+class GhConnectBody(BaseModel):
+    projectId: str
+    remoteUrl: str
+    token: str | None = None
+    branch: str | None = None
+
+
+class GhProjectBody(BaseModel):
+    projectId: str
+
+
+class GhPushBody(BaseModel):
+    projectId: str
+    message: str | None = None
+    author: str | None = None    # "IA" → el commit queda anotado como hecho por la IA
+
+
+class GhPullBody(BaseModel):
+    projectId: str
+    ref: str | None = None
+    author: str | None = None

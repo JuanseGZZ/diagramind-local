@@ -76,6 +76,13 @@ CREATE TABLE IF NOT EXISTS editor_targets (
   project_id TEXT    PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
   target     TEXT    NOT NULL                        -- dir REAL que abre el modo editor (doc 27)
 );
+
+CREATE TABLE IF NOT EXISTS editor_github (
+  project_id TEXT    PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  remote_url TEXT    NOT NULL,                       -- repo GitHub PROPIO del proyecto editor
+  token      TEXT    NOT NULL DEFAULT '',            -- va en la URL al push/fetch, nunca al repo
+  branch     TEXT    NOT NULL DEFAULT 'main'
+);
 """
 
 

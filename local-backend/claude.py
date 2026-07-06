@@ -14,7 +14,8 @@ from cli_base import _focus_note, _editor_note, _editor_relay_note
 # tools del MCP fs de editores externos (editor_mcp.py) — para --allowedTools
 MCP_FS_TOOLS = ["fs_tree", "fs_read", "fs_write", "fs_mkdir", "fs_rename",
                 "fs_delete", "fs_grep", "fs_exec",
-                "sv_save", "sv_list", "sv_restore"]
+                "sv_save", "sv_list", "sv_restore",
+                "gh_push", "gh_pull", "gh_log"]
 
 
 def _self_cmd():

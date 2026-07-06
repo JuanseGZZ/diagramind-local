@@ -65,12 +65,14 @@
     <button class="tab active" data-tab="users">Usuarios</button>
     <button class="tab" data-tab="repo">Repo</button>
     <button class="tab" data-tab="versions">Versiones</button>
+    <button class="tab" data-tab="sourcever">Source Versions</button>
     <button class="tab" data-tab="github">GitHub</button>
   </nav>
   <main>
     <div id="tab-users" class="tabpane"></div>
     <div id="tab-repo" class="tabpane hidden"></div>
     <div id="tab-versions" class="tabpane hidden"></div>
+    <div id="tab-sourcever" class="tabpane hidden"></div>
     <div id="tab-github" class="tabpane hidden"></div>
   </main>
 </div>
@@ -139,7 +141,7 @@ function showTab(name) {
   document.querySelectorAll("nav .tab").forEach(b => b.classList.toggle("active", b.dataset.tab===name));
   document.querySelectorAll(".tabpane").forEach(p => p.classList.add("hidden"));
   $("#tab-"+name).classList.remove("hidden");
-  ({ users:renderUsers, repo:renderRepo, versions:renderVersions, github:renderGithub })[name]();
+  ({ users:renderUsers, repo:renderRepo, versions:renderVersions, sourcever:renderSourcever, github:renderGithub })[name]();
 }
 
 // ---------- Usuarios ----------
@@ -309,6 +311,76 @@ function colorDiff(txt){
     if(l.startsWith("@@")) return `<span class="hh">${e}</span>`;
     return e;
   }).join("\n");
+}
+
+// ---------- Source Versions (proyectos editor, doc 27 fase 4) ----------
+async function renderSourcever(){
+  const pane=$("#tab-sourcever"); pane.innerHTML="Cargando…";
+  let folders; try{ folders=(await jget("/repo")).folders; }catch(e){ pane.innerHTML=`<div class="err">${e.message}</div>`; return; }
+  pane.innerHTML="";
+  const sel=el("select");
+  sel.append(el("option",{value:"",textContent:"— elegí un proyecto editor —"}));
+  for(const f of folders) for(const p of f.projects) sel.append(el("option",{value:p.id,textContent:`${f.name} / ${p.name}`}));
+  const card=el("div",{className:"card"});
+  card.append(el("h2",{textContent:"Source Versions (modo editor)"}),
+    el("div",{className:"muted",style:"margin-bottom:8px",textContent:"Snapshots por proyecto de los archivos del target — con fecha y autor (usuario o IA). Restaurar guarda antes un snapshot de seguridad."}),
+    el("div",{className:"row"},[sel]));
+  const out=el("div"); card.append(out); pane.append(card);
+  sel.addEventListener("change",()=>loadSv(sel.value,out));
+}
+async function loadSv(pid,out){
+  out.innerHTML="";
+  if(!pid) return;
+  let st,versions;
+  try{ st=await jget("/sv/status?projectId="+pid); versions=(await jget("/sv/list?projectId="+pid)).versions; }
+  catch(e){
+    out.innerHTML = String(e.message).includes("target not set")
+      ? `<div class="muted" style="margin-top:8px">Este proyecto no es un editor con carpeta asignada.</div>`
+      : `<div class="err" style="margin-top:8px">${e.message}</div>`;
+    return;
+  }
+  const diffBox=el("pre",{className:"diff hidden"});
+  // cambios vs. la última versión
+  out.append(el("div",{className:"row",style:"margin:10px 0 4px"},[
+    el("b",{textContent:`Cambios sin guardar (${st.changes.length})`}),
+    versions.length===0?el("span",{className:"muted",textContent:"— sin versiones todavía"}):null,
+  ]));
+  const LETTER={modified:["M","#f59e0b"],added:["A","#34d399"],deleted:["D","#f87171"]};
+  for(const c of st.changes){
+    const [ltr,color]=LETTER[c.state]||["?",""];
+    const row=el("div",{className:"row",style:"padding:2px 0"});
+    const dbtn=el("button",{textContent:"diff"});
+    dbtn.addEventListener("click",async()=>{
+      try{ const d=await jget(`/sv/diff?projectId=${pid}&path=${encodeURIComponent(c.path)}`);
+        diffBox.classList.remove("hidden"); diffBox.innerHTML=colorDiff(d.diff||"(sin cambios)");
+        diffBox.scrollIntoView({behavior:"smooth"}); }
+      catch(e){ alertErr(e); }
+    });
+    row.append(el("b",{style:`color:${color};width:14px`,textContent:ltr}),
+               el("span",{className:"grow",textContent:c.path}), dbtn);
+    out.append(row);
+  }
+  // historial con restore
+  out.append(el("div",{style:"margin:12px 0 4px"},el("b",{textContent:`Versiones (${versions.length})`})));
+  if(versions.length===0){ out.append(el("div",{className:"muted",textContent:"Guardá la primera versión desde la web (Source Control del editor)."}), diffBox); return; }
+  const t=el("table");
+  t.append(el("tr",{},["Fecha","Autor","Nota","Archivos",""].map(h=>el("th",{textContent:h}))));
+  for(const v of versions){
+    const rb=el("button",{textContent:"Restaurar"});
+    rb.addEventListener("click",async()=>{
+      if(!confirm(`¿Volver el proyecto a la versión del ${new Date(v.ts).toLocaleString()}? Antes se guarda un snapshot de seguridad.`)) return;
+      try{ await jpost("/sv/restore",{projectId:pid,id:v.id}); loadSv(pid,out); }
+      catch(e){ alertErr(e); }
+    });
+    t.append(el("tr",{},[
+      el("td",{className:"muted",textContent:new Date(v.ts).toLocaleString()}),
+      el("td",{textContent:v.author}),
+      el("td",{className:"grow",textContent:v.note||"(sin nota)"}),
+      el("td",{className:"muted",textContent:String(v.count)}),
+      el("td",{},rb),
+    ]));
+  }
+  out.append(t, diffBox);
 }
 
 // ---------- GitHub ----------
