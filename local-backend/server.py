@@ -62,7 +62,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.19.0"   # IA Orchestrator fase 2: motor de runs (/orch/*, doc 28)
+VERSION = "0.20.0"   # IA Orchestrator fase 4: Claude Code como cabeza de agente (doc 28)
 
 # ===================== rutas / disco =====================
 
@@ -275,6 +275,7 @@ def orch_ctx(pid):
     return {
         "pid": pid, "app_dir": app_dir(),
         "graph_path": os.path.join(tree_dir(folder, meta.get("name") or pid), "tree.json"),
+        "work_dir": folder_dir(folder),      # cwd de los agentes CLI (fase 4)
         "tree_path_of": tree_path_of, "sv_dir_of": sv_dir_of, "project_meta": project_meta,
         # el watcher del mirror ya detecta los tree.json tocados (mtime → SSE a la web)
         "notify_edit": lambda rpid: None,

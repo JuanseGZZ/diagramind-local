@@ -34,9 +34,13 @@ import urllib.error
 import urllib.request
 import uuid
 
+import subprocess
+
 import editorfs
 import sourcever
-from skills import SKILLS as TYPE_SKILLS
+from claude import EFFORT_THINK, find_claude, map_model
+from skills import SKILLS as TYPE_SKILLS, install_skills
+from util import safe_name
 
 MEM_HEAVY_CHARS = 8000
 MAX_TURNS_DEFAULT = 30
@@ -48,6 +52,8 @@ KEYS = {}                     # pid -> apiKeys (SOLO RAM)
 LOCK = threading.Lock()
 
 CONTROL_TOOLS = {"delegar", "responder", "preguntar_al_usuario"}
+CLI_PROVIDERS = {"local", "local-codex", "local-gemini"}
+CLI_TIMEOUT = 15 * 60        # tope de un turno CLI
 
 
 # ===================== storage =====================
@@ -309,7 +315,7 @@ def make_adapter(ctx, node):
             raise OrchError(400, f"el nodo «{node.get('titulo')}» usa 'Otra API' y no llegó su key/URL")
         return OpenAIChat(o["key"], ia.get("model") or "gpt-4o", None, base=o["url"])
     raise OrchError(400, f"el nodo «{node.get('titulo')}» usa el proveedor '{provider}', que el motor "
-                         "todavía no soporta (v1: Anthropic y OpenAI-compatible; CLIs = fase 4)")
+                         "todavía no soporta (APIs: Anthropic y OpenAI-compatible; CLI: Claude Code)")
 
 
 # ===================== tools =====================
@@ -539,10 +545,19 @@ def snapshot_resources(ctx, run, graph, node):
 # ===================== frames / motor =====================
 
 def _new_frame(ctx, graph, run, node, entry_kind, initial_text):
-    adapter = make_adapter(ctx, node)
-    frame = {"nodeId": node["id"], "provider": adapter.provider, "entry": entry_kind,
-             "messages": [adapter.user_msg(initial_text)], "pendingToolId": None,
-             "stash": [], "iters": 0, "firstText": initial_text}
+    provider = ((node.get("data") or {}).get("ia") or {}).get("provider") or "anthropic"
+    if provider in CLI_PROVIDERS:
+        if provider != "local":
+            raise OrchError(400, f"el nodo «{node.get('titulo')}» usa '{provider}': como cabeza CLI "
+                                 "por ahora solo está soportado Claude Code (fase 4 v1)")
+        frame = {"kind": "cli", "nodeId": node["id"], "provider": provider, "entry": entry_kind,
+                 "sessionId": None, "pendingInput": initial_text, "iters": 0,
+                 "firstText": initial_text}
+    else:
+        adapter = make_adapter(ctx, node)
+        frame = {"kind": "api", "nodeId": node["id"], "provider": adapter.provider, "entry": entry_kind,
+                 "messages": [adapter.user_msg(initial_text)], "pendingToolId": None,
+                 "stash": [], "iters": 0, "firstText": initial_text}
     snapshot_resources(ctx, run, graph, node)
     set_node_state(ctx, run, node["id"], "running")
     emit(run, "log", nodeId=node["id"], text=f"→ entra trabajo: {initial_text[:200]}")
@@ -629,6 +644,9 @@ def _loop(ctx):
 
 def _step(ctx, graph, run):
     frame = run["stack"][-1]
+    if frame.get("kind") == "cli":
+        _step_cli(ctx, graph, run, frame)
+        return
     node = _agent(graph, frame["nodeId"])
     adapter = _adapter_for_frame(ctx, graph, frame)
     ctrl = control_tools(graph, node["id"])
@@ -738,6 +756,10 @@ def _exec_tool(ctx, graph, run, node, rexecs, tc):
 
 def _resume_frame(ctx, graph, run, frame, content, is_error=False):
     """Entrega el tool_result pendiente (respuesta de delegado / humano / error)."""
+    if frame.get("kind") == "cli":
+        frame["pendingInput"] = ("⚠ " if is_error else "") + content
+        set_node_state(ctx, run, frame["nodeId"], "running")
+        return
     adapter = _adapter_for_frame(ctx, graph, frame)
     results = frame["stash"] + [{"id": frame["pendingToolId"], "name": "control",
                                  "content": content, **({"is_error": True} if is_error else {})}]
@@ -764,6 +786,224 @@ def _do_responder(ctx, graph, run, frame, mensaje):
     child = _agent(graph, frame["nodeId"])
     _resume_frame(ctx, graph, run, parent,
                   f"Respuesta de «{child.get('titulo') or child['id']}»: {mensaje}")
+
+
+# ===================== turnos CLI (Claude Code — fase 4) =====================
+# La cabeza del nodo es el CLI: acceso DIRECTO a los targets de sus recursos editor
+# (--add-dir) y a los tree.json de los diagramas (cwd = la carpeta del mirror, con
+# las skills instaladas). Las acciones de control van por PROTOCOLO DE TEXTO: la
+# última línea del turno debe ser `CONTROL: {json}`. La continuidad entre
+# delegaciones/preguntas usa --resume (sesión por frame).
+
+CLI_PROTOCOL = (
+    "PROTOCOLO DE CONTROL (OBLIGATORIO — sos un empleado del orquestador): tu respuesta "
+    "DEBE terminar con UNA línea exacta `CONTROL: {json}` con una de estas acciones:\n"
+    'CONTROL: {"accion":"responder","mensaje":"<tu resultado, concreto y verificable>"}\n'
+    'CONTROL: {"accion":"delegar","agente":"<nombre subordinado>","mensaje":"<qué tiene que hacer>"}\n'
+    'CONTROL: {"accion":"preguntar_al_usuario","pregunta":"<qué necesitás que decida el humano>"}\n'
+    "Además podés emitir líneas `CONTROL: {\"accion\":\"limpiar_memoria\",\"agente\":\"<opcional>\"}` "
+    "ANTES de la línea final. Si delegás o preguntás, vas a recibir la respuesta en el próximo turno "
+    "de esta misma conversación. NUNCA termines sin la línea CONTROL."
+)
+
+
+def _cli_resource_notes(ctx, graph, node):
+    """Notas de recursos para un agente CLI (rutas reales, no tools) + add_dirs."""
+    notes, add_dirs = [], []
+    for r in resources_of(graph, node["id"]):
+        rpid = r["data"]["projectId"]
+        meta = ctx["project_meta"](rpid)
+        if not meta:
+            continue
+        perm = (r["data"] or {}).get("permiso") or "editar"
+        if meta.get("type") == "editor":
+            target = editorfs.get_target(ctx["app_dir"], rpid)
+            if target:
+                notes.append(f"- «{meta.get('name')}» (editor, permiso {perm}): la carpeta real "
+                             f"{target} — trabajá DIRECTO ahí con tus herramientas de archivos")
+                if PERM_LEVEL.get(perm, 1) >= 1:
+                    add_dirs.append(target)
+        else:
+            rel = f"./{safe_name(meta.get('name') or rpid)}/tree.json"
+            notes.append(f"- «{meta.get('name')}» ({meta.get('type')}, permiso {perm}): el diagrama "
+                         f"{rel} — editalo respetando el esquema EXACTO de su tipo "
+                         f"(skill diagramind-{str(meta.get('type')).lower()})")
+    return notes, add_dirs
+
+
+def _cli_system(ctx, graph, node, notes):
+    d = node.get("data") or {}
+    partes = [
+        f"Sos «{node.get('titulo') or 'agente'}», un empleado IA de la empresa (IA Orchestrator de DiagraMinder).",
+        f"TU ROL: {d.get('rol') or '(sin rol definido — trabajá con criterio)'}",
+    ]
+    targets = delega_targets(graph, node["id"])
+    if targets:
+        partes.append("SUBORDINADOS (podés delegarles y esperás su respuesta): " +
+                      "; ".join(f"«{t.get('titulo') or t['id']}» ({(t.get('data') or {}).get('rol', '')[:80]})" for t in targets))
+    if notes:
+        partes.append("TUS RECURSOS:\n" + "\n".join(notes))
+    if (d.get("memoria") or {}).get("enabled", True):
+        mem = mem_read(ctx, node["id"])
+        if mem:
+            lines = [f"- [{time.strftime('%Y-%m-%d %H:%M', time.localtime(m['ts'] / 1000))}] {m['texto']}"
+                     for m in mem[-12:]]
+            partes.append("TU MEMORIA (trabajos y charlas anteriores):\n" + "\n".join(lines))
+    partes.append("REGLAS: 1) Trabajá SOLO en lo que te pidieron. 2) Tocá ÚNICAMENTE tus recursos "
+                  "(no otros proyectos de la carpeta). 3) Respondé en español, concreto.")
+    partes.append(CLI_PROTOCOL)
+    return "\n\n".join(partes)
+
+
+def _parse_control(text):
+    """(acciones_limpiar, accion_final|None, texto_sin_lineas_control)."""
+    limpiar, final, visibles = [], None, []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("CONTROL:"):
+            try:
+                obj = json.loads(stripped[len("CONTROL:"):].strip())
+            except Exception:
+                visibles.append(line)
+                continue
+            if obj.get("accion") == "limpiar_memoria":
+                limpiar.append(obj)
+            else:
+                final = obj
+        else:
+            visibles.append(line)
+    return limpiar, final, "\n".join(visibles).strip()
+
+
+def _run_cli_turn(ctx, run, node, frame, message):
+    """Lanza `claude -p` para un turno del agente y devuelve (texto, session_id, costo)."""
+    cli_bin = find_claude()
+    if not cli_bin:
+        raise OrchError(400, f"el nodo «{node.get('titulo')}» usa Claude Code y el binario `claude` "
+                             "no está en esta máquina")
+    graph = load_graph(ctx)
+    notes, add_dirs = _cli_resource_notes(ctx, graph, node)
+    system = _cli_system(ctx, graph, node, notes)
+    ia = (node.get("data") or {}).get("ia") or {}
+    kw = EFFORT_THINK.get(ia.get("effort") or "", "")
+    msg = message + (f"\n\n{kw}" if kw else "")
+    work_dir = ctx.get("work_dir") or ctx["app_dir"]
+    try:
+        install_skills(work_dir)
+    except Exception:
+        pass
+    cmd = [cli_bin, "-p", msg, "--output-format", "stream-json", "--verbose",
+           "--model", map_model(ia.get("model")), "--permission-mode", "acceptEdits",
+           "--add-dir", work_dir,
+           "--disallowedTools", "WebFetch", "WebSearch",
+           "--append-system-prompt", system]
+    for d in add_dirs:
+        cmd += ["--add-dir", d]
+    if frame.get("sessionId"):
+        cmd += ["--resume", str(frame["sessionId"])]
+    try:
+        proc = subprocess.Popen(cmd, cwd=work_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, bufsize=1, encoding="utf-8", errors="replace")
+    except Exception as e:
+        raise OrchError(400, f"no pude lanzar Claude Code: {e}")
+    run["_cliProc"] = proc
+    session_id, result_text, texts, cost, deadline = None, None, [], 0.0, time.time() + CLI_TIMEOUT
+    for line in proc.stdout:
+        if time.time() > deadline:
+            proc.terminate()
+            raise OrchError(400, f"turno CLI de «{node.get('titulo')}» superó el tope de {CLI_TIMEOUT // 60} min")
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") == "system" and obj.get("subtype") == "init":
+            session_id = obj.get("session_id") or session_id
+        elif obj.get("type") == "assistant":
+            for b in (obj.get("message", {}).get("content") or []):
+                if b.get("type") == "text" and b.get("text"):
+                    texts.append(b["text"])
+                elif b.get("type") == "tool_use":
+                    emit(run, "log", nodeId=node["id"], text=f"cli tool {b.get('name', '?')}")
+        elif obj.get("type") == "result":
+            session_id = obj.get("session_id") or session_id
+            result_text = obj.get("result")
+            cost = obj.get("total_cost_usd") or 0.0
+            if obj.get("is_error"):
+                proc.wait()
+                run["_cliProc"] = None
+                raise OrchError(502, f"Claude Code devolvió un error: {result_text or '?'}")
+    proc.wait()
+    run["_cliProc"] = None
+    if run.get("_kill"):
+        raise OrchError(400, "turno CLI cancelado")
+    if proc.returncode not in (0, None) and result_text is None:
+        err = (proc.stderr.read() or "").strip()[:400]
+        raise OrchError(502, f"Claude Code salió con código {proc.returncode}: {err}")
+    return (result_text or "\n\n".join(texts) or ""), session_id, cost
+
+
+def _step_cli(ctx, graph, run, frame):
+    node = _agent(graph, frame["nodeId"])
+    message = frame.get("pendingInput") or "(continuá)"
+    frame["pendingInput"] = None
+    frame["iters"] += 1
+    set_node_state(ctx, run, node["id"], "running")
+    text, session_id, cost = _run_cli_turn(ctx, run, node, frame, message)
+    run["turns"] += 1
+    if session_id:
+        frame["sessionId"] = session_id
+    add_spend(run, node["id"], {"in": 0, "out": 0})
+    if cost:
+        for key in (str(node["id"]), "total"):
+            sp = run["spend"].setdefault(key, {"turns": 0, "in": 0, "out": 0})
+            sp["usd"] = round(sp.get("usd", 0.0) + cost, 6)
+    limpiar, accion, visible = _parse_control(text)
+
+    for lm in limpiar:
+        who = (lm.get("agente") or "").strip()
+        if not who:
+            mem_clear(ctx, node["id"])
+            emit(run, "log", nodeId=node["id"], text="limpió su memoria")
+        else:
+            target = _resolve_target(graph, node["id"], who)
+            if target:
+                mem_clear(ctx, target["id"])
+                emit(run, "log", nodeId=node["id"], text=f"limpió la memoria de «{target.get('titulo')}»")
+
+    if accion is None or accion.get("accion") == "responder":
+        mensaje = (accion or {}).get("mensaje") or visible or "(sin respuesta)"
+        _do_responder(ctx, graph, run, frame, str(mensaje))
+        _save(ctx, run)
+        return
+    if frame["iters"] > MAX_TOOL_ITERS:
+        _do_responder(ctx, graph, run, frame, visible + "\n(corté: demasiadas iteraciones)")
+        _save(ctx, run)
+        return
+    if accion.get("accion") == "delegar":
+        target = _resolve_target(graph, node["id"], accion.get("agente"))
+        if not target:
+            frame["pendingInput"] = (f"⚠ no podés delegar a «{accion.get('agente')}»: no está conectado "
+                                     "por una flecha delega. Elegí un subordinado válido o respondé.")
+            _save(ctx, run)
+            return
+        set_node_state(ctx, run, node["id"], "waiting")
+        texto = f"«{node.get('titulo') or node['id']}» te delega: {accion.get('mensaje') or ''}"
+        run["stack"].append(_new_frame(ctx, graph, run, target, "delegado", texto))
+        _save(ctx, run)
+        return
+    if accion.get("accion") == "preguntar_al_usuario":
+        run["pending"] = {"nodeId": node["id"], "question": str(accion.get("pregunta") or "")}
+        run["status"] = "waiting_human"
+        set_node_state(ctx, run, node["id"], "asking")
+        emit(run, "ask", nodeId=node["id"], question=run["pending"]["question"])
+        _save(ctx, run)
+        return
+    # acción desconocida → pedirle que corrija
+    frame["pendingInput"] = f"⚠ acción CONTROL desconocida: {accion.get('accion')}. Usá responder/delegar/preguntar_al_usuario."
+    _save(ctx, run)
 
 
 # ===================== API de alto nivel (la usa server.py) =====================
@@ -831,6 +1071,12 @@ def kill(ctx):
         raise OrchError(409, "no hay un run activo")
     if run["status"] == "running":
         run["_kill"] = True
+        proc = run.get("_cliProc")
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
     else:
         run["status"] = "killed"
         emit(run, "status", status="killed")
