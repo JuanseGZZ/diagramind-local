@@ -52,6 +52,7 @@ from urllib.parse import urlparse, parse_qs
 from util import safe_name, safe_file_name
 from runs import RUNS, RUNS_LOCK, SESSION_MAP, new_run, emit
 import editorfs
+import orchestrator
 import sourcever
 import svgit
 from skills import install_skills
@@ -61,7 +62,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.18.0"   # modo editor fase 4: GitHub por proyecto (/svgit/*, doc 27)
+VERSION = "0.19.0"   # IA Orchestrator fase 2: motor de runs (/orch/*, doc 28)
 
 # ===================== rutas / disco =====================
 
@@ -239,6 +240,45 @@ def gh_conn_write(data):
 
 def gh_conn_of(pid):
     return gh_conn_read().get(pid or "")
+
+
+# Resuelve un proyecto por id escaneando los index.json de las carpetas del mirror.
+def project_entry(pid):
+    """(carpeta, meta {id,name,type}) del proyecto `pid`, o (None, None)."""
+    try:
+        folders_list = os.listdir(projects_dir())
+    except OSError:
+        folders_list = []
+    for folder in folders_list:
+        if not os.path.isdir(os.path.join(projects_dir(), folder)):
+            continue
+        for p in read_folder_index(folder).get("projects", []):
+            if p.get("id") == pid:
+                return folder, p
+    return None, None
+
+
+# Contexto de rutas que consume el motor del orquestador (orchestrator.py).
+def orch_ctx(pid):
+    folder, meta = project_entry(pid or "")
+    if not meta:
+        return None
+    def tree_path_of(rpid):
+        f2, m2 = project_entry(rpid)
+        return os.path.join(tree_dir(f2, m2.get("name") or rpid), "tree.json") if m2 else None
+    def sv_dir_of(rpid):
+        err, svd, _t = sv_context(rpid)
+        return None if err else svd
+    def project_meta(rpid):
+        _f, m2 = project_entry(rpid)
+        return m2
+    return {
+        "pid": pid, "app_dir": app_dir(),
+        "graph_path": os.path.join(tree_dir(folder, meta.get("name") or pid), "tree.json"),
+        "tree_path_of": tree_path_of, "sv_dir_of": sv_dir_of, "project_meta": project_meta,
+        # el watcher del mirror ya detecta los tree.json tocados (mtime → SSE a la web)
+        "notify_edit": lambda rpid: None,
+    }
 
 
 # Source Versions del modo editor (doc 27): el sv_dir vive DENTRO del directorio
@@ -440,6 +480,50 @@ class Handler(BaseHTTPRequestHandler):
         except sourcever.SvError as e:
             self._json(e.code, {"error": e.msg})
 
+    def _orch(self, pid, fn):
+        """Resuelve el ctx del orquestador y corre `fn(ctx)` traduciendo OrchError."""
+        ctx = orch_ctx(pid)
+        if not ctx:
+            self._json(409, {"error": "el orquestador no está sincronizado (falta en el mirror)"})
+            return
+        try:
+            self._json(200, fn(ctx))
+        except orchestrator.OrchError as e:
+            self._json(e.code, {"error": e.msg})
+        except sourcever.SvError as e:
+            self._json(e.code, {"error": e.msg})
+
+    def _orch_stream(self, pid, since):
+        """SSE de eventos del run del orquestador (para pintar el canvas en vivo)."""
+        ctx = orch_ctx(pid)
+        if not ctx:
+            self._json(409, {"error": "el orquestador no está sincronizado"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self._cors()
+        self.end_headers()
+        sent = since
+        last_beat = time.time()
+        try:
+            while True:
+                evs, sent, status = orchestrator.events_since(ctx, sent)
+                for ev in evs:
+                    self.wfile.write(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                if status in ("done", "error", "killed", "none") and not evs:
+                    self.wfile.write(b"data: {\"kind\": \"end\"}\n\n")
+                    self.wfile.flush()
+                    break
+                if time.time() - last_beat > 15:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    last_beat = time.time()
+                time.sleep(0.25)
+        except (ConnectionError, OSError):
+            pass
+
     def _read_json(self):
         length = int(self.headers.get("Content-Length") or 0)
         if not length:
@@ -545,6 +629,20 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._gh(lambda: svgit.gh_log(gh_conn_of(pid), target,
                                               int(q.get("n", ["20"])[0])))
+        # --- IA Orchestrator (doc 28, fase 2) ---
+        elif path == "/orch/state":
+            self._orch(q.get("projectId", [None])[0], lambda ctx: orchestrator.get_state(ctx))
+        elif path == "/orch/stream":
+            self._orch_stream(q.get("projectId", [None])[0], int(q.get("since", ["0"])[0]))
+        elif path == "/orch/chatlog":
+            self._orch(q.get("projectId", [None])[0],
+                       lambda ctx: orchestrator.chat_read(ctx, int(q.get("nodeId", ["0"])[0])))
+        elif path == "/orch/mem":
+            def _mem(ctx):
+                nid = int(q.get("nodeId", ["0"])[0])
+                return {"entries": orchestrator.mem_read(ctx, nid),
+                        "chars": orchestrator.mem_chars(ctx, nid)}
+            self._orch(q.get("projectId", [None])[0], _mem)
         else:
             self._json(404, {"error": "not found", "path": path})
 
@@ -645,6 +743,52 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._gh(lambda: svgit.gh_pull(gh_conn_of(b.get("projectId")), target,
                                                b.get("ref"), svd, b.get("author") or "usuario"))
+        # --- IA Orchestrator (doc 28, fase 2) ---
+        elif path == "/orch/run":
+            b = self._read_json()
+            def _run(ctx):
+                graph = orchestrator.load_graph(ctx)
+                task = graph["nodos"].get(int(b.get("taskNodeId") or 0))
+                if not task or task.get("type") != "agTask":
+                    raise orchestrator.OrchError(400, "taskNodeId no es un nodo tarea")
+                edge = next((f for f in graph["flechas"]
+                             if f.get("kind") == "task" and int(f.get("fromId", -1)) == int(task["id"])), None)
+                if not edge:
+                    raise orchestrator.OrchError(400, "la tarea no está conectada a un agente (flecha task)")
+                enunciado = (task.get("data") or {}).get("enunciado") or ""
+                texto = f"TAREA «{task.get('titulo') or ''}»: {enunciado}".strip()
+                run = orchestrator.start_run(ctx, "task", int(edge["toId"]), texto,
+                                             b.get("apiKeys") or {}, b.get("maxTurns"))
+                return {"runId": run["id"]}
+            self._orch(b.get("projectId"), _run)
+        elif path == "/orch/chat":
+            b = self._read_json()
+            self._orch(b.get("projectId"),
+                       lambda ctx: orchestrator.chat_message(ctx, int(b.get("nodeId") or 0),
+                                                             b.get("message") or "",
+                                                             b.get("apiKeys") or {}, b.get("maxTurns")))
+        elif path == "/orch/answer":
+            b = self._read_json()
+            self._orch(b.get("projectId"), lambda ctx: orchestrator.answer(ctx, b.get("text") or ""))
+        elif path == "/orch/pause":
+            b = self._read_json()
+            self._orch(b.get("projectId"), lambda ctx: orchestrator.pause(ctx))
+        elif path == "/orch/resume":
+            b = self._read_json()
+            self._orch(b.get("projectId"), lambda ctx: orchestrator.resume(ctx))
+        elif path == "/orch/kill":
+            b = self._read_json()
+            self._orch(b.get("projectId"), lambda ctx: orchestrator.kill(ctx))
+        elif path == "/orch/memclear":
+            b = self._read_json()
+            def _mc(ctx):
+                orchestrator.mem_clear(ctx, int(b.get("nodeId") or 0))
+                return {"ok": True}
+            self._orch(b.get("projectId"), _mc)
+        elif path == "/orch/chatclear":
+            b = self._read_json()
+            self._orch(b.get("projectId"),
+                       lambda ctx: orchestrator.chat_clear(ctx, int(b.get("nodeId") or 0)))
         else:
             self._json(404, {"error": "not found", "path": path})
 
