@@ -644,6 +644,11 @@ class Handler(BaseHTTPRequestHandler):
                 return {"entries": orchestrator.mem_read(ctx, nid),
                         "chars": orchestrator.mem_chars(ctx, nid)}
             self._orch(q.get("projectId", [None])[0], _mem)
+        elif path == "/orch/runs":
+            self._orch(q.get("projectId", [None])[0], lambda ctx: orchestrator.runs_list(ctx))
+        elif path == "/orch/rundetail":
+            self._orch(q.get("projectId", [None])[0],
+                       lambda ctx: orchestrator.run_detail(ctx, q.get("runId", [None])[0]))
         else:
             self._json(404, {"error": "not found", "path": path})
 

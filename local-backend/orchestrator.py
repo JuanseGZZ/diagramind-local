@@ -68,6 +68,38 @@ def _run_path(ctx):
     return os.path.join(orch_dir(ctx["app_dir"], ctx["pid"]), "run.json")
 
 
+def _runs_dir(ctx):
+    d = os.path.join(orch_dir(ctx["app_dir"], ctx["pid"]), "runs")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _runs_index_path(ctx):
+    return os.path.join(_runs_dir(ctx), "index.json")
+
+
+def _run_summary(run):
+    """Fila del historial: lo justo para la lista (sin events)."""
+    return {"id": run["id"], "entry": run["entry"], "rootNodeId": run.get("rootNodeId"),
+            "status": run["status"], "final": run.get("final"), "error": run.get("error"),
+            "createdAt": run.get("createdAt"), "endedAt": run.get("endedAt"),
+            "turns": run.get("turns", 0), "spend": (run.get("spend") or {}).get("total", {})}
+
+
+def _archive_run(ctx, run):
+    """Guarda un run TERMINADO en runs/<id>.json + lo prepend al index (una vez)."""
+    if run.get("_archived") or run["status"] not in ("done", "error", "killed"):
+        return
+    run["_archived"] = True
+    run["endedAt"] = run.get("endedAt") or int(time.time() * 1000)
+    full = {k: v for k, v in run.items() if not str(k).startswith("_") and k not in ("stack",)}
+    _write_json(os.path.join(_runs_dir(ctx), f"{run['id']}.json"), full)
+    idx = _read_json(_runs_index_path(ctx), [])
+    idx = [x for x in idx if x.get("id") != run["id"]]
+    idx.insert(0, _run_summary(run))
+    _write_json(_runs_index_path(ctx), idx[:200])
+
+
 def _mem_path(ctx, node_id):
     d = os.path.join(orch_dir(ctx["app_dir"], ctx["pid"]), "memory")
     os.makedirs(d, exist_ok=True)
@@ -640,6 +672,7 @@ def _loop(ctx):
         run["error"] = f"error interno del motor: {e}"
         emit(run, "status", status="error", error=run["error"])
     _save(ctx, run)
+    _archive_run(ctx, run)
 
 
 def _step(ctx, graph, run):
@@ -1081,7 +1114,32 @@ def kill(ctx):
         run["status"] = "killed"
         emit(run, "status", status="killed")
         _save(ctx, run)
+        _archive_run(ctx, run)
     return {"ok": True}
+
+
+def runs_list(ctx):
+    """Historial de runs (nuevo → viejo). El run VIVO (si lo hay) va primero."""
+    idx = _read_json(_runs_index_path(ctx), [])
+    live = RUNS.get(ctx["pid"])
+    if live and not live.get("_archived"):
+        idx = [x for x in idx if x.get("id") != live["id"]]
+        idx.insert(0, {**_run_summary(live), "live": True})
+    return {"runs": idx}
+
+
+def run_detail(ctx, run_id):
+    """Un run completo (con sus events). Del vivo en RAM o del archivo."""
+    live = RUNS.get(ctx["pid"])
+    if live and live["id"] == run_id:
+        d = {k: v for k, v in live.items() if not str(k).startswith("_") and k != "stack"}
+        d["live"] = live["status"] in ("running", "waiting_human", "paused")
+        d["stackNodes"] = [f["nodeId"] for f in live.get("stack", [])]
+        return {"run": d}
+    data = _read_json(os.path.join(_runs_dir(ctx), f"{run_id}.json"), None)
+    if not data:
+        raise OrchError(404, "no existe ese run en el historial")
+    return {"run": data}
 
 
 def events_since(ctx, since):
