@@ -62,7 +62,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.20.0"   # IA Orchestrator fase 4: Claude Code como cabeza de agente (doc 28)
+VERSION = "0.21.0"   # IA Orchestrator fase 3: paralelismo (fork/join + locks, doc 28)
 
 # ===================== rutas / disco =====================
 
@@ -775,7 +775,8 @@ class Handler(BaseHTTPRequestHandler):
                                                              b.get("apiKeys") or {}, b.get("maxTurns")))
         elif path == "/orch/answer":
             b = self._read_json()
-            self._orch(b.get("projectId"), lambda ctx: orchestrator.answer(ctx, b.get("text") or ""))
+            self._orch(b.get("projectId"),
+                       lambda ctx: orchestrator.answer(ctx, b.get("text") or "", b.get("nodeId")))
         elif path == "/orch/pause":
             b = self._read_json()
             self._orch(b.get("projectId"), lambda ctx: orchestrator.pause(ctx))

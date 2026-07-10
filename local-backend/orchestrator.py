@@ -1,26 +1,37 @@
-"""Motor del IA Orchestrator (doc 28, Fase 2 — SECUENCIAL).
+"""Motor del IA Orchestrator (doc 28, Fase 3 — PARALELO).
 
 - UN run por proyecto a la vez. El trabajo entra por una TAREA (`agTask` → agente
   raíz por flecha `task`) o por el MINI-CHAT de un nodo (decisión S: hablarle a un
   agente — típicamente el PM — es otro entry point; la charla entra a su memoria y
   se puede borrar entera).
-- TOKEN de ejecución con PILA de llamadas (decisión C: delegar = llamar y esperar).
-  Cada frame es un agente con su transcript nativo del proveedor. `delegar` /
-  `responder` / `preguntar_al_usuario` son TOOLS que mueven/suspenden el token.
+- TOKENS = ÁRBOL DE FRAMES (decisiones C y D): cada frame es un agente trabajando
+  con su transcript nativo. `delegar` suspende al caller; con `agentes: [..]` el
+  token se FORKEA (varios hijos en paralelo) y el `join` elige cómo despertarlo:
+  "todos" (default: una sola vuelta con todas las respuestas) o "cada_una" (una
+  vuelta por respuesta). Un SCHEDULER (thread por run) lanza un worker por frame
+  listo; el estado compartido se muta siempre bajo el LOCK global y las llamadas
+  LLM/CLI corren afuera (ahí vive el paralelismo).
+- ANTI-PISADAS (decisión E): lock por RECURSO DE ESCRITURA (projectId de cada
+  `usa` con permiso ≥ editar) + lock POR AGENTE (un empleado hace UNA cosa a la
+  vez). Un frame adquiere TODOS sus locks antes de girar y los suelta al terminar
+  o suspenderse (delegar / preguntar): el que no puede queda `queued` (en cola).
+  Adquisición todo-o-nada ⇒ sin deadlocks.
 - TOOLS DE RECURSOS: por cada `agResource` conectado por `usa`, el agente recibe
   tools con prefijo `r<idNodo>_` según permiso (editor → fs_*/sv_* vía
-  editorfs/sourcever; diagramas → view_tree/set_tree sobre el tree.json del mirror,
-  que la web refleja en vivo).
+  editorfs/sourcever; diagramas → view_tree/set_tree sobre el tree.json del mirror).
 - MEMORIA por agente (decisión N): entradas {id, kind: task|chat|delegado, chatId?,
   ts, texto} en <orch>/<pid>/memory/<nodeId>.json; se inyecta al system si está
   habilitada; `memHeavy` (decisión R) si supera MEM_HEAVY_CHARS. `limpiar_memoria`
   como tool (la propia o la de un subordinado conectado por `delega`).
-- SNAPSHOT pre-turno (decisión I): al activar el frame de un agente con recursos de
-  escritura → sv_save en los editores + copia del tree.json en los diagramas.
+- HUMANO EN EL LOOP: `preguntar_al_usuario` suspende SOLO esa rama; las demás
+  siguen. `run.pendings` acumula las preguntas abiertas (run.pending = la primera,
+  compat) y el run recién pasa a `waiting_human` cuando NADA más puede avanzar.
+- SNAPSHOT pre-ejecución (decisión I): al crear el frame de un agente con recursos
+  de escritura → sv_save en los editores + copia del tree.json en los diagramas.
 - PRESUPUESTO (decisión J): maxTurns (llamadas LLM) por run; pause/resume/kill.
-- Proveedores v1: Anthropic + OpenAI-compatible (openai/other). Google y CLIs → más
-  adelante (error claro). Las API keys viven SOLO en RAM (nunca se persisten): si el
-  backend se reinicia a mitad de un run, el run queda en error y se relanza.
+- Cabezas: APIs (Anthropic + OpenAI-compatible) y Claude Code CLI (fase 4), mixto.
+  Las API keys viven SOLO en RAM (nunca se persisten): si el backend se reinicia a
+  mitad de un run, el run queda en error y se relanza.
 
 El server (server.py) provee el contexto de rutas: dónde está el tree.json del
 orquestador y cómo resolver los de los proyectos-recurso (mirror de la carpeta).
@@ -49,11 +60,20 @@ HTTP_TIMEOUT = 180
 
 RUNS = {}                     # pid -> run dict vivo
 KEYS = {}                     # pid -> apiKeys (SOLO RAM)
-LOCK = threading.Lock()
+LOCK = threading.Lock()       # protege RUNS/run dicts; los workers lo sueltan para llamar al LLM
+RUNTIME = {}                  # pid -> {cv, procs, alive} (NUNCA se serializa)
 
 CONTROL_TOOLS = {"delegar", "responder", "preguntar_al_usuario"}
 CLI_PROVIDERS = {"local", "local-codex", "local-gemini"}
 CLI_TIMEOUT = 15 * 60        # tope de un turno CLI
+
+
+def _rt(pid):
+    """Runtime NO serializable del run (condition variable + procesos CLI vivos)."""
+    rt = RUNTIME.get(pid)
+    if rt is None:
+        rt = RUNTIME.setdefault(pid, {"cv": threading.Condition(LOCK), "procs": {}, "alive": False})
+    return rt
 
 
 # ===================== storage =====================
@@ -92,7 +112,8 @@ def _archive_run(ctx, run):
         return
     run["_archived"] = True
     run["endedAt"] = run.get("endedAt") or int(time.time() * 1000)
-    full = {k: v for k, v in run.items() if not str(k).startswith("_") and k not in ("stack",)}
+    full = {k: v for k, v in run.items()
+            if not str(k).startswith("_") and k not in ("stack", "frames", "locks")}
     _write_json(os.path.join(_runs_dir(ctx), f"{run['id']}.json"), full)
     idx = _read_json(_runs_index_path(ctx), [])
     idx = [x for x in idx if x.get("id") != run["id"]]
@@ -126,8 +147,8 @@ def _write_json(path, data):
 
 
 def _save(ctx, run):
-    """Persiste el run SIN las keys (viven solo en RAM)."""
-    _write_json(_run_path(ctx), run)
+    """Persiste el run SIN las keys (viven solo en RAM). Llamar con el LOCK tomado."""
+    _write_json(_run_path(ctx), {k: v for k, v in run.items() if not str(k).startswith("_")})
 
 
 # ===================== grafo =====================
@@ -372,17 +393,24 @@ def control_tools(graph, node_id):
     ]
     if delega_targets(graph, node_id):
         tools.insert(0, dict(name="delegar", **_s(
-            f"Delegá trabajo a un subordinado directo y ESPERÁ su respuesta (podés delegar a: {names}). El mensaje debe ser concreto y verificable.",
-            {"agente": {"type": "string", "description": "nombre del agente destino"},
-             "mensaje": {"type": "string", "description": "qué tiene que hacer, con el contexto necesario"}},
-            ["agente", "mensaje"])))
+            f"Delegá trabajo a subordinados directos y ESPERÁ su(s) respuesta(s) (podés delegar a: {names}). "
+            "Para UNO usá `agente`; para VARIOS EN PARALELO usá `agentes` y elegí `join`: \"todos\" te despierta "
+            "UNA vez con todas las respuestas juntas (default, para validar en conjunto) o \"cada_una\" te "
+            "despierta con CADA respuesta a medida que llega. El mensaje debe ser concreto y verificable.",
+            {"agente": {"type": "string", "description": "nombre del agente destino (delegación simple)"},
+             "agentes": {"type": "array", "items": {"type": "string"},
+                         "description": "varios destinos: trabajan EN PARALELO"},
+             "mensaje": {"type": "string", "description": "qué tienen que hacer, con el contexto necesario"},
+             "join": {"type": "string", "enum": ["todos", "cada_una"],
+                      "description": "cómo te despierto si delegás a varios (default: todos)"}},
+            ["mensaje"])))
     return tools
 
 
 PERM_LEVEL = {"leer": 0, "editar": 1, "ejecutar": 2}
 
 
-def resource_tools(ctx, graph, node_id):
+def resource_tools(ctx, graph, node_id, author):
     """(tools, executors, notas para el system) de los recursos `usa` del agente."""
     tools, execs, notes = [], {}, []
     for r in resources_of(graph, node_id):
@@ -397,7 +425,7 @@ def resource_tools(ctx, graph, node_id):
         label = f"{meta.get('name')} ({rtype}, permiso {r['data'].get('permiso')})"
         notes.append(f"- {rid}: {label}")
         if rtype == "editor":
-            _editor_tools(ctx, rid, rpid, perm, tools, execs)
+            _editor_tools(ctx, rid, rpid, perm, tools, execs, author)
         else:
             _diagram_tools(ctx, rid, rpid, rtype, perm, tools, execs)
     return tools, execs, notes
@@ -408,7 +436,7 @@ def _fs(fn, *args):
     return json.dumps(payload, ensure_ascii=False), code >= 400
 
 
-def _editor_tools(ctx, rid, rpid, perm, tools, execs):
+def _editor_tools(ctx, rid, rpid, perm, tools, execs, author):
     app = ctx["app_dir"]
     def add(name, spec, fn):
         tools.append(dict(name=f"{rid}_{name}", **spec))
@@ -439,12 +467,12 @@ def _editor_tools(ctx, rid, rpid, perm, tools, execs):
             lambda i: _fs(editorfs.fs_delete, app, rpid, i.get("path")))
         def sv_save(i):
             svd, t = sv_ctx()
-            return json.dumps(sourcever.sv_save(svd, t, ctx["author"], i.get("note") or ""), ensure_ascii=False), False
+            return json.dumps(sourcever.sv_save(svd, t, author, i.get("note") or ""), ensure_ascii=False), False
         add("sv_save", _s("Guarda una VERSIÓN (snapshot) del proyecto. Usala ANTES de una tanda de cambios.",
                           {"note": {"type": "string"}}), sv_save)
         def sv_restore(i):
             svd, t = sv_ctx()
-            return json.dumps(sourcever.sv_restore(svd, t, i.get("id"), ctx["author"]), ensure_ascii=False), False
+            return json.dumps(sourcever.sv_restore(svd, t, i.get("id"), author), ensure_ascii=False), False
         add("sv_restore", _s("Vuelve el proyecto a una versión (con snapshot de seguridad previo). Solo si te lo piden.",
                              {"id": {"type": "string"}}, ["id"]), sv_restore)
     if perm >= 2:
@@ -486,7 +514,7 @@ def _skill_body(rtype):
     return content.split("---\n", 2)[-1].strip() if content else ""
 
 
-def build_system(ctx, graph, node):
+def build_system(ctx, graph, node, notes):
     d = node.get("data") or {}
     nid = node["id"]
     partes = [
@@ -495,9 +523,9 @@ def build_system(ctx, graph, node):
     ]
     targets = delega_targets(graph, nid)
     if targets:
-        partes.append("SUBORDINADOS (podés delegarles con la tool `delegar` y esperás su respuesta): " +
+        partes.append("SUBORDINADOS (podés delegarles con la tool `delegar` — a varios EN PARALELO con "
+                      "`agentes` — y esperás su(s) respuesta(s)): " +
                       "; ".join(f"«{t.get('titulo') or t['id']}» ({(t.get('data') or {}).get('rol', '')[:80]})" for t in targets))
-    _tools, _execs, notes = ctx["_res_cache"]
     if notes:
         partes.append("TUS RECURSOS (tools con el prefijo indicado):\n" + "\n".join(notes))
     if (d.get("memoria") or {}).get("enabled", True):
@@ -523,6 +551,7 @@ def build_system(ctx, graph, node):
 
 
 # ===================== eventos / estado =====================
+# emit / set_node_state / add_spend asumen el LOCK tomado (mutan run).
 
 def emit(run, kind, **data):
     run["events"].append({"kind": kind, "ts": int(time.time() * 1000), **data})
@@ -546,7 +575,7 @@ def add_spend(run, node_id, usage):
     emit(run, "spend", total=run["spend"]["total"])
 
 
-# ===================== snapshots pre-turno (decisión I) =====================
+# ===================== snapshots pre-ejecución (decisión I) =====================
 
 def snapshot_resources(ctx, run, graph, node):
     name = node.get("titulo") or f"nodo {node['id']}"
@@ -574,34 +603,63 @@ def snapshot_resources(ctx, run, graph, node):
             emit(run, "log", nodeId=node["id"], text=f"snapshot falló ({meta.get('name')}): {e}")
 
 
-# ===================== frames / motor =====================
+# ===================== locks por recurso/agente (decisión E) =====================
+# run["locks"]: key -> frameId. Keys: "res:<projectId>" (recurso con permiso de
+# escritura) y "node:<nodeId>" (un empleado hace UNA cosa a la vez). Un frame toma
+# TODOS sus locks o ninguno (sin deadlock posible) y los mantiene entre iteraciones
+# de tools; los suelta al responder, delegar o preguntar.
 
-def _new_frame(ctx, graph, run, node, entry_kind, initial_text):
+def _lock_keys(graph, frame):
+    keys = [f"node:{frame['nodeId']}"]
+    for r in resources_of(graph, frame["nodeId"]):
+        if PERM_LEVEL.get((r["data"] or {}).get("permiso") or "editar", 1) >= 1:
+            keys.append(f"res:{r['data']['projectId']}")
+    return keys
+
+
+def _try_locks(graph, run, frame):
+    keys = _lock_keys(graph, frame)
+    for k in keys:
+        holder = run["locks"].get(k)
+        if holder and holder != frame["id"]:
+            return False
+    for k in keys:
+        run["locks"][k] = frame["id"]
+    return True
+
+
+def _release_locks(run, frame_id):
+    for k in [k for k, v in run["locks"].items() if v == frame_id]:
+        del run["locks"][k]
+
+
+# ===================== frames =====================
+
+def _new_frame(ctx, graph, run, node, entry_kind, initial_text, parent_id=None):
+    """Crea un frame listo para correr (snapshot pre-ejecución incluido)."""
+    run["_fseq"] = run.get("_fseq", 0) + 1
+    fid = f"f{run['_fseq']}"
     provider = ((node.get("data") or {}).get("ia") or {}).get("provider") or "anthropic"
+    base = {"id": fid, "nodeId": node["id"], "parentId": parent_id, "provider": provider,
+            "entry": entry_kind, "status": "ready", "iters": 0, "firstText": initial_text,
+            "inbox": [{"text": initial_text}], "join": None, "waiting": {}, "collected": []}
     if provider in CLI_PROVIDERS:
         if provider != "local":
             raise OrchError(400, f"el nodo «{node.get('titulo')}» usa '{provider}': como cabeza CLI "
                                  "por ahora solo está soportado Claude Code (fase 4 v1)")
-        frame = {"kind": "cli", "nodeId": node["id"], "provider": provider, "entry": entry_kind,
-                 "sessionId": None, "pendingInput": initial_text, "iters": 0,
-                 "firstText": initial_text}
+        frame = {**base, "kind": "cli", "sessionId": None}
     else:
-        adapter = make_adapter(ctx, node)
-        frame = {"kind": "api", "nodeId": node["id"], "provider": adapter.provider, "entry": entry_kind,
-                 "messages": [adapter.user_msg(initial_text)], "pendingToolId": None,
-                 "stash": [], "iters": 0, "firstText": initial_text}
+        make_adapter(ctx, node)   # valida ya mismo que la key del proveedor esté
+        frame = {**base, "kind": "api", "messages": [], "pendingToolId": None, "stash": []}
+    run["frames"][fid] = frame
     snapshot_resources(ctx, run, graph, node)
     set_node_state(ctx, run, node["id"], "running")
     emit(run, "log", nodeId=node["id"], text=f"→ entra trabajo: {initial_text[:200]}")
     return frame
 
 
-def _adapter_for_frame(ctx, graph, frame):
-    return make_adapter(ctx, _agent(graph, frame["nodeId"]))
-
-
 def _finish_node(ctx, run, graph, frame, mensaje):
-    """responder: registra memoria y devuelve el mensaje al caller (o cierra el run)."""
+    """responder: registra memoria y marca el nodo como terminado."""
     node = _agent(graph, frame["nodeId"])
     d = node.get("data") or {}
     if (d.get("memoria") or {}).get("enabled", True):
@@ -612,12 +670,98 @@ def _finish_node(ctx, run, graph, frame, mensaje):
     emit(run, "log", nodeId=node["id"], text=f"← responde: {mensaje[:200]}")
 
 
+def _do_responder(ctx, graph, run, frame, mensaje):
+    """Cierra el frame y entrega la respuesta al padre (o cierra el run si es la raíz)."""
+    _finish_node(ctx, run, graph, frame, mensaje)
+    frame["status"] = "done"
+    _release_locks(run, frame["id"])
+    parent_id = frame.get("parentId")
+    if not parent_id:
+        run["final"] = mensaje
+        if run["entry"] == "chat":
+            chat_append(ctx, run["rootNodeId"], "assistant", mensaje, run["chatId"])
+        emit(run, "final", text=mensaje)
+        return
+    parent = run["frames"][parent_id]
+    child = _agent(graph, frame["nodeId"])
+    texto = f"Respuesta de «{child.get('titulo') or child['id']}»: {mensaje}"
+    parent["waiting"].pop(frame["id"], None)
+    if parent.get("join") == "cada_una":
+        quedan = len(parent["waiting"])
+        if quedan:
+            texto += f"\n(seguís esperando {quedan} respuesta(s) más)"
+        parent["inbox"].append({"text": texto})
+        if parent["status"] == "waiting_children":
+            parent["status"] = "ready"
+    else:                                  # join "todos": una sola vuelta con todo
+        parent["collected"].append(texto)
+        if not parent["waiting"]:
+            parent["inbox"].append({"text": "\n\n".join(parent["collected"])})
+            parent["collected"] = []
+            parent["status"] = "ready"
+
+
+def _implicit_end(ctx, graph, run, frame, texto):
+    """Turno que terminó sin acción de control: si espera hijos, sigue esperando;
+    si no, es un responder implícito con el texto."""
+    if frame["waiting"]:
+        frame["status"] = "waiting_children"
+        set_node_state(ctx, run, frame["nodeId"], "waiting")
+        _release_locks(run, frame["id"])
+        emit(run, "log", nodeId=frame["nodeId"], text="sigue esperando las respuestas pendientes")
+        return
+    _do_responder(ctx, graph, run, frame, texto)
+
+
+def _do_delegar(ctx, graph, run, frame, node, inp):
+    """Resuelve destino(s) y forkea el token (decisión D). Devuelve un texto de
+    error (sin tocar nada) o None si delegó y el frame quedó esperando hijos."""
+    if frame["waiting"]:
+        faltan = ", ".join(f"«{v}»" for v in frame["waiting"].values())
+        return f"ya tenés delegaciones en curso ({faltan}): esperá esas respuestas antes de volver a delegar"
+    wanted = [w for w in (inp.get("agentes") if isinstance(inp.get("agentes"), list) else []) if str(w or "").strip()]
+    if str(inp.get("agente") or "").strip():
+        wanted.insert(0, inp["agente"])
+    seen, names = set(), []
+    for w in wanted:
+        k = str(w).strip().lower()
+        if k not in seen:
+            seen.add(k)
+            names.append(str(w))
+    if not names:
+        return "decí a quién delegás: `agente` (uno) o `agentes` (varios en paralelo)"
+    targets, ids = [], set()
+    for w in names:
+        t = _resolve_target(graph, node["id"], w)
+        if not t:
+            return f"no podés delegar a «{w}»: no está conectado por una flecha delega"
+        if t["id"] not in ids:
+            ids.add(t["id"])
+            targets.append(t)
+    join = "cada_una" if str(inp.get("join") or "").strip().lower() in ("cada_una", "cada una") else "todos"
+    msg = str(inp.get("mensaje") or "")
+    frame["join"], frame["collected"] = join, []
+    frame["status"] = "waiting_children"
+    set_node_state(ctx, run, node["id"], "waiting")
+    _release_locks(run, frame["id"])
+    texto = f"«{node.get('titulo') or node['id']}» te delega: {msg}"
+    for t in targets:
+        child = _new_frame(ctx, graph, run, t, "delegado", texto, parent_id=frame["id"])
+        frame["waiting"][child["id"]] = t.get("titulo") or str(t["id"])
+    if len(targets) > 1:
+        emit(run, "log", nodeId=node["id"],
+             text=f"fork: delegó en paralelo a {len(targets)} agentes (join: {join})")
+    return None
+
+
+# ===================== scheduler + workers =====================
+
 def start_run(ctx, entry_kind, root_node_id, initial_text, api_keys, max_turns=None):
     """Crea y lanza un run (entry task o chat). Devuelve el run dict."""
     with LOCK:
         prev = RUNS.get(ctx["pid"])
         if prev and prev["status"] in ("running", "waiting_human", "paused"):
-            raise OrchError(409, "ya hay un run en curso en este orquestador (v1 secuencial): "
+            raise OrchError(409, "ya hay un run en curso en este orquestador: "
                                  "esperá, respondé lo pendiente o matalo")
         graph = load_graph(ctx)
         root = _agent(graph, root_node_id)
@@ -626,14 +770,16 @@ def start_run(ctx, entry_kind, root_node_id, initial_text, api_keys, max_turns=N
             "id": "run" + uuid.uuid4().hex[:8], "projectId": ctx["pid"], "entry": entry_kind,
             "status": "running", "rootNodeId": root["id"], "final": None, "error": None,
             "turns": 0, "maxTurns": max_turns or MAX_TURNS_DEFAULT,
-            "chatId": None, "pending": None, "stack": [], "nodeStates": {}, "spend": {},
+            "chatId": None, "pending": None, "pendings": [],
+            "frames": {}, "locks": {}, "nodeStates": {}, "spend": {},
             "events": [], "createdAt": int(time.time() * 1000),
+            "_fseq": 0, "_workers": 0,
         }
         if entry_kind == "chat":
             c = chat_read(ctx, root["id"])
             run["chatId"] = c.get("chatId") or ("c" + uuid.uuid4().hex[:8])
             chat_append(ctx, root["id"], "user", initial_text, run["chatId"])
-        run["stack"].append(_new_frame(ctx, graph, run, root, entry_kind, initial_text))
+        _new_frame(ctx, graph, run, root, entry_kind, initial_text)
         RUNS[ctx["pid"]] = run
         _save(ctx, run)
     _spawn(ctx)
@@ -641,125 +787,223 @@ def start_run(ctx, entry_kind, root_node_id, initial_text, api_keys, max_turns=N
 
 
 def _spawn(ctx):
+    """Arranca el scheduler del run si no está vivo; si está, lo despierta."""
+    rt = _rt(ctx["pid"])
+    with LOCK:
+        if rt["alive"]:
+            rt["cv"].notify_all()
+            return
+        rt["alive"] = True
     threading.Thread(target=_loop, args=(ctx,), daemon=True).start()
 
 
 def _loop(ctx):
+    """Scheduler: lanza un worker por frame listo (si consigue sus locks), decide
+    queued/waiting_human/done y corta por presupuesto, pausa o kill."""
     run = RUNS.get(ctx["pid"])
+    rt = _rt(ctx["pid"])
+    cv = rt["cv"]
+    with cv:
+        try:
+            graph = load_graph(ctx)
+            while run["status"] == "running":
+                if run.get("_kill"):
+                    run["status"] = "killed"
+                    break
+                active = [f for f in run["frames"].values() if f["status"] != "done"]
+                if not active:
+                    run["status"] = "done"
+                    break
+                if run.get("_pause"):
+                    if run["_workers"] == 0:
+                        run.pop("_pause", None)
+                        run["status"] = "paused"
+                        break
+                elif run["turns"] >= run["maxTurns"]:
+                    if run["_workers"] == 0:
+                        raise OrchError(400, f"presupuesto agotado ({run['maxTurns']} turnos). "
+                                             "Subí maxTurns o dividí la tarea")
+                else:
+                    for f in sorted((x for x in run["frames"].values() if x["status"] in ("ready", "queued")),
+                                    key=lambda x: int(x["id"][1:])):
+                        if run["turns"] + run["_workers"] >= run["maxTurns"]:
+                            break
+                        if _try_locks(graph, run, f):
+                            f["status"] = "running"
+                            run["_workers"] += 1
+                            threading.Thread(target=_worker, args=(ctx, graph, run, f), daemon=True).start()
+                        elif f["status"] != "queued":
+                            f["status"] = "queued"
+                            set_node_state(ctx, run, f["nodeId"], "queued")
+                            emit(run, "log", nodeId=f["nodeId"],
+                                 text="en cola: espera un recurso/agente ocupado por otra rama")
+                    if run["_workers"] == 0:
+                        blocked = {x["status"] for x in active}
+                        if blocked <= {"waiting_human", "waiting_children"} and "waiting_human" in blocked:
+                            run["status"] = "waiting_human"
+                            break
+                        if blocked == {"waiting_children"}:
+                            raise OrchError(500, "el run quedó trabado (agentes esperando sin hijos activos)")
+                cv.wait(timeout=0.25)
+        except OrchError as e:
+            run["status"], run["error"] = "error", e.msg
+        except Exception as e:
+            run["status"], run["error"] = "error", f"error interno del motor: {e}"
+        if run["status"] == "error":
+            emit(run, "status", status="error", error=run["error"])
+        else:
+            emit(run, "status", status=run["status"])
+        _save(ctx, run)
+        _archive_run(ctx, run)
+        rt["alive"] = False
+        cv.notify_all()
+
+
+def _worker(ctx, graph, run, frame):
+    """Un turno de agente (una rama). El LLM/CLI corre SIN el lock global."""
+    cv = _rt(ctx["pid"])["cv"]
     try:
-        graph = load_graph(ctx)
-        while run["status"] == "running":
-            if run.get("_kill"):
-                run["status"] = "killed"
-                break
-            if run.get("_pause"):
-                run["status"] = "paused"
-                run.pop("_pause", None)
-                break
-            if not run["stack"]:
-                run["status"] = "done"
-                break
-            if run["turns"] >= run["maxTurns"]:
-                raise OrchError(400, f"presupuesto agotado ({run['maxTurns']} turnos). Subí maxTurns o dividí la tarea")
-            _step(ctx, graph, run)
-        emit(run, "status", status=run["status"])
+        if frame["kind"] == "cli":
+            _turn_cli(ctx, graph, run, frame)
+        else:
+            _turn_api(ctx, graph, run, frame)
     except OrchError as e:
-        run["status"] = "error"
-        run["error"] = e.msg
-        emit(run, "status", status="error", error=e.msg)
+        with cv:
+            if run["status"] == "running":
+                run["status"], run["error"] = "error", e.msg
     except Exception as e:
-        run["status"] = "error"
-        run["error"] = f"error interno del motor: {e}"
-        emit(run, "status", status="error", error=run["error"])
-    _save(ctx, run)
-    _archive_run(ctx, run)
+        with cv:
+            if run["status"] == "running":
+                run["status"], run["error"] = "error", f"error interno del motor: {e}"
+    finally:
+        with cv:
+            run["_workers"] -= 1
+            _save(ctx, run)
+            cv.notify_all()
 
 
-def _step(ctx, graph, run):
-    frame = run["stack"][-1]
-    if frame.get("kind") == "cli":
-        _step_cli(ctx, graph, run, frame)
-        return
-    node = _agent(graph, frame["nodeId"])
-    adapter = _adapter_for_frame(ctx, graph, frame)
-    ctrl = control_tools(graph, node["id"])
-    rtools, rexecs, rnotes = resource_tools(ctx, graph, node["id"])
-    ctx["_res_cache"] = (rtools, rexecs, rnotes)
-    ctx["author"] = f"IA ({node.get('titulo') or node['id']})"
-    system = build_system(ctx, graph, node)
-    tools = ctrl + rtools
+def _deliver_inbox(adapter, frame):
+    """Vuelca el inbox del frame a su transcript (con el LOCK tomado). El primer
+    ítem resuelve el tool_result pendiente (delegar/preguntar); el resto entra
+    como mensajes de usuario."""
+    items, frame["inbox"] = frame["inbox"], []
+    if frame.get("pendingToolId"):
+        first = items.pop(0) if items else {"text": "(continuá)"}
+        results = frame["stash"] + [{"id": frame["pendingToolId"], "name": "control",
+                                     "content": first["text"],
+                                     **({"is_error": True} if first.get("is_error") else {})}]
+        if adapter.provider == "anthropic":
+            frame["messages"].append(adapter.tool_results_msg(results))
+        else:
+            frame["messages"].extend(adapter.tool_results_msg(results))
+        frame["pendingToolId"] = None
+        frame["stash"] = []
+    for it in items:
+        frame["messages"].append(adapter.user_msg(it["text"]))
 
-    set_node_state(ctx, run, node["id"], "running")
-    res = adapter.call(system, frame["messages"], tools)
-    run["turns"] += 1
-    frame["iters"] += 1
-    add_spend(run, node["id"], res["usage"])
-    frame["messages"].append(res["assistant_msg"])
 
-    if not res["tool_calls"]:
-        # sin tools → responder implícito con el texto
-        _do_responder(ctx, graph, run, frame, res["text"] or "(sin respuesta)")
-        _save(ctx, run)
-        return
+def _append_results(adapter, frame, results):
+    if adapter.provider == "anthropic":
+        frame["messages"].append(adapter.tool_results_msg(results))
+    else:
+        frame["messages"].extend(adapter.tool_results_msg(results))
 
-    if frame["iters"] > MAX_TOOL_ITERS:
-        _do_responder(ctx, graph, run, frame,
-                      (res["text"] or "") + "\n(corté: demasiadas iteraciones en este turno)")
-        _save(ctx, run)
-        return
 
-    results, control = [], None
-    for tc in res["tool_calls"]:
-        if control is not None:
-            results.append({"id": tc["id"], "name": tc["name"], "is_error": True,
-                            "content": "ignorada: primero se resuelve la acción de control anterior"})
-            continue
-        if tc["name"] in CONTROL_TOOLS:
-            control = tc
-            continue
-        results.append(_exec_tool(ctx, graph, run, node, rexecs, tc))
-
-    if control is None:
-        frame["messages"].append(adapter.tool_results_msg(results)) if adapter.provider == "anthropic" \
-            else frame["messages"].extend(adapter.tool_results_msg(results))
-        _save(ctx, run)
-        return
-
-    if control["name"] == "responder":
-        _do_responder(ctx, graph, run, frame, str(control["input"].get("mensaje") or ""))
-        _save(ctx, run)
-        return
-
-    # delegar / preguntar_al_usuario: dejan el frame esperando el tool_result
+def _reject_control(frame, control, results, texto):
+    """Devuelve un error a la acción de control sin suspender el frame: el próximo
+    turno entrega stash + el error como tool_result."""
     frame["pendingToolId"] = control["id"]
     frame["stash"] = results
-    if control["name"] == "delegar":
-        target = _resolve_target(graph, node["id"], control["input"].get("agente"))
-        if not target:
-            _resume_frame(ctx, graph, run, frame,
-                          f"no podés delegar a «{control['input'].get('agente')}»: no está conectado por una flecha delega",
-                          is_error=True)
+    frame["inbox"].insert(0, {"text": texto, "is_error": True})
+    frame["status"] = "ready"
+
+
+def _turn_api(ctx, graph, run, frame):
+    node = _agent(graph, frame["nodeId"])
+    adapter = make_adapter(ctx, node)
+    author = f"IA ({node.get('titulo') or node['id']})"
+    ctrl = control_tools(graph, node["id"])
+    rtools, rexecs, rnotes = resource_tools(ctx, graph, node["id"], author)
+    system = build_system(ctx, graph, node, rnotes)
+    tools = ctrl + rtools
+    cv = _rt(ctx["pid"])["cv"]
+
+    with cv:
+        _deliver_inbox(adapter, frame)
+        set_node_state(ctx, run, node["id"], "running")
+    res = adapter.call(system, frame["messages"], tools)      # ← paralelismo real
+
+    with cv:
+        if run["status"] != "running" or run.get("_kill"):
+            return
+        run["turns"] += 1
+        frame["iters"] += 1
+        add_spend(run, node["id"], res["usage"])
+        frame["messages"].append(res["assistant_msg"])
+        if not res["tool_calls"]:
+            _implicit_end(ctx, graph, run, frame, res["text"] or "(sin respuesta)")
             _save(ctx, run)
             return
-        set_node_state(ctx, run, node["id"], "waiting")
-        msg = str(control["input"].get("mensaje") or "")
-        texto = f"«{node.get('titulo') or node['id']}» te delega: {msg}"
-        run["stack"].append(_new_frame(ctx, graph, run, target, "delegado", texto))
-        _save(ctx, run)
-        return
+        if frame["iters"] > MAX_TOOL_ITERS:
+            _implicit_end(ctx, graph, run, frame,
+                          (res["text"] or "") + "\n(corté: demasiadas iteraciones en este turno)")
+            _save(ctx, run)
+            return
+        control, plain, ignored = None, [], []
+        for tc in res["tool_calls"]:
+            if control is not None:
+                ignored.append({"id": tc["id"], "name": tc["name"], "is_error": True,
+                                "content": "ignorada: primero se resuelve la acción de control anterior"})
+            elif tc["name"] in CONTROL_TOOLS:
+                control = tc
+            else:
+                plain.append(tc)
 
-    # preguntar_al_usuario
-    pregunta = str(control["input"].get("pregunta") or "")
-    run["pending"] = {"nodeId": node["id"], "question": pregunta}
-    run["status"] = "waiting_human"
-    set_node_state(ctx, run, node["id"], "asking")
-    emit(run, "ask", nodeId=node["id"], question=pregunta)
-    _save(ctx, run)
+    # tools de recursos FUERA del lock global (el frame ya tiene sus locks de recurso)
+    results = [_exec_tool(ctx, graph, run, node, rexecs, tc) for tc in plain] + ignored
+
+    with cv:
+        if run["status"] != "running" or run.get("_kill"):
+            return
+        if control is None:
+            _append_results(adapter, frame, results)
+            frame["status"] = "ready"
+            _save(ctx, run)
+            return
+        inp = control["input"] or {}
+        if control["name"] == "responder":
+            if frame["waiting"]:
+                faltan = ", ".join(f"«{v}»" for v in frame["waiting"].values())
+                _reject_control(frame, control, results,
+                                f"todavía esperás las respuestas de: {faltan} — no podés responder hasta que lleguen")
+            else:
+                _do_responder(ctx, graph, run, frame, str(inp.get("mensaje") or ""))
+        elif control["name"] == "delegar":
+            err = _do_delegar(ctx, graph, run, frame, node, inp)
+            if err:
+                _reject_control(frame, control, results, err)
+            else:
+                frame["pendingToolId"] = control["id"]
+                frame["stash"] = results
+        else:                                   # preguntar_al_usuario
+            pregunta = str(inp.get("pregunta") or "")
+            frame["pendingToolId"] = control["id"]
+            frame["stash"] = results
+            frame["status"] = "waiting_human"
+            _release_locks(run, frame["id"])
+            run["pendings"].append({"frameId": frame["id"], "nodeId": node["id"], "question": pregunta})
+            run["pending"] = run["pendings"][0]
+            set_node_state(ctx, run, node["id"], "asking")
+            emit(run, "ask", nodeId=node["id"], question=pregunta)
+        _save(ctx, run)
 
 
 def _exec_tool(ctx, graph, run, node, rexecs, tc):
+    """Ejecuta una tool de recurso/memoria. Corre SIN el lock global (toma el LOCK
+    solo para emitir eventos)."""
     name, inp = tc["name"], tc["input"]
-    emit(run, "log", nodeId=node["id"], text=f"tool {name}({json.dumps(inp, ensure_ascii=False)[:160]})")
+    with LOCK:
+        emit(run, "log", nodeId=node["id"], text=f"tool {name}({json.dumps(inp, ensure_ascii=False)[:160]})")
     try:
         if name == "limpiar_memoria":
             who = (inp.get("agente") or "").strip()
@@ -771,7 +1015,9 @@ def _exec_tool(ctx, graph, run, node, rexecs, tc):
                 return {"id": tc["id"], "name": name, "is_error": True,
                         "content": f"«{who}» no es un subordinado directo tuyo"}
             mem_clear(ctx, target["id"])
-            set_node_state(ctx, run, target["id"], run["nodeStates"].get(str(target["id"]), {}).get("status", "idle"))
+            with LOCK:
+                set_node_state(ctx, run, target["id"],
+                               run["nodeStates"].get(str(target["id"]), {}).get("status", "idle"))
             return {"id": tc["id"], "name": name, "content": f"OK: memoria de «{target.get('titulo')}» limpia."}
         fn = rexecs.get(name)
         if not fn:
@@ -787,40 +1033,6 @@ def _exec_tool(ctx, graph, run, node, rexecs, tc):
         return {"id": tc["id"], "name": name, "is_error": True, "content": f"error ejecutando {name}: {e}"}
 
 
-def _resume_frame(ctx, graph, run, frame, content, is_error=False):
-    """Entrega el tool_result pendiente (respuesta de delegado / humano / error)."""
-    if frame.get("kind") == "cli":
-        frame["pendingInput"] = ("⚠ " if is_error else "") + content
-        set_node_state(ctx, run, frame["nodeId"], "running")
-        return
-    adapter = _adapter_for_frame(ctx, graph, frame)
-    results = frame["stash"] + [{"id": frame["pendingToolId"], "name": "control",
-                                 "content": content, **({"is_error": True} if is_error else {})}]
-    if adapter.provider == "anthropic":
-        frame["messages"].append(adapter.tool_results_msg(results))
-    else:
-        frame["messages"].extend(adapter.tool_results_msg(results))
-    frame["pendingToolId"] = None
-    frame["stash"] = []
-    set_node_state(ctx, run, frame["nodeId"], "running")
-
-
-def _do_responder(ctx, graph, run, frame, mensaje):
-    _finish_node(ctx, run, graph, frame, mensaje)
-    run["stack"].pop()
-    if not run["stack"]:
-        run["final"] = mensaje
-        run["status"] = "done"
-        if run["entry"] == "chat":
-            chat_append(ctx, run["rootNodeId"], "assistant", mensaje, run["chatId"])
-        emit(run, "final", text=mensaje)
-        return
-    parent = run["stack"][-1]
-    child = _agent(graph, frame["nodeId"])
-    _resume_frame(ctx, graph, run, parent,
-                  f"Respuesta de «{child.get('titulo') or child['id']}»: {mensaje}")
-
-
 # ===================== turnos CLI (Claude Code — fase 4) =====================
 # La cabeza del nodo es el CLI: acceso DIRECTO a los targets de sus recursos editor
 # (--add-dir) y a los tree.json de los diagramas (cwd = la carpeta del mirror, con
@@ -833,9 +1045,12 @@ CLI_PROTOCOL = (
     "DEBE terminar con UNA línea exacta `CONTROL: {json}` con una de estas acciones:\n"
     'CONTROL: {"accion":"responder","mensaje":"<tu resultado, concreto y verificable>"}\n'
     'CONTROL: {"accion":"delegar","agente":"<nombre subordinado>","mensaje":"<qué tiene que hacer>"}\n'
+    'CONTROL: {"accion":"delegar","agentes":["<nombre A>","<nombre B>"],"join":"todos","mensaje":"<qué tienen que hacer>"} '
+    '— delega a VARIOS EN PARALELO; join "todos" = te despierto una vez con todas las respuestas juntas, '
+    '"cada_una" = te despierto con cada respuesta a medida que llega\n'
     'CONTROL: {"accion":"preguntar_al_usuario","pregunta":"<qué necesitás que decida el humano>"}\n'
     "Además podés emitir líneas `CONTROL: {\"accion\":\"limpiar_memoria\",\"agente\":\"<opcional>\"}` "
-    "ANTES de la línea final. Si delegás o preguntás, vas a recibir la respuesta en el próximo turno "
+    "ANTES de la línea final. Si delegás o preguntás, vas a recibir la(s) respuesta(s) en el próximo turno "
     "de esta misma conversación. NUNCA termines sin la línea CONTROL."
 )
 
@@ -872,7 +1087,7 @@ def _cli_system(ctx, graph, node, notes):
     ]
     targets = delega_targets(graph, node["id"])
     if targets:
-        partes.append("SUBORDINADOS (podés delegarles y esperás su respuesta): " +
+        partes.append("SUBORDINADOS (podés delegarles — a varios EN PARALELO — y esperás su(s) respuesta(s)): " +
                       "; ".join(f"«{t.get('titulo') or t['id']}» ({(t.get('data') or {}).get('rol', '')[:80]})" for t in targets))
     if notes:
         partes.append("TUS RECURSOS:\n" + "\n".join(notes))
@@ -908,13 +1123,12 @@ def _parse_control(text):
     return limpiar, final, "\n".join(visibles).strip()
 
 
-def _run_cli_turn(ctx, run, node, frame, message):
+def _run_cli_turn(ctx, graph, run, node, frame, message):
     """Lanza `claude -p` para un turno del agente y devuelve (texto, session_id, costo)."""
     cli_bin = find_claude()
     if not cli_bin:
         raise OrchError(400, f"el nodo «{node.get('titulo')}» usa Claude Code y el binario `claude` "
                              "no está en esta máquina")
-    graph = load_graph(ctx)
     notes, add_dirs = _cli_resource_notes(ctx, graph, node)
     system = _cli_system(ctx, graph, node, notes)
     ia = (node.get("data") or {}).get("ia") or {}
@@ -939,37 +1153,40 @@ def _run_cli_turn(ctx, run, node, frame, message):
                                 text=True, bufsize=1, encoding="utf-8", errors="replace")
     except Exception as e:
         raise OrchError(400, f"no pude lanzar Claude Code: {e}")
-    run["_cliProc"] = proc
+    rt = _rt(ctx["pid"])
+    rt["procs"][frame["id"]] = proc
     session_id, result_text, texts, cost, deadline = None, None, [], 0.0, time.time() + CLI_TIMEOUT
-    for line in proc.stdout:
-        if time.time() > deadline:
-            proc.terminate()
-            raise OrchError(400, f"turno CLI de «{node.get('titulo')}» superó el tope de {CLI_TIMEOUT // 60} min")
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if obj.get("type") == "system" and obj.get("subtype") == "init":
-            session_id = obj.get("session_id") or session_id
-        elif obj.get("type") == "assistant":
-            for b in (obj.get("message", {}).get("content") or []):
-                if b.get("type") == "text" and b.get("text"):
-                    texts.append(b["text"])
-                elif b.get("type") == "tool_use":
-                    emit(run, "log", nodeId=node["id"], text=f"cli tool {b.get('name', '?')}")
-        elif obj.get("type") == "result":
-            session_id = obj.get("session_id") or session_id
-            result_text = obj.get("result")
-            cost = obj.get("total_cost_usd") or 0.0
-            if obj.get("is_error"):
-                proc.wait()
-                run["_cliProc"] = None
-                raise OrchError(502, f"Claude Code devolvió un error: {result_text or '?'}")
-    proc.wait()
-    run["_cliProc"] = None
+    try:
+        for line in proc.stdout:
+            if time.time() > deadline:
+                proc.terminate()
+                raise OrchError(400, f"turno CLI de «{node.get('titulo')}» superó el tope de {CLI_TIMEOUT // 60} min")
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") == "system" and obj.get("subtype") == "init":
+                session_id = obj.get("session_id") or session_id
+            elif obj.get("type") == "assistant":
+                for b in (obj.get("message", {}).get("content") or []):
+                    if b.get("type") == "text" and b.get("text"):
+                        texts.append(b["text"])
+                    elif b.get("type") == "tool_use":
+                        with LOCK:
+                            emit(run, "log", nodeId=node["id"], text=f"cli tool {b.get('name', '?')}")
+            elif obj.get("type") == "result":
+                session_id = obj.get("session_id") or session_id
+                result_text = obj.get("result")
+                cost = obj.get("total_cost_usd") or 0.0
+                if obj.get("is_error"):
+                    proc.wait()
+                    raise OrchError(502, f"Claude Code devolvió un error: {result_text or '?'}")
+        proc.wait()
+    finally:
+        rt["procs"].pop(frame["id"], None)
     if run.get("_kill"):
         raise OrchError(400, "turno CLI cancelado")
     if proc.returncode not in (0, None) and result_text is None:
@@ -978,68 +1195,78 @@ def _run_cli_turn(ctx, run, node, frame, message):
     return (result_text or "\n\n".join(texts) or ""), session_id, cost
 
 
-def _step_cli(ctx, graph, run, frame):
+def _turn_cli(ctx, graph, run, frame):
     node = _agent(graph, frame["nodeId"])
-    message = frame.get("pendingInput") or "(continuá)"
-    frame["pendingInput"] = None
-    frame["iters"] += 1
-    set_node_state(ctx, run, node["id"], "running")
-    text, session_id, cost = _run_cli_turn(ctx, run, node, frame, message)
-    run["turns"] += 1
-    if session_id:
-        frame["sessionId"] = session_id
-    add_spend(run, node["id"], {"in": 0, "out": 0})
-    if cost:
-        for key in (str(node["id"]), "total"):
-            sp = run["spend"].setdefault(key, {"turns": 0, "in": 0, "out": 0})
-            sp["usd"] = round(sp.get("usd", 0.0) + cost, 6)
-    limpiar, accion, visible = _parse_control(text)
-
-    for lm in limpiar:
-        who = (lm.get("agente") or "").strip()
-        if not who:
-            mem_clear(ctx, node["id"])
-            emit(run, "log", nodeId=node["id"], text="limpió su memoria")
-        else:
-            target = _resolve_target(graph, node["id"], who)
-            if target:
-                mem_clear(ctx, target["id"])
-                emit(run, "log", nodeId=node["id"], text=f"limpió la memoria de «{target.get('titulo')}»")
-
-    if accion is None or accion.get("accion") == "responder":
-        mensaje = (accion or {}).get("mensaje") or visible or "(sin respuesta)"
-        _do_responder(ctx, graph, run, frame, str(mensaje))
-        _save(ctx, run)
-        return
-    if frame["iters"] > MAX_TOOL_ITERS:
-        _do_responder(ctx, graph, run, frame, visible + "\n(corté: demasiadas iteraciones)")
-        _save(ctx, run)
-        return
-    if accion.get("accion") == "delegar":
-        target = _resolve_target(graph, node["id"], accion.get("agente"))
-        if not target:
-            frame["pendingInput"] = (f"⚠ no podés delegar a «{accion.get('agente')}»: no está conectado "
-                                     "por una flecha delega. Elegí un subordinado válido o respondé.")
-            _save(ctx, run)
+    cv = _rt(ctx["pid"])["cv"]
+    with cv:
+        items, frame["inbox"] = frame["inbox"], []
+        message = "\n\n".join(("⚠ " if it.get("is_error") else "") + it["text"] for it in items) or "(continuá)"
+        frame["iters"] += 1
+        set_node_state(ctx, run, node["id"], "running")
+    text, session_id, cost = _run_cli_turn(ctx, graph, run, node, frame, message)   # ← sin lock
+    with cv:
+        if run["status"] != "running" or run.get("_kill"):
             return
-        set_node_state(ctx, run, node["id"], "waiting")
-        texto = f"«{node.get('titulo') or node['id']}» te delega: {accion.get('mensaje') or ''}"
-        run["stack"].append(_new_frame(ctx, graph, run, target, "delegado", texto))
+        run["turns"] += 1
+        if session_id:
+            frame["sessionId"] = session_id
+        add_spend(run, node["id"], {"in": 0, "out": 0})
+        if cost:
+            for key in (str(node["id"]), "total"):
+                sp = run["spend"].setdefault(key, {"turns": 0, "in": 0, "out": 0})
+                sp["usd"] = round(sp.get("usd", 0.0) + cost, 6)
+        limpiar, accion, visible = _parse_control(text)
+
+        for lm in limpiar:
+            who = (lm.get("agente") or "").strip()
+            if not who:
+                mem_clear(ctx, node["id"])
+                emit(run, "log", nodeId=node["id"], text="limpió su memoria")
+            else:
+                target = _resolve_target(graph, node["id"], who)
+                if target:
+                    mem_clear(ctx, target["id"])
+                    emit(run, "log", nodeId=node["id"], text=f"limpió la memoria de «{target.get('titulo')}»")
+
+        if accion is None:
+            _implicit_end(ctx, graph, run, frame, visible or "(sin respuesta)")
+        elif accion.get("accion") == "responder":
+            if frame["waiting"]:
+                faltan = ", ".join(f"«{v}»" for v in frame["waiting"].values())
+                frame["inbox"].append({"text": f"todavía esperás las respuestas de: {faltan} — "
+                                               "no podés responder hasta que lleguen", "is_error": True})
+                frame["status"] = "ready"
+            else:
+                _do_responder(ctx, graph, run, frame, str(accion.get("mensaje") or visible or "(sin respuesta)"))
+        elif frame["iters"] > MAX_TOOL_ITERS:
+            _implicit_end(ctx, graph, run, frame, visible + "\n(corté: demasiadas iteraciones)")
+        elif accion.get("accion") == "delegar":
+            err = _do_delegar(ctx, graph, run, frame, node, accion)
+            if err:
+                frame["inbox"].append({"text": err + ". Elegí un subordinado válido o respondé.", "is_error": True})
+                frame["status"] = "ready"
+        elif accion.get("accion") == "preguntar_al_usuario":
+            frame["status"] = "waiting_human"
+            _release_locks(run, frame["id"])
+            p = {"frameId": frame["id"], "nodeId": node["id"], "question": str(accion.get("pregunta") or "")}
+            run["pendings"].append(p)
+            run["pending"] = run["pendings"][0]
+            set_node_state(ctx, run, node["id"], "asking")
+            emit(run, "ask", nodeId=node["id"], question=p["question"])
+        else:
+            frame["inbox"].append({"text": f"acción CONTROL desconocida: {accion.get('accion')}. "
+                                           "Usá responder/delegar/preguntar_al_usuario.", "is_error": True})
+            frame["status"] = "ready"
         _save(ctx, run)
-        return
-    if accion.get("accion") == "preguntar_al_usuario":
-        run["pending"] = {"nodeId": node["id"], "question": str(accion.get("pregunta") or "")}
-        run["status"] = "waiting_human"
-        set_node_state(ctx, run, node["id"], "asking")
-        emit(run, "ask", nodeId=node["id"], question=run["pending"]["question"])
-        _save(ctx, run)
-        return
-    # acción desconocida → pedirle que corrija
-    frame["pendingInput"] = f"⚠ acción CONTROL desconocida: {accion.get('accion')}. Usá responder/delegar/preguntar_al_usuario."
-    _save(ctx, run)
 
 
 # ===================== API de alto nivel (la usa server.py) =====================
+
+def _active_nodes(run):
+    frames = run.get("frames") or {}
+    return [f["nodeId"] for f in sorted(frames.values(), key=lambda x: int(x["id"][1:]))
+            if f["status"] != "done"]
+
 
 def get_state(ctx):
     run = RUNS.get(ctx["pid"])
@@ -1051,23 +1278,40 @@ def get_state(ctx):
             _write_json(_run_path(ctx), run)
     if not run:
         return {"run": None}
-    slim = {k: v for k, v in run.items() if k not in ("stack", "events", "_kill", "_pause")}
-    slim["stackNodes"] = [f["nodeId"] for f in run.get("stack", [])]
+    slim = {k: v for k, v in run.items()
+            if not str(k).startswith("_") and k not in ("stack", "frames", "locks", "events")}
+    slim["stackNodes"] = _active_nodes(run)
     return {"run": slim}
 
 
-def answer(ctx, text):
+def answer(ctx, text, node_id=None):
+    """Respuesta del humano a UNA pregunta pendiente (por nodeId si hay varias)."""
     run = RUNS.get(ctx["pid"])
-    if not run or run["status"] != "waiting_human" or not run.get("pending"):
+    if not run or run["status"] not in ("running", "waiting_human"):
         raise OrchError(409, "no hay ninguna pregunta pendiente (¿se reinició el backend?)")
-    graph = load_graph(ctx)
-    frame = run["stack"][-1]
-    node = _agent(graph, frame["nodeId"])
-    emit(run, "log", nodeId=node["id"], text=f"usuario responde: {text[:200]}")
-    _resume_frame(ctx, graph, run, frame, f"Respuesta del usuario: {text}")
-    run["pending"] = None
-    run["status"] = "running"
-    _save(ctx, run)
+    with LOCK:
+        pendings = run.get("pendings") or []
+        if not pendings:
+            raise OrchError(409, "no hay ninguna pregunta pendiente")
+        if node_id is not None:
+            match = [p for p in pendings if str(p["nodeId"]) == str(node_id)]
+            if not match:
+                raise OrchError(404, "ese nodo no tiene una pregunta pendiente")
+            p = match[0]
+        elif len(pendings) == 1:
+            p = pendings[0]
+        else:
+            raise OrchError(400, "hay varias preguntas pendientes: indicá nodeId")
+        frame = run["frames"][p["frameId"]]
+        emit(run, "log", nodeId=p["nodeId"], text=f"usuario responde: {text[:200]}")
+        # la respuesta del humano va PRIMERA (resuelve el tool_result de la pregunta)
+        frame["inbox"].insert(0, {"text": f"Respuesta del usuario: {text}"})
+        frame["status"] = "ready"
+        pendings.remove(p)
+        run["pending"] = pendings[0] if pendings else None
+        if run["status"] == "waiting_human":
+            run["status"] = "running"
+        _save(ctx, run)
     _spawn(ctx)
     return {"ok": True}
 
@@ -1082,7 +1326,9 @@ def pause(ctx):
     run = RUNS.get(ctx["pid"])
     if not run or run["status"] != "running":
         raise OrchError(409, "no hay un run corriendo")
-    run["_pause"] = True
+    with LOCK:
+        run["_pause"] = True
+        _rt(ctx["pid"])["cv"].notify_all()
     return {"ok": True}
 
 
@@ -1092,8 +1338,9 @@ def resume(ctx):
         raise OrchError(409, "no hay un run pausado")
     if ctx["pid"] not in KEYS:
         raise OrchError(409, "el backend se reinició: relanzá el run")
-    run["status"] = "running"
-    _save(ctx, run)
+    with LOCK:
+        run["status"] = "running"
+        _save(ctx, run)
     _spawn(ctx)
     return {"ok": True}
 
@@ -1102,19 +1349,22 @@ def kill(ctx):
     run = RUNS.get(ctx["pid"])
     if not run or run["status"] not in ("running", "waiting_human", "paused"):
         raise OrchError(409, "no hay un run activo")
-    if run["status"] == "running":
-        run["_kill"] = True
-        proc = run.get("_cliProc")
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-    else:
-        run["status"] = "killed"
-        emit(run, "status", status="killed")
-        _save(ctx, run)
-        _archive_run(ctx, run)
+    rt = _rt(ctx["pid"])
+    with LOCK:
+        if run["status"] == "running":
+            run["_kill"] = True
+            for proc in list(rt["procs"].values()):
+                if proc.poll() is None:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+            rt["cv"].notify_all()
+        else:                       # waiting_human / paused: el scheduler no está vivo
+            run["status"] = "killed"
+            emit(run, "status", status="killed")
+            _save(ctx, run)
+            _archive_run(ctx, run)
     return {"ok": True}
 
 
@@ -1132,9 +1382,10 @@ def run_detail(ctx, run_id):
     """Un run completo (con sus events). Del vivo en RAM o del archivo."""
     live = RUNS.get(ctx["pid"])
     if live and live["id"] == run_id:
-        d = {k: v for k, v in live.items() if not str(k).startswith("_") and k != "stack"}
+        d = {k: v for k, v in live.items()
+             if not str(k).startswith("_") and k not in ("stack", "frames", "locks")}
         d["live"] = live["status"] in ("running", "waiting_human", "paused")
-        d["stackNodes"] = [f["nodeId"] for f in live.get("stack", [])]
+        d["stackNodes"] = _active_nodes(live)
         return {"run": d}
     data = _read_json(os.path.join(_runs_dir(ctx), f"{run_id}.json"), None)
     if not data:
