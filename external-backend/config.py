@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.3.0"   # IA Orchestrator server-side (doc 28, fase 5)
+VERSION = "0.4.0"   # IA Orchestrator fase 6: director + webhooks + MCP/API (doc 28)
 NAME = "DiagraMind Connector"
 
 

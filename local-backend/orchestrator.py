@@ -36,8 +36,10 @@
 El server (server.py) provee el contexto de rutas: dónde está el tree.json del
 orquestador y cómo resolver los de los proyectos-recurso (mirror de la carpeta).
 """
+import hmac
 import json
 import os
+import secrets
 import shutil
 import threading
 import time
@@ -170,7 +172,7 @@ def keys_write(ctx, patch):
     """Setea/borra credenciales por proveedor (valor vacío/None = borrar)."""
     keys = keys_read(ctx)
     for prov, val in (patch or {}).items():
-        if prov not in ("anthropic", "openai", "other"):
+        if prov not in ("anthropic", "openai", "other") and not str(prov).startswith("mcp:"):
             continue
         empty = not val or (isinstance(val, dict) and not (val.get("key") or val.get("url")))
         if empty:
@@ -202,10 +204,395 @@ def keys_status(ctx):
     o = keys.get("other") or {}
     out["other"] = {"set": bool(o.get("key") and o.get("url")), "url": o.get("url") or "",
                     "hint": _key_hint(o.get("key") or "")}
+    mcp = {}
+    for k, v in keys.items():
+        if str(k).startswith("mcp:"):
+            mcp[str(k).split(":", 1)[1]] = {"set": bool((v or {}).get("key")),
+                                            "hint": _key_hint((v or {}).get("key") or "")}
+    out["mcp"] = mcp
     return {"keys": out}
 
 
+# ===================== MCP / API EXTERNAS (decisión V — salida, fase 6c) =====================
+# Nodos agMcp conectados por `usa`: el agente recibe las tools de ese servicio con
+# prefijo m<idNodo>_ (conocimiento LOCAL: solo quien está cableado las ve).
+# - tipo "api": endpoints definidos a mano en el nodo → una tool por endpoint.
+# - tipo "mcp": cliente MCP streamable-HTTP mínimo (initialize → tools/list →
+#   tools/call), tools remotas descubiertas (cache 5 min por nodo).
+# Credenciales: keys.json sección `mcp:<idNodo>` = {key, header?} (decisión T) —
+# van como `Authorization: Bearer <key>` salvo header custom. SIN lock por default
+# (servicios externos con su propia consistencia).
+
+MCP_HTTP_TIMEOUT = 60
+_MCP_CACHE = {}               # (pid, nodeId, url) -> {ts, session, tools}
+
+
+def mcps_of(graph, node_id):
+    out = []
+    for f in graph["flechas"]:
+        if f.get("kind") == "usa" and int(f.get("fromId", -1)) == int(node_id):
+            r = graph["nodos"].get(int(f["toId"]))
+            if r and r.get("type") == "agMcp":
+                out.append(r)
+    return out
+
+
+def _mcp_headers(ctx, node_id):
+    cred = keys_read(ctx).get(f"mcp:{node_id}") or {}
+    key = cred.get("key")
+    if not key:
+        return {}
+    name = (cred.get("header") or "").strip() or "Authorization"
+    if name.lower() == "authorization" and not key.lower().startswith("bearer "):
+        key = f"Bearer {key}"
+    return {name: key}
+
+
+def _http_raw(url, method, headers, body_bytes):
+    req = urllib.request.Request(url, method=method)
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, body_bytes, timeout=MCP_HTTP_TIMEOUT) as r:
+            return r.status, dict(r.headers), r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers or {}), (e.read() or b"").decode("utf-8", "replace")
+    except Exception as e:
+        raise OrchError(502, f"no pude hablar con el servicio externo: {e}")
+
+
+def _mcp_rpc(url, headers, session, method, params=None, rpc_id=1, notify=False):
+    body = {"jsonrpc": "2.0", "method": method}
+    if params is not None:
+        body["params"] = params
+    if not notify:
+        body["id"] = rpc_id
+    hdrs = {"Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream", **headers}
+    if session:
+        hdrs["Mcp-Session-Id"] = session
+    status, rhdrs, text = _http_raw(url, "POST", hdrs, json.dumps(body).encode("utf-8"))
+    session = rhdrs.get("Mcp-Session-Id") or rhdrs.get("mcp-session-id") or session
+    if notify or not (text or "").strip():
+        return session, None
+    data = text
+    if "text/event-stream" in (rhdrs.get("Content-Type") or ""):
+        datas = [l[5:].strip() for l in text.splitlines() if l.startswith("data:")]
+        data = datas[-1] if datas else "{}"
+    try:
+        obj = json.loads(data)
+    except Exception:
+        raise OrchError(502, f"respuesta MCP no-JSON (HTTP {status})")
+    if isinstance(obj, dict) and obj.get("error"):
+        raise OrchError(502, f"error MCP: {(obj['error'] or {}).get('message')}")
+    return session, (obj or {}).get("result")
+
+
+def _mcp_connect(ctx, node):
+    """(url, session, tools) del server MCP del nodo (cache 5 min)."""
+    node_id = int(node["id"])
+    url = ((node.get("data") or {}).get("config") or {}).get("url") or ""
+    if not url:
+        raise OrchError(400, f"el nodo MCP «{node.get('titulo')}» no tiene URL configurada")
+    ck = (ctx["pid"], node_id, url)
+    c = _MCP_CACHE.get(ck)
+    if c and time.time() - c["ts"] < 300:
+        return url, c["session"], c["tools"]
+    headers = _mcp_headers(ctx, node_id)
+    session, _ = _mcp_rpc(url, headers, None, "initialize", {
+        "protocolVersion": "2025-03-26", "capabilities": {},
+        "clientInfo": {"name": "diagramind-orchestrator", "version": "1.0"}})
+    _mcp_rpc(url, headers, session, "notifications/initialized", {}, notify=True)
+    session2, res = _mcp_rpc(url, headers, session, "tools/list", {}, rpc_id=2)
+    tools = (res or {}).get("tools") or []
+    _MCP_CACHE[ck] = {"ts": time.time(), "session": session2 or session, "tools": tools}
+    return url, session2 or session, tools
+
+
+def _tool_name_safe(s):
+    return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in str(s or "ep"))[:48]
+
+
+def _add_api_endpoint_tool(ctx, node, mid, ep, tools, execs):
+    tname = f"{mid}_{_tool_name_safe(ep.get('name'))}"
+    def call(i, _ep=ep, _nid=int(node["id"])):
+        headers = {"Content-Type": "application/json", **_mcp_headers(ctx, _nid)}
+        url = _ep.get("url") or ""
+        q = i.get("query")
+        if isinstance(q, dict) and q:
+            from urllib.parse import urlencode
+            url += ("&" if "?" in url else "?") + urlencode({k: str(v) for k, v in q.items()})
+        body = (i.get("body") or "").encode("utf-8") if i.get("body") else None
+        status, _h, text = _http_raw(url, (_ep.get("method") or "GET").upper(), headers, body)
+        return json.dumps({"status": status, "body": text[:20000]}, ensure_ascii=False), status >= 400
+    tools.append(dict(name=tname, **_s(
+        f"[{node.get('titulo') or mid}] {_ep_desc(ep)}",
+        {"body": {"type": "string", "description": "cuerpo JSON (opcional)"},
+         "query": {"type": "object", "description": "query params (opcional)"}})))
+    execs[tname] = call
+
+
+def _ep_desc(ep):
+    return (ep.get("description") or f"{(ep.get('method') or 'GET').upper()} {ep.get('url') or ''}")[:400]
+
+
+def _add_mcp_remote_tool(ctx, node, mid, url, rt, tools, execs):
+    tname = f"{mid}_{_tool_name_safe(rt.get('name'))}"
+    schema = rt.get("inputSchema") or {"type": "object", "properties": {}}
+    tools.append({"name": tname,
+                  "description": (f"[{node.get('titulo') or mid}] "
+                                  f"{rt.get('description') or rt.get('name')}")[:800],
+                  "schema": schema})
+    def call(i, _rt=rt, _nid=int(node["id"]), _url=url):
+        headers = _mcp_headers(ctx, _nid)
+        session = (_MCP_CACHE.get((ctx["pid"], _nid, _url)) or {}).get("session")
+        _s2, res = _mcp_rpc(_url, headers, session, "tools/call",
+                            {"name": _rt.get("name"), "arguments": i or {}}, rpc_id=3)
+        parts = [c.get("text", "") for c in (res or {}).get("content", []) if c.get("type") == "text"]
+        out = "\n".join(p for p in parts if p) or json.dumps(res or {}, ensure_ascii=False)
+        return out[:60000], bool((res or {}).get("isError"))
+    execs[tname] = call
+
+
+def mcp_tools(ctx, graph, node_id):
+    """(tools, executors, notas) de los nodos agMcp conectados por `usa`."""
+    tools, execs, notes = [], {}, []
+    for m in mcps_of(graph, node_id):
+        mid = f"m{m['id']}"
+        d = m.get("data") or {}
+        cfg = d.get("config") or {}
+        label = f"{m.get('titulo') or mid} ({d.get('tipo')}, preset {d.get('preset')})"
+        if d.get("tipo") == "api":
+            eps = cfg.get("endpoints") or []
+            notes.append(f"- {mid}: {label} — {len(eps)} endpoints")
+            for ep in eps:
+                _add_api_endpoint_tool(ctx, m, mid, ep, tools, execs)
+        else:
+            try:
+                url, _sess, remote = _mcp_connect(ctx, m)
+            except OrchError as e:
+                notes.append(f"- {mid}: {label} — NO DISPONIBLE ({e.msg})")
+                continue
+            notes.append(f"- {mid}: {label} — {len(remote)} tools MCP")
+            for rt in remote:
+                _add_mcp_remote_tool(ctx, m, mid, url, rt, tools, execs)
+    return tools, execs, notes
+
+
+# ===================== WEBHOOKS (decisión V — entrada reactiva) =====================
+# El exterior dispara trabajo: cada nodo agWebhook tiene URI + TOKEN PROPIO
+# (generados por el conector, guardados en <orch>/<pid>/hooks.json — nunca en el
+# tree.json). El disparo responde AL INSTANTE (arrancó o se encoló); si el que
+# llama quiere el resultado pasa `callback` (una URL suya) y al terminar el run
+# se le POSTea {hookId, runId, status, final|error}. Cola FIFO con tope por nodo
+# (queueMax, default 50) — NO hay runs concurrentes — y rate-limit por hook.
+
+HOOK_RATE_MAX = 30            # disparos por minuto por hook
+HOOK_QUEUE_DEFAULT = 50
+_HOOK_RATE = {}               # hookId -> [timestamps] (RAM)
+
+
+def _hooks_path(ctx):
+    return os.path.join(orch_dir(ctx["app_dir"], ctx["pid"]), "hooks.json")
+
+
+def _hooks_index_path(app_dir):
+    d = os.path.join(app_dir, "orchestrator")
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, "hooks-index.json")
+
+
+def _triggers_path(ctx):
+    return os.path.join(orch_dir(ctx["app_dir"], ctx["pid"]), "triggers.json")
+
+
+def hook_register(ctx, node_id):
+    """Crea (o REGENERA: invalida el anterior) la URI + token de un nodo webhook."""
+    graph = load_graph(ctx)
+    n = graph["nodos"].get(int(node_id))
+    if not n or n.get("type") != "agWebhook":
+        raise OrchError(400, "el nodo no es un webhook")
+    hooks = _read_json(_hooks_path(ctx), {})
+    old = (hooks.get(str(int(node_id))) or {}).get("hookId")
+    hook = {"hookId": "h" + uuid.uuid4().hex[:12], "token": secrets.token_urlsafe(24)}
+    hooks[str(int(node_id))] = hook
+    _write_json(_hooks_path(ctx), hooks)
+    try:
+        os.chmod(_hooks_path(ctx), 0o600)
+    except OSError:
+        pass
+    idx = _read_json(_hooks_index_path(ctx["app_dir"]), {})
+    if old:
+        idx.pop(old, None)
+    idx[hook["hookId"]] = ctx["pid"]
+    _write_json(_hooks_index_path(ctx["app_dir"]), idx)
+    return dict(hook)
+
+
+def hook_info(ctx, node_id):
+    return dict(_read_json(_hooks_path(ctx), {}).get(str(int(node_id))) or
+                {"hookId": None, "token": None})
+
+
+def hook_resolve(app_dir, hook_id):
+    """hookId → projectId del orquestador dueño (o None)."""
+    return _read_json(_hooks_index_path(app_dir), {}).get(str(hook_id))
+
+
+def _trigger_text(node, payload):
+    d = (node.get("data") or {}) if node else {}
+    base = (f"WEBHOOK «{(node or {}).get('titulo') or 'webhook'}» ({d.get('tipo') or 'otro'}): "
+            f"{str(payload)[:6000]}")
+    plantilla = (d.get("plantilla") or "").strip()
+    return f"{plantilla}\n\n{base}" if plantilla else base
+
+
+def _enqueue_trigger(ctx, trig, qmax):
+    with LOCK:
+        q = _read_json(_triggers_path(ctx), [])
+        if len(q) >= qmax:
+            raise OrchError(429, "trigger queue full — try again in a moment")
+        q.append(trig)
+        _write_json(_triggers_path(ctx), q)
+        return {"ok": True, "queued": len(q)}
+
+
+def _start_trigger_run(ctx, trig):
+    graph = load_graph(ctx)
+    node = graph["nodos"].get(int(trig["nodeId"]))
+    texto = _trigger_text(node, trig["payload"])
+    return start_run(ctx, "trigger", trig["rootId"], texto, {},
+                     trigger={"hookId": trig["hookId"], "callback": trig.get("callback")})
+
+
+def hook_fire(ctx, hook_id, token, payload, callback=None):
+    """Disparo EXTERNO del hook. Valida el token propio del hook + rate-limit, y
+    responde al instante: arrancó (runId) o quedó encolado (posición)."""
+    hooks = _read_json(_hooks_path(ctx), {})
+    node_id = next((int(k) for k, v in hooks.items() if v.get("hookId") == hook_id), None)
+    if node_id is None:
+        raise OrchError(404, "unknown hook")
+    if not token or not hmac.compare_digest(str(token), hooks[str(node_id)].get("token") or ""):
+        raise OrchError(401, "bad hook token")
+    now = time.time()
+    stamps = [t for t in _HOOK_RATE.get(hook_id, []) if now - t < 60]
+    if len(stamps) >= HOOK_RATE_MAX:
+        _HOOK_RATE[hook_id] = stamps
+        raise OrchError(429, "rate limited — slow down")
+    stamps.append(now)
+    _HOOK_RATE[hook_id] = stamps
+
+    graph = load_graph(ctx)
+    node = graph["nodos"].get(node_id)
+    if not node or node.get("type") != "agWebhook":
+        raise OrchError(404, "unknown hook")
+    if (node.get("data") or {}).get("enabled") is False:
+        raise OrchError(409, "this webhook is disabled")
+    edge = next((f for f in graph["flechas"]
+                 if f.get("kind") == "trigger" and int(f.get("fromId", -1)) == node_id), None)
+    if not edge:
+        raise OrchError(409, "the webhook is not connected to an agent (trigger arrow)")
+    if not isinstance(payload, str):
+        payload = json.dumps(payload, ensure_ascii=False)
+    trig = {"nodeId": node_id, "rootId": int(edge["toId"]), "payload": payload,
+            "callback": (str(callback or "").strip() or None), "hookId": hook_id,
+            "ts": int(now * 1000)}
+    qmax = int((node.get("data") or {}).get("queueMax") or HOOK_QUEUE_DEFAULT)
+    with LOCK:
+        run = RUNS.get(ctx["pid"])
+        busy = bool(run and run["status"] in ("running", "waiting_human", "paused")) \
+            or bool(_read_json(_triggers_path(ctx), []))
+    if busy:
+        return _enqueue_trigger(ctx, trig, qmax)
+    try:
+        return {"ok": True, "runId": _start_trigger_run(ctx, trig)["id"]}
+    except OrchError as e:
+        if e.code == 409:              # carrera: otro run arrancó justo antes
+            return _enqueue_trigger(ctx, trig, qmax)
+        raise
+
+
+def _post_callback(trig, run_id, status, final, error):
+    cb = (trig or {}).get("callback")
+    if not cb:
+        return
+    try:
+        body = json.dumps({"hookId": trig.get("hookId"), "runId": run_id, "status": status,
+                           "final": final, "error": error}, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(cb, data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        urllib.request.urlopen(req, timeout=10).read()
+    except Exception:
+        pass                            # best-effort: el callback caído no frena nada
+
+
+def _after_run(ctx, run):
+    """Post-run (SIN el lock global): callback del webhook + drenar la cola."""
+    _post_callback(run.get("trigger"), run["id"], run["status"], run.get("final"), run.get("error"))
+    while True:
+        with LOCK:
+            live = RUNS.get(ctx["pid"])
+            if live and live["status"] in ("running", "waiting_human", "paused"):
+                return
+            q = _read_json(_triggers_path(ctx), [])
+            if not q:
+                return
+            trig = q.pop(0)
+            _write_json(_triggers_path(ctx), q)
+        try:
+            _start_trigger_run(ctx, trig)
+            return
+        except OrchError as e:          # trigger inválido (agente borrado, key faltante)
+            _post_callback(trig, None, "error", None, e.msg)
+            continue
+
+
 # ===================== grafo =====================
+
+NODE_TYPES = {"agAgent", "agResource", "agTask", "agDept", "agWebhook", "agMcp"}
+ARROW_OK = {("delega", "agAgent", "agAgent"), ("usa", "agAgent", "agResource"),
+            ("usa", "agAgent", "agMcp"), ("task", "agTask", "agAgent"),
+            ("trigger", "agWebhook", "agAgent")}
+
+
+def validate_graph(ctx, obj):
+    """Valida un organigrama entero (para org_edit del director, decisión U).
+    Devuelve None si es válido, o el texto del error."""
+    if not isinstance(obj, dict) or obj.get("type") != "orchestrator":
+        return "el JSON debe ser un objeto con type='orchestrator'"
+    nodos, flechas = obj.get("nodos"), obj.get("flechas")
+    if not isinstance(nodos, list) or not isinstance(flechas, list):
+        return "faltan las listas nodos/flechas"
+    seen = {}
+    for n in nodos:
+        try:
+            nid = int(n.get("id"))
+        except (TypeError, ValueError):
+            return "cada nodo necesita un id entero"
+        if nid in seen:
+            return f"id de nodo repetido: {nid}"
+        if n.get("type") not in NODE_TYPES:
+            return f"tipo de nodo inválido: {n.get('type')}"
+        seen[nid] = n
+    for f in flechas:
+        try:
+            a, b = int(f.get("fromId")), int(f.get("toId"))
+        except (TypeError, ValueError):
+            return "cada flecha necesita fromId/toId enteros"
+        if a not in seen or b not in seen:
+            return f"flecha con punta inexistente ({a}→{b})"
+        combo = (f.get("kind"), seen[a].get("type"), seen[b].get("type"))
+        if combo not in ARROW_OK:
+            return f"flecha inválida: {combo[0]} {combo[1]}→{combo[2]}"
+    for n in nodos:
+        if n.get("type") == "agResource":
+            rpid = (n.get("data") or {}).get("projectId")
+            if rpid == ctx["pid"]:
+                return "un recurso no puede ser el propio orquestador"
+            if rpid and not ctx["project_meta"](rpid):
+                return f"el recurso «{n.get('titulo')}» apunta a un proyecto que no es de esta carpeta"
+    return None
+
 
 def load_graph(ctx):
     tree = _read_json(ctx["graph_path"], None)
@@ -535,6 +922,53 @@ def _editor_tools(ctx, rid, rpid, perm, tools, execs, author):
             lambda i: _fs(editorfs.fs_exec, app, rpid, i.get("cmd")))
 
 
+def org_tools(ctx, graph, run, node):
+    """Tools del DIRECTOR (decisión U): auto-edición del organigrama en el que vive.
+    org_edit valida + snapshotea + refresca el grafo del run EN VIVO (los frames
+    nuevos y los próximos turnos lo ven) y NUNCA dispara runs."""
+    tools, execs = [], {}
+    def org_view(i):
+        tree = _read_json(ctx["graph_path"], None)
+        if tree is None:
+            return "el organigrama no está sincronizado", True
+        return json.dumps(tree, ensure_ascii=False), False
+    tools.append(dict(name="org_view", **_s(
+        "Devuelve el JSON completo del organigrama de TU empresa (este orquestador).")))
+    execs["org_view"] = org_view
+
+    def org_edit(i):
+        raw = i.get("json")
+        try:
+            obj = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception as e:
+            return f"JSON inválido: {e}", True
+        err = validate_graph(ctx, obj)
+        if err:
+            return f"organigrama inválido: {err}", True
+        try:                                     # snapshot pre-edición (decisión I)
+            d = os.path.join(orch_dir(ctx["app_dir"], ctx["pid"]), "snapshots")
+            os.makedirs(d, exist_ok=True)
+            if os.path.isfile(ctx["graph_path"]):
+                shutil.copyfile(ctx["graph_path"],
+                                os.path.join(d, f"{run['id']}-org-{int(time.time() * 1000)}.json"))
+        except Exception:
+            pass
+        _write_json(ctx["graph_path"], obj)
+        ctx["notify_edit"](ctx["pid"])
+        with LOCK:                               # refresh en vivo del grafo del run
+            graph["nodos"] = {int(n["id"]): n for n in obj.get("nodos", [])}
+            graph["flechas"] = obj.get("flechas", [])
+            emit(run, "log", nodeId=node["id"], text="👑 editó el organigrama (org_edit)")
+        return "OK: organigrama actualizado. NO se disparó ningún run.", False
+    tools.append(dict(name="org_edit", **_s(
+        "Reemplaza el organigrama ENTERO de tu empresa con un JSON válido de tipo orchestrator "
+        "(usá org_view primero y respetá su esquema EXACTO; conservá lo que no te pidieron tocar). "
+        "Editar NUNCA ejecuta nada: hacé SOLO los cambios que te pidieron.",
+        {"json": {"type": "string", "description": "el tree.json completo del orquestador"}}, ["json"])))
+    execs["org_edit"] = org_edit
+    return tools, execs
+
+
 def _diagram_tools(ctx, rid, rpid, rtype, perm, tools, execs):
     def view(i):
         tree = _read_json(ctx["tree_path_of"](rpid), None)
@@ -595,6 +1029,14 @@ def build_system(ctx, graph, node, notes):
         body = _skill_body(t)
         if body:
             partes.append(f"ESQUEMA del tipo {t} (para view/set_tree):\n{body[:3500]}")
+    if d.get("director"):
+        partes.append("👑 SOS DIRECTOR de esta empresa (decisión U): podés gestionar el organigrama "
+                      "con `org_view` y `org_edit` — crear/editar/borrar agentes, recursos y flechas, "
+                      "incluso modificarte a vos mismo. REGLAS del director: editar el grafo NUNCA "
+                      "dispara runs; hacé SOLO los cambios que te pidieron y conservá el resto.")
+        body = _skill_body("orchestrator")
+        if body:
+            partes.append(f"ESQUEMA del organigrama (para org_view/org_edit):\n{body[:3500]}")
     partes.append(
         "REGLAS: 1) Trabajá SOLO en lo que te pidieron. 2) Usá `preguntar_al_usuario` ante decisiones "
         "importantes o contexto faltante. 3) Cerrá SIEMPRE tu turno con `responder` (resumen concreto y "
@@ -810,8 +1252,8 @@ def _do_delegar(ctx, graph, run, frame, node, inp):
 
 # ===================== scheduler + workers =====================
 
-def start_run(ctx, entry_kind, root_node_id, initial_text, api_keys, max_turns=None):
-    """Crea y lanza un run (entry task o chat). Devuelve el run dict."""
+def start_run(ctx, entry_kind, root_node_id, initial_text, api_keys, max_turns=None, trigger=None):
+    """Crea y lanza un run (entry task, chat o trigger). Devuelve el run dict."""
     with LOCK:
         prev = RUNS.get(ctx["pid"])
         if prev and prev["status"] in ("running", "waiting_human", "paused"):
@@ -826,7 +1268,7 @@ def start_run(ctx, entry_kind, root_node_id, initial_text, api_keys, max_turns=N
             "status": "running", "rootNodeId": root["id"], "final": None, "error": None,
             "turns": 0, "maxTurns": max_turns or MAX_TURNS_DEFAULT,
             "chatId": None, "pending": None, "pendings": [],
-            "frames": {}, "locks": {}, "nodeStates": {}, "spend": {},
+            "trigger": trigger, "frames": {}, "locks": {}, "nodeStates": {}, "spend": {},
             "events": [], "createdAt": int(time.time() * 1000),
             "_fseq": 0, "_workers": 0,
         }
@@ -912,6 +1354,7 @@ def _loop(ctx):
         _archive_run(ctx, run)
         rt["alive"] = False
         cv.notify_all()
+    _after_run(ctx, run)                # callback del webhook + drenar la cola (V)
 
 
 def _worker(ctx, graph, run, frame):
@@ -979,6 +1422,13 @@ def _turn_api(ctx, graph, run, frame):
     author = f"IA ({node.get('titulo') or node['id']})"
     ctrl = control_tools(graph, node["id"])
     rtools, rexecs, rnotes = resource_tools(ctx, graph, node["id"], author)
+    mtools, mexecs, mnotes = mcp_tools(ctx, graph, node["id"])
+    rtools, rnotes = rtools + mtools, rnotes + mnotes
+    rexecs = {**rexecs, **mexecs}
+    if (node.get("data") or {}).get("director"):
+        otools, oexecs = org_tools(ctx, graph, run, node)
+        rtools = otools + rtools
+        rexecs = {**rexecs, **oexecs}
     system = build_system(ctx, graph, node, rnotes)
     tools = ctrl + rtools
     cv = _rt(ctx["pid"])["cv"]
@@ -1152,6 +1602,13 @@ def _cli_system(ctx, graph, node, notes):
             lines = [f"- [{time.strftime('%Y-%m-%d %H:%M', time.localtime(m['ts'] / 1000))}] {m['texto']}"
                      for m in mem[-12:]]
             partes.append("TU MEMORIA (trabajos y charlas anteriores):\n" + "\n".join(lines))
+    if d.get("director"):
+        partes.append("👑 SOS DIRECTOR de esta empresa (decisión U): podés gestionar el organigrama "
+                      f"editando DIRECTO el archivo {ctx['graph_path']} (seguí la skill "
+                      "diagramind-orchestrator y respetá su esquema EXACTO — org completo, ids únicos, "
+                      "contadores). Podés crear/editar/borrar agentes, recursos y flechas, incluso a "
+                      "vos mismo. REGLAS: editar el grafo NUNCA dispara runs; hacé SOLO los cambios "
+                      "que te pidieron y conservá el resto.")
     partes.append("REGLAS: 1) Trabajá SOLO en lo que te pidieron. 2) Tocá ÚNICAMENTE tus recursos "
                   "(no otros proyectos de la carpeta). 3) Respondé en español, concreto.")
     partes.append(CLI_PROTOCOL)
@@ -1405,6 +1862,7 @@ def kill(ctx):
     if not run or run["status"] not in ("running", "waiting_human", "paused"):
         raise OrchError(409, "no hay un run activo")
     rt = _rt(ctx["pid"])
+    direct = False
     with LOCK:
         if run["status"] == "running":
             run["_kill"] = True
@@ -1420,6 +1878,9 @@ def kill(ctx):
             emit(run, "status", status="killed")
             _save(ctx, run)
             _archive_run(ctx, run)
+            direct = True
+    if direct:
+        _after_run(ctx, run)        # también acá se drena la cola de triggers (V)
     return {"ok": True}
 
 

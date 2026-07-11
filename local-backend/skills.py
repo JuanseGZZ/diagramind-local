@@ -320,6 +320,56 @@ SKILLS = dict([
         "   a estos proyectos: es código/archivos comunes.\n"
         "5. Los demás proyectos del workspace siguen las reglas de siempre.",
     ),
+    _skill(
+        "diagramind-orchestrator",
+        "Tipo `orchestrator` (doc 28): la EMPRESA de agentes IA como canvas. "
+        "Gestión del organigrama: crear/editar empleados, recursos, cableado.",
+        "# Tipo orchestrator (empresa de agentes)\n\n"
+        "Contenedor familia free (`nodos` + `flechas` + `formas` + contadores, como "
+        "freestyle: cada nodo tiene id/x/y/ancho/alto/titulo/contenido/color/type/data). "
+        "UNO por carpeta. El grafo ES la empresa: se puede EJECUTAR (runs).\n\n"
+        "## Nodos (campo `type` + su `data`)\n"
+        "- `agAgent` → empleado IA. data={ preset, rol (str: prompt de contexto), "
+        "ia:{provider:'anthropic'|'openai'|'other'|'local'(Claude Code), model, effort|null}, "
+        "memoria:{enabled:bool}, director:bool (default false: SOLO el humano lo activa — "
+        "da facultad TOTAL de gestionar esta empresa, NO lo pongas vos) }. "
+        "El `titulo` es el NOMBRE del empleado.\n"
+        "- `agResource` → proyecto de la MISMA carpeta como recurso. "
+        "data={ projectId, permiso:'leer'|'editar'|'ejecutar' }.\n"
+        "- `agTask` → entrada de trabajo. data={ enunciado }.\n"
+        "- `agDept` → departamento (sector visual por geometría). data={ collapsed }.\n"
+        "- `agWebhook` → entrada REACTIVA desde el exterior (mail/server/api). "
+        "data={ tipo:'gmail'|'outlook'|'mail'|'api'|'mcp'|'otro', enabled:bool, "
+        "queueMax:int (default 50), plantilla?:str (cómo interpretar el payload) }. "
+        "La URI + token los genera el conector (no van en el tree.json).\n"
+        "- `agMcp` → tooling hacia AFUERA (MCPs y APIs externas). "
+        "data={ tipo:'mcp'|'api', preset:'notion'|'canva'|'mail'|'custom'|…, "
+        "config:{ url?, endpoints?:[{name,method,url,description}] } }. "
+        "Las credenciales NO van en el tree.json (viven en el conector).\n\n"
+        "## Flechas (campo `kind`)\n"
+        "- `delega` (agAgent→agAgent): quién puede llamar a quién; ciclos permitidos. "
+        "label 'delega', color #6366f1.\n"
+        "- `usa` (agAgent→agResource o agAgent→agMcp): le asigna el recurso/servicio. "
+        "label 'usa', color #14b8a6.\n"
+        "- `task` (agTask→agAgent): entrada del run. label 'tarea', color #f59e0b.\n"
+        "- `trigger` (agWebhook→agAgent): el disparo externo entra por ese agente. "
+        "label 'trigger', color #f43f5e.\n"
+        "OTRA combinación es inválida.\n\n"
+        "## Gestión de la empresa (buenas prácticas)\n"
+        "1. Cada agente SOLO conoce lo que tiene cableado (sus flechas): no armes "
+        "   grafos donde todos hablan con todos — jerarquías claras (PM → devs → QA).\n"
+        "2. Roles CONCRETOS y verificables en `rol` (qué hace, qué NO hace, cuándo "
+        "   pregunta al usuario). Cascada de costos: modelo caro al PM, medio a devs, "
+        "   barato a lo mecánico.\n"
+        "3. Recursos con el permiso MÍNIMO (leer si solo consulta). Dos agentes "
+        "   escribiendo el MISMO recurso se serializan por lock: si querés paralelo "
+        "   real, partí el recurso.\n"
+        "4. Webhooks → apuntalos a un agente 'recepcionista' dedicado que delegue.\n"
+        "5. EDITAR el grafo NUNCA ejecuta nada (no dispara runs): cambiá lo que te "
+        "   pidieron y nada más.\n"
+        "6. Al editar respetá diagramind-format (ids enteros únicos, contadores, "
+        "   campos exactos) y conservá lo que no te pidieron tocar.",
+    ),
 ])
 
 

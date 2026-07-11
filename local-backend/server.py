@@ -62,7 +62,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.21.0"   # IA Orchestrator fase 3: paralelismo (fork/join + locks, doc 28)
+VERSION = "0.22.0"   # IA Orchestrator fase 6: director + webhooks + MCP/API (doc 28)
 
 # ===================== rutas / disco =====================
 
@@ -481,6 +481,32 @@ class Handler(BaseHTTPRequestHandler):
         except sourcever.SvError as e:
             self._json(e.code, {"error": e.msg})
 
+    def _orch_hook(self, path):
+        """POST /orch/hook/<hookId> — disparo externo (decisión V). Body JSON:
+        {payload?, callback?, token?}; token también por header X-Hook-Token o
+        ?token=. Responde AL INSTANTE (runId o posición en la cola)."""
+        hook_id = path.split("/")[3] if len(path.split("/")) > 3 else ""
+        body = self._read_json() or {}
+        token = (self.headers.get("X-Hook-Token")
+                 or parse_qs(urlparse(self.path).query).get("token", [None])[0]
+                 or body.get("token") or "")
+        payload = body.get("payload")
+        if payload is None:
+            payload = {k: v for k, v in body.items() if k not in ("token", "callback")}
+        pid = orchestrator.hook_resolve(app_dir(), hook_id)
+        if not pid:
+            self._json(404, {"error": "unknown hook"})
+            return
+        ctx = orch_ctx(pid)
+        if not ctx:
+            self._json(409, {"error": "el orquestador no está sincronizado"})
+            return
+        try:
+            self._json(200, orchestrator.hook_fire(ctx, hook_id, token, payload,
+                                                   body.get("callback")))
+        except orchestrator.OrchError as e:
+            self._json(e.code, {"error": e.msg})
+
     def _orch(self, pid, fn):
         """Resuelve el ctx del orquestador y corre `fn(ctx)` traduciendo OrchError."""
         ctx = orch_ctx(pid)
@@ -646,6 +672,13 @@ class Handler(BaseHTTPRequestHandler):
             self._orch(q.get("projectId", [None])[0], _mem)
         elif path == "/orch/keys":
             self._orch(q.get("projectId", [None])[0], lambda ctx: orchestrator.keys_status(ctx))
+        elif path == "/orch/hookinfo":
+            def _hi(ctx):
+                info = orchestrator.hook_info(ctx, int(q.get("nodeId", ["0"])[0]))
+                if info.get("hookId"):
+                    info["url"] = f"http://127.0.0.1:{self.server.server_address[1]}/orch/hook/{info['hookId']}"
+                return info
+            self._orch(q.get("projectId", [None])[0], _hi)
         elif path == "/orch/runs":
             self._orch(q.get("projectId", [None])[0], lambda ctx: orchestrator.runs_list(ctx))
         elif path == "/orch/rundetail":
@@ -656,6 +689,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path.startswith("/orch/hook/"):
+            # PÚBLICO (doc 28 decisión V): lo autentica el TOKEN PROPIO del hook
+            # (se lo diste al sistema externo), no el token local de la web.
+            self._orch_hook(path)
+            return
         if not self._auth_ok():
             self._json(401, {"error": "unauthorized"})
             return
@@ -792,6 +830,13 @@ class Handler(BaseHTTPRequestHandler):
             b = self._read_json()
             self._orch(b.get("projectId"),
                        lambda ctx: orchestrator.keys_write(ctx, b.get("keys") or {}))
+        elif path == "/orch/hookreg":
+            b = self._read_json()
+            def _hr(ctx):
+                info = orchestrator.hook_register(ctx, int(b.get("nodeId") or 0))
+                info["url"] = f"http://127.0.0.1:{self.server.server_address[1]}/orch/hook/{info['hookId']}"
+                return info
+            self._orch(b.get("projectId"), _hr)
         elif path == "/orch/memclear":
             b = self._read_json()
             def _mc(ctx):
