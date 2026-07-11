@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"   # IA Orchestrator server-side (doc 28, fase 5)
 NAME = "DiagraMind Connector"
 
 

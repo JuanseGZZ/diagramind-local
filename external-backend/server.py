@@ -7,6 +7,7 @@ El WebSocket realtime, el CRUD de folders/projects y el versionado llegan despu�
 Correr:  .venv/bin/python server.py       (o: uvicorn server:app)
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -23,6 +24,8 @@ from fs import router as fs_router
 from sv import router as sv_router
 from db import connect, init_db
 from gitrepo import init_repo
+import orch
+from orch import router as orch_router
 from realtime import router as realtime_router
 from security import hash_password, random_password
 from users import router as users_router
@@ -60,6 +63,7 @@ async def lifespan(app: FastAPI):
     init_db()
     bootstrap_admin()
     root = init_repo()
+    orch.set_loop(asyncio.get_running_loop())   # broadcasts WS desde los threads del motor
     print(f"[connector] {config.NAME} v{config.VERSION}", flush=True)
     print(f"  home:      {config.HOME}", flush=True)
     print(f"             (en Mac, ~/Library está oculta en Finder: Cmd+Shift+G para ir)", flush=True)
@@ -92,6 +96,7 @@ app.include_router(content_router)    # REST folders/projects (namespace + permi
 app.include_router(versions_router)   # versionado git + GitHub
 app.include_router(fs_router)         # modo editor: /editor/target + /fs/* (doc 27)
 app.include_router(sv_router)         # modo editor: source versions /sv/* (doc 27, fase 4)
+app.include_router(orch_router)       # IA Orchestrator server-side /orch/* (doc 28, fase 5 — solo admin)
 app.include_router(realtime_router)   # WebSocket /ws (realtime mirror)
 
 
