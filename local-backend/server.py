@@ -644,6 +644,8 @@ class Handler(BaseHTTPRequestHandler):
                 return {"entries": orchestrator.mem_read(ctx, nid),
                         "chars": orchestrator.mem_chars(ctx, nid)}
             self._orch(q.get("projectId", [None])[0], _mem)
+        elif path == "/orch/keys":
+            self._orch(q.get("projectId", [None])[0], lambda ctx: orchestrator.keys_status(ctx))
         elif path == "/orch/runs":
             self._orch(q.get("projectId", [None])[0], lambda ctx: orchestrator.runs_list(ctx))
         elif path == "/orch/rundetail":
@@ -786,6 +788,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/orch/kill":
             b = self._read_json()
             self._orch(b.get("projectId"), lambda ctx: orchestrator.kill(ctx))
+        elif path == "/orch/keys":
+            b = self._read_json()
+            self._orch(b.get("projectId"),
+                       lambda ctx: orchestrator.keys_write(ctx, b.get("keys") or {}))
         elif path == "/orch/memclear":
             b = self._read_json()
             def _mc(ctx):

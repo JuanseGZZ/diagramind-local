@@ -147,8 +147,62 @@ def _write_json(path, data):
 
 
 def _save(ctx, run):
-    """Persiste el run SIN las keys (viven solo en RAM). Llamar con el LOCK tomado."""
+    """Persiste el run SIN las keys. Llamar con el LOCK tomado."""
     _write_json(_run_path(ctx), {k: v for k, v in run.items() if not str(k).startswith("_")})
+
+
+# ===================== API keys DEL ORQUESTADOR (por proyecto) =====================
+# Las credenciales viven EN EL CONECTOR del proyecto (decisión 2026-07-11): el core
+# tiene que poder correr sin la web conectada, y no son las keys del chat del
+# usuario. Se guardan en <orch>/<pid>/keys.json (0600) — NUNCA en el tree.json ni
+# en el mirror (eso las metería en localStorage/git). Al correr, las del proyecto
+# MANDAN; las que lleguen en el request quedan solo como fallback (compat).
+
+def _keys_path(ctx):
+    return os.path.join(orch_dir(ctx["app_dir"], ctx["pid"]), "keys.json")
+
+
+def keys_read(ctx):
+    return _read_json(_keys_path(ctx), {})
+
+
+def keys_write(ctx, patch):
+    """Setea/borra credenciales por proveedor (valor vacío/None = borrar)."""
+    keys = keys_read(ctx)
+    for prov, val in (patch or {}).items():
+        if prov not in ("anthropic", "openai", "other"):
+            continue
+        empty = not val or (isinstance(val, dict) and not (val.get("key") or val.get("url")))
+        if empty:
+            keys.pop(prov, None)
+        elif isinstance(val, dict):
+            # merge parcial (p.ej. actualizar solo la URL de "other" sin pisar la key)
+            keys[prov] = {**(keys.get(prov) or {}), **{k: v for k, v in val.items() if v}}
+        else:
+            keys[prov] = val
+    _write_json(_keys_path(ctx), keys)
+    try:
+        os.chmod(_keys_path(ctx), 0o600)
+    except OSError:
+        pass
+    return keys_status(ctx)
+
+
+def _key_hint(k):
+    return ("…" + k[-4:]) if isinstance(k, str) and len(k) >= 8 else ""
+
+
+def keys_status(ctx):
+    """Estado para la UI: qué proveedores están configurados. NUNCA devuelve los secretos."""
+    keys = keys_read(ctx)
+    out = {}
+    for prov in ("anthropic", "openai"):
+        v = keys.get(prov)
+        out[prov] = {"set": bool(v), "hint": _key_hint(v or "")}
+    o = keys.get("other") or {}
+    out["other"] = {"set": bool(o.get("key") and o.get("url")), "url": o.get("url") or "",
+                    "hint": _key_hint(o.get("key") or "")}
+    return {"keys": out}
 
 
 # ===================== grafo =====================
@@ -765,7 +819,8 @@ def start_run(ctx, entry_kind, root_node_id, initial_text, api_keys, max_turns=N
                                  "esperá, respondé lo pendiente o matalo")
         graph = load_graph(ctx)
         root = _agent(graph, root_node_id)
-        KEYS[ctx["pid"]] = api_keys or {}
+        # las keys DEL PROYECTO mandan; las del request quedan como fallback (compat)
+        KEYS[ctx["pid"]] = {**(api_keys or {}), **keys_read(ctx)}
         run = {
             "id": "run" + uuid.uuid4().hex[:8], "projectId": ctx["pid"], "entry": entry_kind,
             "status": "running", "rootNodeId": root["id"], "final": None, "error": None,
@@ -1336,8 +1391,8 @@ def resume(ctx):
     run = RUNS.get(ctx["pid"])
     if not run or run["status"] != "paused":
         raise OrchError(409, "no hay un run pausado")
-    if ctx["pid"] not in KEYS:
-        raise OrchError(409, "el backend se reinició: relanzá el run")
+    if not KEYS.get(ctx["pid"]):
+        KEYS[ctx["pid"]] = keys_read(ctx)   # las del proyecto persisten en disco
     with LOCK:
         run["status"] = "running"
         _save(ctx, run)

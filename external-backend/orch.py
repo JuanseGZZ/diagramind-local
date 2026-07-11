@@ -201,6 +201,60 @@ def _save(ctx, run):
     _write_json(_run_path(ctx), {k: v for k, v in run.items() if not str(k).startswith("_")})
 
 
+# ===================== API keys DEL ORQUESTADOR (por proyecto) =====================
+# Las credenciales viven EN ESTE CONECTOR (decisión 2026-07-11): el core corre
+# server-side aunque el usuario cierre la web, y no son las keys del chat del
+# usuario. Se guardan en <HOME>/orchestrator/<pid>/keys.json (0600) — FUERA del
+# repo git (nunca se commitean ni viajan por el mirror). Al correr, las del
+# proyecto MANDAN; las del request quedan como fallback (compat).
+
+def _keys_path(ctx):
+    return orch_dir(ctx["pid"]) / "keys.json"
+
+
+def keys_read(ctx):
+    return _read_json(_keys_path(ctx), {})
+
+
+def keys_write(ctx, patch):
+    """Setea/borra credenciales por proveedor (valor vacío/None = borrar)."""
+    keys = keys_read(ctx)
+    for prov, val in (patch or {}).items():
+        if prov not in ("anthropic", "openai", "other"):
+            continue
+        empty = not val or (isinstance(val, dict) and not (val.get("key") or val.get("url")))
+        if empty:
+            keys.pop(prov, None)
+        elif isinstance(val, dict):
+            # merge parcial (p.ej. actualizar solo la URL de "other" sin pisar la key)
+            keys[prov] = {**(keys.get(prov) or {}), **{k: v for k, v in val.items() if v}}
+        else:
+            keys[prov] = val
+    _write_json(_keys_path(ctx), keys)
+    try:
+        os.chmod(_keys_path(ctx), 0o600)
+    except OSError:
+        pass
+    return keys_status(ctx)
+
+
+def _key_hint(k):
+    return ("…" + k[-4:]) if isinstance(k, str) and len(k) >= 8 else ""
+
+
+def keys_status(ctx):
+    """Estado para la UI: qué proveedores están configurados. NUNCA devuelve los secretos."""
+    keys = keys_read(ctx)
+    out = {}
+    for prov in ("anthropic", "openai"):
+        v = keys.get(prov)
+        out[prov] = {"set": bool(v), "hint": _key_hint(v or "")}
+    o = keys.get("other") or {}
+    out["other"] = {"set": bool(o.get("key") and o.get("url")), "url": o.get("url") or "",
+                    "hint": _key_hint(o.get("key") or "")}
+    return {"keys": out}
+
+
 # ===================== grafo =====================
 
 def load_graph(ctx):
@@ -828,7 +882,8 @@ def start_run(ctx, entry_kind, root_node_id, initial_text, api_keys, max_turns=N
                                  "esperá, respondé lo pendiente o matalo")
         graph = load_graph(ctx)
         root = _agent(graph, root_node_id)
-        KEYS[ctx["pid"]] = api_keys or {}
+        # las keys DEL PROYECTO mandan; las del request quedan como fallback (compat)
+        KEYS[ctx["pid"]] = {**(api_keys or {}), **keys_read(ctx)}
         run = {
             "id": "run" + uuid.uuid4().hex[:8], "projectId": ctx["pid"], "entry": entry_kind,
             "status": "running", "rootNodeId": root["id"], "final": None, "error": None,
@@ -1154,8 +1209,8 @@ def resume(ctx):
     run = RUNS.get(ctx["pid"])
     if not run or run["status"] != "paused":
         raise OrchError(409, "no hay un run pausado")
-    if ctx["pid"] not in KEYS:
-        raise OrchError(409, "el conector se reinició: relanzá el run")
+    if not KEYS.get(ctx["pid"]):
+        KEYS[ctx["pid"]] = keys_read(ctx)   # las del proyecto persisten en disco
     with LOCK:
         run["status"] = "running"
         _save(ctx, run)
@@ -1246,6 +1301,11 @@ class OrchNodeBody(BaseModel):
     nodeId: int
 
 
+class OrchKeysBody(BaseModel):
+    projectId: str
+    keys: dict
+
+
 def _orch(pid, user, fn):
     try:
         return fn(make_ctx(pid, user))
@@ -1334,6 +1394,16 @@ def orch_memclear(body: OrchNodeBody, user: dict = Depends(require_admin)):
 @router.post("/orch/chatclear")
 def orch_chatclear(body: OrchNodeBody, user: dict = Depends(require_admin)):
     return _orch(body.projectId, user, lambda ctx: chat_clear(ctx, body.nodeId))
+
+
+@router.get("/orch/keys")
+def orch_keys_get(projectId: str = Query(...), user: dict = Depends(require_admin)):
+    return _orch(projectId, user, keys_status)
+
+
+@router.post("/orch/keys")
+def orch_keys_set(body: OrchKeysBody, user: dict = Depends(require_admin)):
+    return _orch(body.projectId, user, lambda ctx: keys_write(ctx, body.keys or {}))
 
 
 @router.get("/orch/runs")
