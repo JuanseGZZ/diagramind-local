@@ -131,3 +131,15 @@ class GhPullBody(BaseModel):
     projectId: str
     ref: str | None = None
     author: str | None = None
+
+
+# ---- MCP por carpeta (doc 26 §6) ----
+
+class McpTokenCreateBody(BaseModel):
+    folderId: str
+    userId: int | None = None    # admin puede emitir para otro usuario; default: uno mismo
+    name: str = ""
+
+
+class McpTokenRevokeBody(BaseModel):
+    id: int

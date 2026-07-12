@@ -83,6 +83,17 @@ CREATE TABLE IF NOT EXISTS editor_github (
   token      TEXT    NOT NULL DEFAULT '',            -- va en la URL al push/fetch, nunca al repo
   branch     TEXT    NOT NULL DEFAULT 'main'
 );
+
+CREATE TABLE IF NOT EXISTS mcp_tokens (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,      -- MCP por carpeta (doc 26 §6)
+  token      TEXT    NOT NULL UNIQUE,                -- secreto de la URL /mcp/<token>
+  folder_id  TEXT    NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,  -- su ACL = permiso
+  name       TEXT    NOT NULL DEFAULT '',
+  revoked    INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+  last_used  TEXT
+);
 """
 
 

@@ -24,6 +24,7 @@ from fs import router as fs_router
 from sv import router as sv_router
 from db import connect, init_db
 from gitrepo import init_repo
+from mcp import router as mcp_router
 import orch
 from orch import router as orch_router
 from realtime import router as realtime_router
@@ -97,6 +98,7 @@ app.include_router(versions_router)   # versionado git + GitHub
 app.include_router(fs_router)         # modo editor: /editor/target + /fs/* (doc 27)
 app.include_router(sv_router)         # modo editor: source versions /sv/* (doc 27, fase 4)
 app.include_router(orch_router)       # IA Orchestrator server-side /orch/* (doc 28, fase 5 — solo admin)
+app.include_router(mcp_router)        # MCP por carpeta: /mcp/tokens (sesión) + /mcp/<token> (doc 26 §6)
 app.include_router(realtime_router)   # WebSocket /ws (realtime mirror)
 
 

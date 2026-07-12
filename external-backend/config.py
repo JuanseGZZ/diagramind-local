@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.4.0"   # IA Orchestrator fase 6: director + webhooks + MCP/API (doc 28)
+VERSION = "0.5.0"   # MCP por carpeta: /mcp/tokens + /mcp/<token> (doc 26 §6)
 NAME = "DiagraMind Connector"
 
 

@@ -66,6 +66,7 @@
     <button class="tab" data-tab="repo">Repo</button>
     <button class="tab" data-tab="versions">Versiones</button>
     <button class="tab" data-tab="sourcever">Source Versions</button>
+    <button class="tab" data-tab="mcp">MCP</button>
     <button class="tab" data-tab="github">GitHub</button>
   </nav>
   <main>
@@ -73,6 +74,7 @@
     <div id="tab-repo" class="tabpane hidden"></div>
     <div id="tab-versions" class="tabpane hidden"></div>
     <div id="tab-sourcever" class="tabpane hidden"></div>
+    <div id="tab-mcp" class="tabpane hidden"></div>
     <div id="tab-github" class="tabpane hidden"></div>
   </main>
 </div>
@@ -141,7 +143,7 @@ function showTab(name) {
   document.querySelectorAll("nav .tab").forEach(b => b.classList.toggle("active", b.dataset.tab===name));
   document.querySelectorAll(".tabpane").forEach(p => p.classList.add("hidden"));
   $("#tab-"+name).classList.remove("hidden");
-  ({ users:renderUsers, repo:renderRepo, versions:renderVersions, sourcever:renderSourcever, github:renderGithub })[name]();
+  ({ users:renderUsers, repo:renderRepo, versions:renderVersions, sourcever:renderSourcever, mcp:renderMcp, github:renderGithub })[name]();
 }
 
 // ---------- Usuarios ----------
@@ -381,6 +383,73 @@ async function loadSv(pid,out){
     ]));
   }
   out.append(t, diffBox);
+}
+
+// ---------- MCP por carpeta (doc 26 §6) ----------
+async function renderMcp(){
+  const pane=$("#tab-mcp"); pane.innerHTML="Cargando…";
+  let repo, users;
+  try{ repo=(await jget("/repo")).folders; users=(await jget("/users")).users; }
+  catch(e){ pane.innerHTML=`<div class="err">${e.message}</div>`; return; }
+  pane.innerHTML="";
+
+  const mk=el("div",{className:"card"});
+  mk.append(el("h2",{textContent:"Crear MCP de una carpeta"}),
+    el("div",{className:"muted",style:"margin-bottom:8px",textContent:
+      "Genera una URL MCP (streamable HTTP) para que un chat de Claude trabaje sobre ESA carpeta. "+
+      "Las tools quedan limitadas a la carpeta y al permiso (ACL) del usuario elegido; "+
+      "revocá el token (o la ACL) para cortarla."}));
+  const fsel=el("select");
+  fsel.append(el("option",{value:"",textContent:"— carpeta —"}));
+  repo.forEach(f=>fsel.append(el("option",{value:f.id,textContent:f.name})));
+  const usel=el("select");
+  users.filter(u=>!u.disabled).forEach(u=>usel.append(el("option",{value:String(u.id),textContent:u.username,selected:u.username===TOK.username})));
+  const nm=el("input",{placeholder:"nombre (opcional)"});
+  const btn=el("button",{className:"primary",textContent:"Crear MCP"});
+  const out=el("div",{className:"muted",style:"margin-top:8px"});
+  btn.addEventListener("click",async()=>{
+    if(!fsel.value) return;
+    try{
+      const d=await jpost("/mcp/tokens",{folderId:fsel.value,userId:Number(usel.value),name:nm.value.trim()});
+      const url=location.origin+d.path;
+      out.innerHTML=`<span class="ok">Creado.</span> URL: <b>${url}</b> `;
+      const cp=el("button",{textContent:"copiar"});
+      cp.addEventListener("click",()=>navigator.clipboard.writeText(url));
+      out.append(cp); nm.value=""; renderList();
+    }catch(e){ out.innerHTML=`<span class="err">${e.message}</span>`; }
+  });
+  mk.append(el("div",{className:"row"},[fsel,usel,nm,btn]),out); pane.append(mk);
+
+  const lc=el("div",{className:"card"});
+  lc.append(el("h2",{textContent:"MCPs activos"}));
+  const box=el("div"); lc.append(box); pane.append(lc);
+  function renderList(){
+    jget("/mcp/tokens").then(({tokens})=>{
+      if(!tokens.length){ box.innerHTML=`<div class="muted">No hay MCPs. Creá el primero arriba.</div>`; return; }
+      const t=el("table");
+      t.append(el("tr",{},["Nombre","Carpeta","Usuario","Creado","Último uso","Acciones"].map(h=>el("th",{textContent:h}))));
+      for(const k of tokens){
+        const cp=el("button",{textContent:"copiar URL"});
+        cp.addEventListener("click",()=>navigator.clipboard.writeText(location.origin+k.path));
+        const rv=el("button",{className:"danger",textContent:"revocar"});
+        rv.addEventListener("click",async()=>{
+          if(confirm(`¿Revocar el MCP «${k.name||k.folderName}»? La URL deja de funcionar.`)){
+            try{ await jpost("/mcp/tokens/revoke",{id:k.id}); renderList(); }catch(e){ alertErr(e); }
+          }
+        });
+        t.append(el("tr",{},[
+          el("td",{},el("b",{textContent:k.name||"(sin nombre)"})),
+          el("td",{textContent:k.folderName}),
+          el("td",{textContent:k.username}),
+          el("td",{className:"muted",textContent:(k.createdAt||"").slice(0,16)}),
+          el("td",{className:"muted",textContent:(k.lastUsed||"—").slice(0,16)}),
+          el("td",{},el("div",{className:"row"},[cp,rv])),
+        ]));
+      }
+      box.innerHTML=""; box.append(t);
+    }).catch(e=>box.innerHTML=`<div class="err">${e.message}</div>`);
+  }
+  renderList();
 }
 
 // ---------- GitHub ----------

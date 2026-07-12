@@ -30,6 +30,7 @@ cambiarla.
 | `DMC_ROOT` | `<HOME>/repo` | root del conector = repo git |
 | `DMC_HOST` | `127.0.0.1` | host |
 | `DMC_PORT` | `8770` | puerto |
+| `DMC_MCP_RATE_MAX` | `120` | requests/min por token MCP (`/mcp/<token>`) |
 
 ## Endpoints (pasos 1–5)
 
@@ -56,8 +57,10 @@ cambiarla.
 | GET | `/versions/diff?id=&a=&b=` | read | diff (sin `a`: HEAD vs working) |
 | POST | `/versions/rollback` | write | restaura a un commit + difunde al room |
 | GET/POST | `/github/*` | admin | connect / status / push / disconnect |
+| POST/GET | `/mcp/tokens` · `/mcp/tokens/revoke` | sesión | emitir/listar/revocar la **URL MCP de una carpeta** (admin puede emitir para otro usuario) |
+| POST | `/mcp/<token>` | **token propio** (sin JWT) | server **MCP** de la carpeta: JSON-RPC `initialize`/`tools/list`/`tools/call` (doc 26 §6) |
 | WS | `/ws?ticket=` | sesión | mirror realtime: `open`/`edit`/`cursor`/`close` (§5) |
-| GET | `/dashboard/` | admin (en la UI) | dashboard estático: usuarios/ACL + repo + versiones + GitHub |
+| GET | `/dashboard/` | admin (en la UI) | dashboard estático: usuarios/ACL + repo + versiones + MCP + GitHub |
 
 El **dashboard** de administración está en `http://<host>:<port>/dashboard/` (`/` redirige ahí).
 
@@ -67,6 +70,15 @@ con **rotación**; cambiar password o deshabilitar **invalida todo** (`token_ver
 **Permisos** (§3): ACL por carpeta `none|read|write` (default sin fila = `none` = ni ve la
 carpeta). El permiso de un proyecto = el de su carpeta. `admin` → write en todo. El **mirror
 en vivo** (crear/editar) va por el **WebSocket**, no por REST.
+
+**MCP por carpeta** (doc 26 §6): desde el dashboard (tab **MCP**) o por REST se genera una
+URL `http(s)://<conector>/mcp/<token>` ligada a **(carpeta, usuario)**. Pegada en un cliente
+MCP (Claude Code: `claude mcp add --transport http micarpeta <url>`; claude.ai: conector
+custom), la IA lista/lee/edita/guarda los proyectos de ESA carpeta y sus archivos (tools
+`fs_*`), siempre con el permiso de la ACL del usuario (con `read` solo ve tools de lectura).
+Escribir un `tree.json` se difunde al room del WS: quien tenga el proyecto abierto ve a la
+IA editar **en vivo**. El token se revoca desde el dashboard; la ACL se re-chequea en cada
+request y hay rate-limit por token.
 
 ---
 
