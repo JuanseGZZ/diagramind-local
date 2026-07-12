@@ -87,8 +87,9 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    """Público: detección del conector + esquema de auth."""
-    return {"status": "ok", "name": config.NAME, "version": config.VERSION, "auth": "jwt"}
+    """Público: detección del conector + esquema de auth (+ flags SaaS, doc 26 §3)."""
+    return {"status": "ok", "name": config.NAME, "version": config.VERSION, "auth": "jwt",
+            "shared": config.SHARED, "folderQuotaMb": config.FOLDER_QUOTA_MB}
 
 
 app.include_router(auth_router)

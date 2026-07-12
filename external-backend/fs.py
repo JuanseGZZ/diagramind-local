@@ -20,6 +20,8 @@ import subprocess
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+import config
+import quota
 import store
 from auth import current_user, require_admin
 from db import connect
@@ -130,6 +132,12 @@ def fs_write(body: FsWriteBody, user: dict = Depends(current_user)):
     _, p = _resolve(body.projectId, body.path)
     if os.path.isdir(p):
         raise HTTPException(status_code=400, detail="path is a directory")
+    fid = quota.folder_of_path(p)            # el target puede estar fuera del root
+    if fid:
+        try:
+            quota.ensure_room(fid, len(body.content.encode("utf-8")), replaces=p)
+        except quota.QuotaExceeded as e:
+            raise HTTPException(status_code=413, detail=str(e))
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p, "w", encoding="utf-8") as f:
         f.write(body.content)
@@ -207,7 +215,7 @@ def fs_grep(projectId: str = Query(...), q: str = Query(...), glob: str = "",
 
 @router.post("/fs/exec")
 def fs_exec(body: FsExecBody, user: dict = Depends(require_admin)):
-    if os.environ.get("DMC_DISABLE_EXEC"):
+    if os.environ.get("DMC_DISABLE_EXEC") or config.SHARED:
         raise HTTPException(status_code=403, detail="exec disabled on this connector")
     base, _ = _resolve(body.projectId, ".")
     try:

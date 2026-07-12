@@ -16,6 +16,7 @@
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+import config
 import git_ops
 import github
 import realtime
@@ -24,6 +25,13 @@ from auth import current_user, require_admin
 from models import CommitBody, GithubConnectBody, IdBody, RollbackBody
 
 router = APIRouter(tags=["versions"])
+
+
+def _no_shared() -> None:
+    """En instancias COMPARTIDAS (SaaS free, doc 26 §3) GitHub del root se deshabilita:
+    es la única feature de alcance root, y el admin es el back central."""
+    if config.SHARED:
+        raise HTTPException(status_code=403, detail="github disabled on shared connector")
 
 
 def _author(user: dict) -> tuple[str, str]:
@@ -93,21 +101,25 @@ async def versions_rollback(body: RollbackBody, user: dict = Depends(current_use
 
 @router.get("/github/status")
 def github_status(_: dict = Depends(require_admin)):
+    _no_shared()
     return github.status()
 
 
 @router.post("/github/connect")
 def github_connect(body: GithubConnectBody, _: dict = Depends(require_admin)):
+    _no_shared()
     github.connect(body.remoteUrl, body.token, body.branch)
     return github.status()
 
 
 @router.post("/github/disconnect")
 def github_disconnect(_: dict = Depends(require_admin)):
+    _no_shared()
     github.disconnect()
     return {"ok": True}
 
 
 @router.post("/github/push")
 def github_push(_: dict = Depends(require_admin)):
+    _no_shared()
     return github.push()

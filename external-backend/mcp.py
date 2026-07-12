@@ -31,6 +31,7 @@ from fastapi.responses import JSONResponse
 import config
 import git_ops
 import github
+import quota
 import realtime
 import store
 from auth import current_user, get_user_by_id
@@ -328,6 +329,7 @@ def _call_tool(ctx: dict, name: str, a: dict):
         _, p = _resolve(ctx, a["path"])
         if os.path.isdir(p):
             raise ToolError("path is a directory")
+        quota.ensure_room(fid, len(a["content"].encode("utf-8")), replaces=p)
         os.makedirs(os.path.dirname(p), exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
             f.write(a["content"])
@@ -414,7 +416,7 @@ async def mcp_endpoint(token: str, request: Request):
         name, args = params.get("name") or "", params.get("arguments") or {}
         try:
             res = _call_tool(ctx, name, args)
-        except ToolError as e:
+        except (ToolError, quota.QuotaExceeded) as e:
             return {"jsonrpc": "2.0", "id": rpc_id, "result": {
                 "content": [{"type": "text", "text": str(e)}], "isError": True}}
         except KeyError as e:

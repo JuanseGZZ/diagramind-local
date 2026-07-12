@@ -27,6 +27,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from auth import consume_ws_ticket
 from projects import read_tree, write_tree
+from quota import QuotaExceeded
 from store import project_permission
 
 router = APIRouter()
@@ -176,6 +177,12 @@ async def ws_endpoint(ws: WebSocket):
                 async with room.lock:
                     try:
                         write_tree(pid, tree)
+                    except QuotaExceeded as e:
+                        # cuota llena: rechazar + reenviar el canónico → revierte lo optimista
+                        await _send(ws, {"t": "error", "code": "quota_exceeded", "detail": str(e)})
+                        await _send(ws, {"t": "state", "projectId": pid,
+                                         "tree": read_tree(pid), "seq": room.seq})
+                        continue
                     except ValueError:
                         await _send(ws, {"t": "error", "code": "bad_tree", "detail": "tree is not valid JSON"})
                         continue

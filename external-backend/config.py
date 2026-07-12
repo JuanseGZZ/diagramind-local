@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.5.0"   # MCP por carpeta: /mcp/tokens + /mcp/<token> (doc 26 §6)
+VERSION = "0.6.0"   # cuota por carpeta + modo compartido (doc 26 §3, SaaS free)
 NAME = "DiagraMind Connector"
 
 
@@ -54,6 +54,12 @@ REPO_ROOT = Path(os.environ.get("DMC_ROOT", HOME / "repo")).resolve()
 # ---- red ----
 HOST = os.environ.get("DMC_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DMC_PORT", "8770"))
+
+# ---- SaaS (doc 26 §3): cuota por carpeta + modo compartido ----
+FOLDER_QUOTA_MB = int(os.environ.get("DMC_FOLDER_QUOTA_MB", "0"))   # 0 = sin cuota; free: 30
+FOLDER_QUOTA_BYTES = FOLDER_QUOTA_MB * 1024 * 1024
+# Instancia COMPARTIDA (free-N): deshabilita GitHub del root y /fs/exec.
+SHARED = os.environ.get("DMC_SHARED", "") not in ("", "0")
 
 # ---- tiempos (segundos) ----
 ACCESS_TTL = 15 * 60            # access JWT corto

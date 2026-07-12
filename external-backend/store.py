@@ -58,6 +58,12 @@ def list_folders() -> list[dict]:
         return [dict(r) for r in c.execute("SELECT * FROM folders ORDER BY name").fetchall()]
 
 
+def get_folder_by_dirname(dirname: str) -> dict | None:
+    with connect() as c:
+        r = c.execute("SELECT * FROM folders WHERE dirname=?", (dirname,)).fetchone()
+        return dict(r) if r else None
+
+
 # ---------------- projects ----------------
 
 def create_project(folder_id: str, name: str, created_by: int) -> dict:

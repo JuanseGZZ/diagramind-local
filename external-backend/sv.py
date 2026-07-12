@@ -14,6 +14,7 @@ import os
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 import fs as fsmod
+import quota
 import sourcever
 import store
 import svgit
@@ -79,10 +80,31 @@ def sv_diff(projectId: str = Query(...), path: str = Query(...), id: str = "",
     return _run(lambda: sourcever.sv_diff(svd, target, id or None, path))
 
 
+def _snapshot_size(target: str) -> int:
+    """Bytes que ocuparía un snapshot del target (mismas reglas que sourcever)."""
+    total = 0
+    for root, dirs, files in os.walk(target):
+        dirs[:] = [d for d in dirs if d not in sourcever.SKIP_DIRS]
+        for f in files:
+            try:
+                s = os.path.getsize(os.path.join(root, f))
+            except OSError:
+                continue
+            if s <= sourcever.MAX_FILE:
+                total += s
+    return total
+
+
 @router.post("/sv/save")
 def sv_save(body: SvSaveBody, user: dict = Depends(current_user)):
     _need(user, body.projectId, "write")
     svd, target = _ctx(body.projectId)
+    fid = quota.folder_of_path(svd)          # el snapshot se escribe DENTRO de la carpeta
+    if fid:
+        try:
+            quota.ensure_room(fid, _snapshot_size(target))
+        except quota.QuotaExceeded as e:
+            raise HTTPException(status_code=413, detail=str(e))
     return _run(lambda: sourcever.sv_save(svd, target, _author(user, body.author), body.note))
 
 

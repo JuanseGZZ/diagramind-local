@@ -31,6 +31,8 @@ cambiarla.
 | `DMC_HOST` | `127.0.0.1` | host |
 | `DMC_PORT` | `8770` | puerto |
 | `DMC_MCP_RATE_MAX` | `120` | requests/min por token MCP (`/mcp/<token>`) |
+| `DMC_FOLDER_QUOTA_MB` | `0` (sin cuota) | cuota de disco POR CARPETA (SaaS free: 30). Rechaza edits/writes/snapshots que se pasen (WS: `quota_exceeded`; REST: 413; MCP: isError). Borrar siempre pasa. |
+| `DMC_SHARED` | (off) | instancia COMPARTIDA (SaaS free): deshabilita `/github/*` del root y `/fs/exec` (403). El commit local de Guardar sigue funcionando. |
 
 ## Endpoints (pasos 1–5)
 
