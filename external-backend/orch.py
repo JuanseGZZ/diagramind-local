@@ -878,18 +878,29 @@ def control_tools(graph, node_id):
             {"agente": {"type": "string", "description": "nombre del subordinado (opcional; default: vos)"}})),
     ]
     if delega_targets(graph, node_id):
-        tools.insert(0, dict(name="delegar", **_s(
-            f"Delegá trabajo a subordinados directos y ESPERÁ su(s) respuesta(s) (podés delegar a: {names}). "
-            "Para UNO usá `agente`; para VARIOS EN PARALELO usá `agentes` y elegí `join`: \"todos\" te despierta "
-            "UNA vez con todas las respuestas juntas (default, para validar en conjunto) o \"cada_una\" te "
-            "despierta con CADA respuesta a medida que llega. El mensaje debe ser concreto y verificable.",
-            {"agente": {"type": "string", "description": "nombre del agente destino (delegación simple)"},
-             "agentes": {"type": "array", "items": {"type": "string"},
-                         "description": "varios destinos: trabajan EN PARALELO"},
-             "mensaje": {"type": "string", "description": "qué tienen que hacer, con el contexto necesario"},
-             "join": {"type": "string", "enum": ["todos", "cada_una"],
-                      "description": "cómo te despierto si delegás a varios (default: todos)"}},
-            ["mensaje"])))
+        node = graph["nodos"].get(int(node_id)) or {}
+        if (node.get("data") or {}).get("secuencial"):
+            # agente SECUENCIAL (decisión W): delega de a UNO, nunca forkea
+            tools.insert(0, dict(name="delegar", **_s(
+                f"Delegá trabajo a UN subordinado directo y ESPERÁ su respuesta (podés delegar a: {names}). "
+                "Sos un agente SECUENCIAL: delegás de a UNO por vez, nunca en paralelo — si necesitás a "
+                "varios, andá uno por uno esperando cada respuesta. El mensaje debe ser concreto y verificable.",
+                {"agente": {"type": "string", "description": "nombre del agente destino"},
+                 "mensaje": {"type": "string", "description": "qué tiene que hacer, con el contexto necesario"}},
+                ["agente", "mensaje"])))
+        else:
+            tools.insert(0, dict(name="delegar", **_s(
+                f"Delegá trabajo a subordinados directos y ESPERÁ su(s) respuesta(s) (podés delegar a: {names}). "
+                "Para UNO usá `agente`; para VARIOS EN PARALELO usá `agentes` y elegí `join`: \"todos\" te despierta "
+                "UNA vez con todas las respuestas juntas (default, para validar en conjunto) o \"cada_una\" te "
+                "despierta con CADA respuesta a medida que llega. El mensaje debe ser concreto y verificable.",
+                {"agente": {"type": "string", "description": "nombre del agente destino (delegación simple)"},
+                 "agentes": {"type": "array", "items": {"type": "string"},
+                             "description": "varios destinos: trabajan EN PARALELO"},
+                 "mensaje": {"type": "string", "description": "qué tienen que hacer, con el contexto necesario"},
+                 "join": {"type": "string", "enum": ["todos", "cada_una"],
+                          "description": "cómo te despierto si delegás a varios (default: todos)"}},
+                ["mensaje"])))
     return tools
 
 
@@ -1089,9 +1100,14 @@ def build_system(ctx, graph, node, notes):
     ]
     targets = delega_targets(graph, nid)
     if targets:
-        partes.append("SUBORDINADOS (podés delegarles con la tool `delegar` — a varios EN PARALELO con "
-                      "`agentes` — y esperás su(s) respuesta(s)): " +
-                      "; ".join(f"«{t.get('titulo') or t['id']}» ({(t.get('data') or {}).get('rol', '')[:80]})" for t in targets))
+        if d.get("secuencial"):
+            partes.append("SUBORDINADOS (sos SECUENCIAL: delegás de a UNO por vez con `delegar` y esperás "
+                          "cada respuesta — nunca en paralelo): " +
+                          "; ".join(f"«{t.get('titulo') or t['id']}» ({(t.get('data') or {}).get('rol', '')[:80]})" for t in targets))
+        else:
+            partes.append("SUBORDINADOS (podés delegarles con la tool `delegar` — a varios EN PARALELO con "
+                          "`agentes` — y esperás su(s) respuesta(s)): " +
+                          "; ".join(f"«{t.get('titulo') or t['id']}» ({(t.get('data') or {}).get('rol', '')[:80]})" for t in targets))
     if notes:
         partes.append("TUS RECURSOS (tools con el prefijo indicado):\n" + "\n".join(notes))
     if (d.get("memoria") or {}).get("enabled", True):
@@ -1294,6 +1310,9 @@ def _do_delegar(ctx, graph, run, frame, node, inp):
         if t["id"] not in ids:
             ids.add(t["id"])
             targets.append(t)
+    if len(targets) > 1 and (node.get("data") or {}).get("secuencial"):
+        return ("sos un agente SECUENCIAL (lo definió el humano): delegá de a UNO con `agente` "
+                "y esperá cada respuesta antes de la siguiente")
     join = "cada_una" if str(inp.get("join") or "").strip().lower() in ("cada_una", "cada una") else "todos"
     msg = str(inp.get("mensaje") or "")
     frame["join"], frame["collected"] = join, []
