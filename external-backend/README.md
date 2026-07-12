@@ -33,6 +33,26 @@ cambiarla.
 | `DMC_MCP_RATE_MAX` | `120` | requests/min por token MCP (`/mcp/<token>`) |
 | `DMC_FOLDER_QUOTA_MB` | `0` (sin cuota) | cuota de disco POR CARPETA (SaaS free: 30). Rechaza edits/writes/snapshots que se pasen (WS: `quota_exceeded`; REST: 413; MCP: isError). Borrar siempre pasa. |
 | `DMC_SHARED` | (off) | instancia COMPARTIDA (SaaS free): deshabilita `/github/*` del root y `/fs/exec` (403). El commit local de Guardar sigue funcionando. |
+| `DMC_ADMIN_PASSWORD` (o `_FILE`) | (off) | bootstrap NO interactivo: password inicial del admin por env o archivo (Secret). No se imprime ni se escribe a disco. |
+| `DMC_ADMIN_MUST_CHANGE` | `1` | con password por env: `0` = no obliga a cambiarla (free: el admin es el back central); `1` = la obliga (pagas: el dueño la cambia al entrar). |
+
+## Docker (imagen del conector — doc 26 §4)
+
+Todo el estado vive en `/data` (`DMC_HOME`): montarle un volumen persistente (en la
+nube, el PVC del tenant). Instancia **free** de referencia:
+
+```bash
+docker build -t diagramind-connector .
+docker run -d -p 8770:8770 -v conector-data:/data \
+  -e DMC_ADMIN_PASSWORD=... -e DMC_ADMIN_MUST_CHANGE=0 \
+  -e DMC_SHARED=1 -e DMC_FOLDER_QUOTA_MB=30 \
+  diagramind-connector
+```
+
+Para una instancia **paga** (org): sin `DMC_SHARED` ni cuota (la impone el volumen) y
+sin `DMC_ADMIN_MUST_CHANGE` (el dueño cambia la password en su primer ingreso). Corre
+como usuario no-root (`connector`, uid 1000); el repo git se inicializa solo con
+identidad local (los commits funcionan sin config global).
 
 ## Endpoints (pasos 1–5)
 

@@ -8,6 +8,7 @@ Correr:  .venv/bin/python server.py       (o: uvicorn server:app)
 """
 
 import asyncio
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -34,20 +35,37 @@ from versions import router as versions_router
 
 
 def bootstrap_admin() -> None:
-    """Primer arranque: si no hay usuarios, crea un admin con password aleatoria.
+    """Primer arranque: si no hay usuarios, crea el admin.
 
-    La password se escribe en `<HOME>/admin_password.txt` y se imprime en consola.
-    `must_change_pw=1` → al entrar la primera vez, obliga a cambiarla.
+    Interactivo (default): password aleatoria → `<HOME>/admin_password.txt` + consola,
+    `must_change_pw=1` (obliga a cambiarla al entrar).
+
+    NO interactivo (SaaS/docker, doc 26 §4): la password inicial viene por env
+    `DMC_ADMIN_PASSWORD` (o `DMC_ADMIN_PASSWORD_FILE`, p.ej. un Secret montado) y NO
+    se escribe a disco ni se imprime. `DMC_ADMIN_MUST_CHANGE=0` desactiva el cambio
+    obligatorio (instancias free: el admin ES el back central); para las pagas se
+    deja el default 1 y el dueño la cambia en su primer ingreso.
     """
     with connect() as c:
         has_user = c.execute("SELECT 1 FROM users LIMIT 1").fetchone()
         if has_user:
             return
-        pw = random_password()
+        pw = os.environ.get("DMC_ADMIN_PASSWORD") or ""
+        pw_file = os.environ.get("DMC_ADMIN_PASSWORD_FILE")
+        if not pw and pw_file and Path(pw_file).is_file():
+            pw = Path(pw_file).read_text(encoding="utf-8").strip()
+        provided = bool(pw)
+        if not provided:
+            pw = random_password()
+        must_change = 0 if (provided and os.environ.get("DMC_ADMIN_MUST_CHANGE", "1") == "0") else 1
         c.execute(
-            "INSERT INTO users (username, password_hash, role, must_change_pw) VALUES (?,?,?,1)",
-            ("admin", hash_password(pw), "admin"),
+            "INSERT INTO users (username, password_hash, role, must_change_pw) VALUES (?,?,?,?)",
+            ("admin", hash_password(pw), "admin", must_change),
         )
+    if provided:
+        print(f"[connector] admin creado con la password provista por env "
+              f"(must_change_pw={must_change})", flush=True)
+        return
     config.ADMIN_PW_PATH.write_text(pw, encoding="utf-8")
     print("=" * 60)
     print("  ADMIN creado (primer arranque)")
