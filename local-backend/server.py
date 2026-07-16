@@ -62,7 +62,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.22.0"   # IA Orchestrator fase 6: director + webhooks + MCP/API (doc 28)
+VERSION = "0.22.1"   # fix anti-pisada del mirror: /state/write con compare-and-write (mtime+seq)
 
 # ===================== rutas / disco =====================
 
@@ -385,13 +385,14 @@ def _read_tree_file(folder, name):
 
 
 def _emit_state(folder, pid, content):
-    """Agrega un evento de cambio al log (asume STATE_LOCK tomado)."""
+    """Agrega un evento de cambio al log (asume STATE_LOCK tomado). Devuelve el seq."""
     global STATE_SEQ
     STATE_SEQ += 1
     STATE_LOG.append({"seq": STATE_SEQ, "folder": folder, "id": pid,
                       "treeJson": content, "ts": time.time()})
     if len(STATE_LOG) > STATE_LOG_MAX:
         del STATE_LOG[: len(STATE_LOG) - STATE_LOG_MAX]
+    return STATE_SEQ
 
 
 def iter_disk_trees():
@@ -426,10 +427,11 @@ def watch_state(interval=0.5):
                     prev = STATE.get(key)
                     if prev is None or prev["mtime"] != mtime:
                         content = _read_tree_file(folder, tname)
-                        STATE[key] = {"mtime": mtime}
+                        seq = (prev or {}).get("seq", 0)
                         if content is not None:
                             # el evento usa el ID de la web (resuelto vía index.json)
-                            _emit_state(folder, resolve_tree_id(folder, tname), content)
+                            seq = _emit_state(folder, resolve_tree_id(folder, tname), content)
+                        STATE[key] = {"mtime": mtime, "seq": seq}
         except Exception:
             pass
         time.sleep(interval)
@@ -867,7 +869,9 @@ class Handler(BaseHTTPRequestHandler):
         install_skills(folder_dir(folder))        # skills a nivel carpeta (cwd del chat)
         try:                                       # anti-eco: mtime ya visto
             with STATE_LOCK:
-                STATE[_skey(folder, name)] = {"mtime": os.path.getmtime(fp)}
+                key = _skey(folder, name)
+                STATE[key] = {"mtime": os.path.getmtime(fp),
+                              "seq": STATE.get(key, {}).get("seq", 0)}
         except OSError:
             pass
         self._json(200, {"ok": True, "path": tdir})
@@ -1071,7 +1075,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def _state_write(self, body):
         """Write-through de la web: escribe tree.json y marca el mtime como ya
-        visto para que el watcher NO devuelva el eco al que lo escribió."""
+        visto para que el watcher NO devuelva el eco al que lo escribió.
+
+        ANTI-PISADA (bug 2026-07-15): si el archivo tiene un cambio EXTERNO que el
+        watcher aún no consumió (la IA/Claude Code lo escribió hace <0.5s), NO se
+        escribe: se emite ese cambio por SSE y se responde 409. Sin esto, la
+        versión vieja de la web pisaba la de la IA y —peor— el mtime quedaba
+        marcado como visto, así que el cambio externo se perdía en silencio."""
         folder = body.get("folder") or "Local"
         name = body.get("name") or body.get("id")
         tree_json = body.get("treeJson")
@@ -1082,13 +1092,36 @@ class Handler(BaseHTTPRequestHandler):
         os.makedirs(tdir, exist_ok=True)
         text = tree_json if isinstance(tree_json, str) else json.dumps(tree_json, ensure_ascii=False, indent=2)
         fp = os.path.join(tdir, "tree.json")
-        with open(fp, "w", encoding="utf-8") as f:
-            f.write(text)
-        try:
-            with STATE_LOCK:
-                STATE[_skey(folder, name)] = {"mtime": os.path.getmtime(fp)}
-        except OSError:
-            pass
+        key = _skey(folder, name)
+        seen_seq = body.get("seenSeq")               # hasta qué evento del stream VIO la web
+        with STATE_LOCK:
+            cur_mtime = None
+            try:
+                cur_mtime = os.path.getmtime(fp)
+            except OSError:
+                pass
+            prev = STATE.get(key)
+            # conflicto 1: cambio externo que el watcher AÚN no consumió (mtime nuevo)
+            if cur_mtime is not None and prev is not None and cur_mtime != prev["mtime"]:
+                content = _read_tree_file(folder, name)
+                seq = (prev or {}).get("seq", 0)
+                if content is not None:
+                    seq = _emit_state(folder, resolve_tree_id(folder, safe_name(name)), content)
+                STATE[key] = {"mtime": cur_mtime, "seq": seq}
+                self._json(409, {"conflict": True, "error": "external change pending"})
+                return
+            # conflicto 2: el watcher YA emitió un cambio de este archivo que la web
+            # todavía no vio cuando capturó su versión → el write es stale igual
+            if (seen_seq is not None and prev is not None
+                    and prev.get("seq", 0) > int(seen_seq)):
+                self._json(409, {"conflict": True, "error": "stale write (newer change emitted)"})
+                return
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(text)
+            try:
+                STATE[key] = {"mtime": os.path.getmtime(fp), "seq": (prev or {}).get("seq", 0)}
+            except OSError:
+                pass
         self._json(200, {"ok": True})
 
     def _chat(self, body):
