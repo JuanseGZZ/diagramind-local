@@ -51,6 +51,7 @@ from urllib.parse import urlparse, parse_qs
 # módulos desacoplados (ver claude.py / codex.py / gemini.py / cli_base.py / etc.)
 from util import safe_name, safe_file_name
 from runs import RUNS, RUNS_LOCK, SESSION_MAP, new_run, emit
+import docsfs
 import editorfs
 import orchestrator
 import sourcever
@@ -62,7 +63,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.22.1"   # fix anti-pisada del mirror: /state/write con compare-and-write (mtime+seq)
+VERSION = "0.23.0"   # /docs/*: mirror de los blobs del modo documents (doc 30 fase 3)
 
 # ===================== rutas / disco =====================
 
@@ -302,6 +303,25 @@ def sv_context(pid):
                 svd = os.path.join(tree_dir(folder, p.get("name") or pid), "source-versions")
                 return None, svd, target
     return (409, {"error": "el proyecto no está sincronizado (falta en el index de su carpeta)"}), None, None
+
+
+def docs_context(pid):
+    """(err, project_dir) para las operaciones /docs del proyecto `documents` `pid`.
+    Igual que sv_context: ubica el proyecto por su id en el index.json de su carpeta
+    (el mirror ya lo escribió), así el cliente NO manda rutas."""
+    if not pid:
+        return (400, {"error": "falta projectId"}), None
+    try:
+        folders = os.listdir(projects_dir())
+    except OSError:
+        folders = []
+    for folder in folders:
+        if not os.path.isdir(os.path.join(projects_dir(), folder)):
+            continue
+        for p in read_folder_index(folder).get("projects", []):
+            if p.get("id") == pid:
+                return None, tree_dir(folder, p.get("name") or pid)
+    return (409, {"error": "el proyecto no está sincronizado (falta en el index de su carpeta)"}), None
 
 
 def resolve_tree_id(folder, dirname):
@@ -563,6 +583,27 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    def _read_raw(self):
+        """Cuerpo binario crudo (blobs del modo documents: sin base64, 33% menos)."""
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
+
+    def _bin(self, data):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self._cors()
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _docs(self, pid, fn):
+        """Resuelve el dir del proyecto documents y corre la operación."""
+        err, pdir = docs_context(pid)
+        if err:
+            self._json(*err)
+            return None
+        return fn(pdir)
+
     # --- verbos ----------------------------------------------------------
     def do_OPTIONS(self):
         self.send_response(204)
@@ -658,6 +699,18 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._gh(lambda: svgit.gh_log(gh_conn_of(pid), target,
                                               int(q.get("n", ["20"])[0])))
+        # --- modo documents (doc 30 fase 3): blobs por hash ---
+        elif path == "/docs/list":
+            self._docs(q.get("projectId", [None])[0],
+                       lambda pdir: self._json(*docsfs.docs_list(pdir)))
+        elif path == "/docs/get":
+            def _get(pdir):
+                code, body = docsfs.docs_get(pdir, q.get("hash", [None])[0])
+                if code == 200:
+                    self._bin(body["bytes"])       # bytes crudos (sin base64)
+                else:
+                    self._json(code, body)
+            self._docs(q.get("projectId", [None])[0], _get)
         # --- IA Orchestrator (doc 28, fase 2) ---
         elif path == "/orch/state":
             self._orch(q.get("projectId", [None])[0], lambda ctx: orchestrator.get_state(ctx))
@@ -791,6 +844,23 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._gh(lambda: svgit.gh_pull(gh_conn_of(b.get("projectId")), target,
                                                b.get("ref"), svd, b.get("author") or "usuario"))
+        # --- modo documents (doc 30 fase 3) ---
+        elif path == "/docs/put":
+            # cuerpo = BYTES crudos del blob; el hash viaja en la query y se
+            # VERIFICA contra el sha256 real antes de escribir (decisión D)
+            q = parse_qs(urlparse(self.path).query)
+            data = self._read_raw()
+            self._docs(q.get("projectId", [None])[0],
+                       lambda pdir: self._json(*docsfs.docs_put(pdir, q.get("hash", [None])[0], data)))
+        elif path == "/docs/delete":
+            b = self._read_json()
+            self._docs(b.get("projectId"),
+                       lambda pdir: self._json(*docsfs.docs_delete(pdir, b.get("hash"))))
+        elif path == "/docs/gc":
+            # la web manda los hashes del manifiesto; el disco borra lo que sobra
+            b = self._read_json()
+            self._docs(b.get("projectId"),
+                       lambda pdir: self._json(*docsfs.docs_gc(pdir, b.get("keep"))))
         # --- IA Orchestrator (doc 28, fase 2) ---
         elif path == "/orch/run":
             b = self._read_json()
