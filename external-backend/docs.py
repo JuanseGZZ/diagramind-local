@@ -102,4 +102,10 @@ def docs_delete(body: DocsHashBody, user: dict = Depends(current_user)):
 @router.post("/docs/gc")
 def docs_gc(body: DocsGcBody, user: dict = Depends(current_user)):
     _need(user, body.projectId, "write")
-    return _out(docsfs.docs_gc(_project_dir(body.projectId), body.keep))
+    pdir = _project_dir(body.projectId)
+    out = _out(docsfs.docs_gc(pdir, body.keep))
+    if body.names is not None:
+        # vista legible `documents/by-name/` (doc 30 fase 5): nombres reales con
+        # extensión, hardlinkeados a los blobs — para la IA y para el usuario
+        out["linked"] = docsfs.docs_link_names(pdir, body.names)
+    return out

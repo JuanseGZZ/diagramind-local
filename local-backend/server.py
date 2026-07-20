@@ -63,7 +63,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.23.0"   # /docs/*: mirror de los blobs del modo documents (doc 30 fase 3)
+VERSION = "0.24.0"   # documents: vista legible by-name/ para la IA (doc 30 fase 5)
 
 # ===================== rutas / disco =====================
 
@@ -857,10 +857,16 @@ class Handler(BaseHTTPRequestHandler):
             self._docs(b.get("projectId"),
                        lambda pdir: self._json(*docsfs.docs_delete(pdir, b.get("hash"))))
         elif path == "/docs/gc":
-            # la web manda los hashes del manifiesto; el disco borra lo que sobra
+            # la web manda los hashes del manifiesto; el disco borra lo que sobra.
+            # Si además manda `names` (nombre+carpeta virtual de cada doc), se
+            # regenera la vista legible `documents/by-name/` (doc 30 fase 5).
             b = self._read_json()
-            self._docs(b.get("projectId"),
-                       lambda pdir: self._json(*docsfs.docs_gc(pdir, b.get("keep"))))
+            def _gc(pdir):
+                code, body = docsfs.docs_gc(pdir, b.get("keep"))
+                if code == 200 and isinstance(b.get("names"), list):
+                    body["linked"] = docsfs.docs_link_names(pdir, b["names"])
+                self._json(code, body)
+            self._docs(b.get("projectId"), _gc)
         # --- IA Orchestrator (doc 28, fase 2) ---
         elif path == "/orch/run":
             b = self._read_json()

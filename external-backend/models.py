@@ -106,6 +106,8 @@ class DocsHashBody(BaseModel):
 class DocsGcBody(BaseModel):
     projectId: str
     keep: list[str] = []         # hashes que el manifiesto sigue referenciando
+    # nombre + carpeta virtual de cada doc → regenera la vista legible by-name/
+    names: list[dict] | None = None
 
 
 class SvSaveBody(BaseModel):

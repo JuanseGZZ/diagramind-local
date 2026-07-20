@@ -798,7 +798,7 @@ def make_adapter(ctx, node):
     if provider == "anthropic":
         if not keys.get("anthropic"):
             raise OrchError(400, f"el nodo «{node.get('titulo')}» usa Anthropic y no llegó esa API key")
-        return AnthropicChat(keys["anthropic"], ia.get("model") or "claude-sonnet-4-6", ia.get("effort"))
+        return AnthropicChat(keys["anthropic"], ia.get("model") or "claude-sonnet-5", ia.get("effort"))
     if provider == "openai":
         if not keys.get("openai"):
             raise OrchError(400, f"el nodo «{node.get('titulo')}» usa OpenAI y no llegó esa API key")

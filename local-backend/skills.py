@@ -53,7 +53,8 @@ SKILLS = dict([
         "- `treeQuestionary` → ver `diagramind-treequestionary`\n"
         "- `activities` → ver `diagramind-activities`\n"
         "- `object` → ver `diagramind-object`\n"
-        "- `editor` → ver `diagramind-editor` (NO es un diagrama: apunta a una carpeta real)\n\n"
+        "- `editor` → ver `diagramind-editor` (NO es un diagrama: apunta a una carpeta real)\n"
+        "- `documents` → ver `diagramind-documents` (NO es un diagrama: biblioteca de archivos)\n\n"
         "Común a todos:\n"
         "- `attachments`: mapa `{ \"<aid>\": { \"name\", \"mime\" } }` (adjuntos; "
         "  los bytes van aparte, NO los toques).\n"
@@ -371,6 +372,47 @@ SKILLS = dict([
         "   pidieron y nada más.\n"
         "6. Al editar respetá diagramind-format (ids enteros únicos, contadores, "
         "   campos exactos) y conservá lo que no te pidieron tocar.",
+    ),
+    _skill(
+        "diagramind-documents",
+        "Tipo `documents`: biblioteca de documentos (PDF/texto/imágenes) del usuario. "
+        "Leer si el proyecto en foco es tipo documents o si te piden algo de sus PDFs.",
+        "# Tipo documents (biblioteca de documentos)\n\n"
+        "Un proyecto `documents` (doc 30) NO es un diagrama: es una **biblioteca de "
+        "archivos** del usuario (PDFs, textos, imágenes, audio). Su `tree.json` es un "
+        "**manifiesto** — metadatos, sin bytes:\n\n"
+        "```json\n"
+        "{ \"type\": \"documents\",\n"
+        "  \"dirs\": [\"papers\"],\n"
+        "  \"docs\": [ { \"id\": 1, \"name\": \"informe.pdf\", \"mime\": \"application/pdf\",\n"
+        "               \"size\": 182734, \"hash\": \"<sha256>\", \"dir\": \"papers\" } ] }\n"
+        "```\n\n"
+        "## Dónde están los archivos de verdad\n\n"
+        "Los bytes viven **al lado del tree.json**, en la carpeta del proyecto:\n\n"
+        "- `documents/<sha256>` → el archivo real, nombrado por el hash de su contenido "
+        "(así se deduplica y se verifica en los mirrors). **Sin extensión.**\n"
+        "- `documents/by-name/<carpeta virtual>/<nombre real>` → **la vista que te "
+        "conviene**: los mismos archivos con su nombre y extensión de verdad (hardlinks, "
+        "no ocupan espacio). Se regenera en cada sincronización.\n\n"
+        "**Para leer un documento del usuario usá `documents/by-name/…`** — ahí "
+        "`informe.pdf` es un PDF con nombre y extensión, y tu tool de lectura lo maneja "
+        "normal. El `tree.json` te dice qué hay y en qué carpeta virtual está.\n\n"
+        "## Reglas\n\n"
+        "1. **No edites el manifiesto para agregar o borrar archivos**: los sube el "
+        "usuario desde la web (o se bajan del conector). Si te piden \"agregá este PDF\", "
+        "explicá que lo tiene que cargar él en el modo Documents.\n"
+        "2. **No toques `documents/`**: ni renombres ni borres blobs. La web es la dueña "
+        "del contenido; el próximo sync podaría lo que no está en el manifiesto.\n"
+        "3. Un PDF **escaneado** no tiene texto extraíble (son imágenes): decilo, no "
+        "inventes contenido.\n"
+        "4. Si un documento figura en el manifiesto pero **no está en disco** (no aparece "
+        "en `documents/by-name/`), es que TODAVÍA NO SE SINCRONIZÓ. En ese caso: **NO lo "
+        "busques en ningún otro lado** (ni Google Drive, ni la web, ni otras carpetas, ni "
+        "pidas permisos de nada: el archivo NO está en esta máquina). Decíselo al usuario y "
+        "pedile que abra ese proyecto en la app con el software local conectado — al abrirlo "
+        "se sincroniza solo — y que después te lo vuelva a pedir. Nunca inventes el contenido "
+        "ni supongas de qué trata por el nombre.\n"
+        "5. Citá los documentos por su **nombre** (y la página, en PDFs), nunca por hash.",
     ),
 ])
 

@@ -16,8 +16,10 @@ que editorfs.py / sourcever.py.
 
 import hashlib
 import os
+import shutil
 
 DOCS_DIRNAME = "documents"
+BYNAME_DIRNAME = "by-name"             # vista legible (hardlinks) para la IA y el usuario
 MAX_BLOB = 200 * 1024 * 1024          # 200 MB por blob (la web corta antes, en 100)
 HASH_LEN = 64                          # sha256 hex
 
@@ -115,6 +117,54 @@ def docs_delete(project_dir, h):
         return 200, {"ok": True}
     except OSError as e:
         return 500, {"error": str(e)}
+
+
+def _safe_component(part):
+    """Un tramo de ruta seguro: sin separadores, sin `..`, sin vacíos."""
+    part = str(part or "").replace("\\", "/").split("/")[-1].strip()
+    if part in ("", ".", ".."):
+        return ""
+    return "".join(c for c in part if c not in '\0:*?"<>|')
+
+
+def docs_link_names(project_dir, entries):
+    """Reconstruye `<documents>/by-name/` : una vista LEGIBLE de la biblioteca —
+    los nombres reales (con extensión) y las carpetas virtuales del manifiesto,
+    apuntando a los blobs con **hardlinks** (mismo filesystem → no ocupan espacio).
+
+    Es lo que hace usable la biblioteca para un agente que mira el disco (Claude
+    Code con `--add-dir`): `documents/<hash>` no dice nada, `by-name/papers/
+    informe.pdf` sí. Se REGENERA entera en cada sync, así nunca queda desfasada.
+    """
+    root = os.path.join(docs_dir(project_dir), BYNAME_DIRNAME)
+    shutil.rmtree(root, ignore_errors=True)
+    made = 0
+    for e in entries or []:
+        h = str((e or {}).get("hash") or "").lower()
+        if not valid_hash(h):
+            continue
+        src = blob_path(project_dir, h)
+        if not os.path.isfile(src):
+            continue                      # todavía no se subió: no hay a qué linkear
+        name = _safe_component((e or {}).get("name") or h[:12])
+        if not name:
+            continue
+        parts = [p for p in (_safe_component(x) for x in str((e or {}).get("dir") or "").split("/")) if p]
+        dest_dir = os.path.join(root, *parts)
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+            dest = os.path.join(dest_dir, name)
+            if os.path.exists(dest):      # dos docs con el mismo nombre en la misma carpeta
+                stem, ext = os.path.splitext(name)
+                dest = os.path.join(dest_dir, f"{stem}-{h[:6]}{ext}")
+            try:
+                os.link(src, dest)        # hardlink: sin duplicar bytes
+            except OSError:
+                shutil.copy2(src, dest)   # otro filesystem / FS sin links: copia
+            made += 1
+        except OSError:
+            pass
+    return made
 
 
 def docs_gc(project_dir, keep_hashes):
