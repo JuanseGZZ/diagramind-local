@@ -9,6 +9,7 @@ Correr:  .venv/bin/python server.py       (o: uvicorn server:app)
 
 import asyncio
 import os
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -130,7 +131,11 @@ def root():
 
 # Dashboard estático (admin): usuarios/ACL + repo + versiones + GitHub.
 # El JS llama a los mismos endpoints REST (mismo origen). Ver dashboard/index.html.
-_DASH = Path(__file__).resolve().parent / "dashboard"
+# Congelado con PyInstaller (--onefile): los datos van a `sys._MEIPASS` (el dir temporal
+# de extracción), no junto al script. Ver externos/.github/workflows/release-connector.yml
+# (--add-data dashboard). En dev es el dir del módulo.
+_BASE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+_DASH = _BASE / "dashboard"
 app.mount("/dashboard", StaticFiles(directory=str(_DASH), html=True), name="dashboard")
 
 

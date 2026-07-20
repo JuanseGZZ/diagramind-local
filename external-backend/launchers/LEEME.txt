@@ -1,0 +1,45 @@
+DiagraMind — Conector externo (versión script, requiere Python 3)
+==================================================================
+
+El conector es un SERVIDOR MULTIUSUARIO: es la "fuente de verdad" de un repo de
+proyectos compartido entre varias personas (auth, permisos por carpeta, versionado
+git, dashboard de administración y URLs MCP para la IA).
+
+Esta carpeta trae el conector en su forma liviana: el código Python + lanzadores.
+Necesitás Python 3 instalado. La primera vez, el lanzador crea un entorno virtual
+(.venv) e instala las dependencias solo (FastAPI, uvicorn, etc.).
+
+REQUISITOS
+----------
+  - Python 3  ->  https://www.python.org/downloads/
+                  (en Windows, marcá "Add Python to PATH")
+  - git instalado (el conector versiona los proyectos con git)
+
+CÓMO INICIARLO
+--------------
+  Windows : doble clic en  iniciar.bat
+  macOS   : doble clic en  iniciar.command   (si no abre: clic derecho -> Abrir)
+  Linux   : en terminal ->  ./iniciar.command
+
+Al primer arranque crea el usuario "admin" con una password aleatoria: la imprime
+en la consola y la deja en el archivo admin_password.txt (dentro del appdir del SO).
+Guardala: la vas a necesitar para entrar al dashboard.
+
+Cuando arranca vas a ver algo como:
+  [connector] DiagraMind Connector v0.6.0
+  dashboard: http://127.0.0.1:8770/dashboard/
+
+Dejá esa ventana abierta. Para administrarlo, abrí esa URL del dashboard.
+Para usarlo desde la web de DiagraMind: agregá el conector por su URL en el panel
+de conectores (Perfil / conectores), con usuario y contraseña.
+
+Para detenerlo: cerrá la ventana o apretá Ctrl+C.
+
+EN UN SERVIDOR (producción)
+---------------------------
+Para exponerlo a internet corré detrás de nginx con HTTPS/WSS (o usá la imagen
+Docker). Ver el README del repo para la config de nginx y las variables de entorno
+(DMC_HOST, DMC_PORT, DMC_HOME, etc.).
+
+¿No querés depender de Python? Usá la versión "Ejecutable (sin Python)" desde el
+mismo botón de descarga en la web.

@@ -1,0 +1,76 @@
+name: Release Connector
+
+# Compila los binarios standalone (sin Python) del CONECTOR EXTERNO para Windows,
+# macOS y Linux y los publica como assets de un GitHub Release marcado *prerelease*.
+#
+# Se dispara al pushear un tag connector-v* (ej. connector-v0.6.0). El backend LOCAL
+# usa tags v* → workflows distintos, versionados independientes, mismo repo.
+#
+# ¿Por qué prerelease? Local y conector comparten repo. GitHub `releases/latest`
+# apunta al release más nuevo NO-prerelease del repo: marcando el conector como
+# prerelease, el `latest` (y las descargas del backend local, que lo usan) nunca se
+# pisa. La web y los instaladores del conector resuelven su versión por la API de
+# GitHub (el release más nuevo con tag connector-v*).
+on:
+  push:
+    tags: ["connector-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write          # necesario para crear el Release
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: windows-latest, name: win,   ext: ".exe", sep: ";" }
+          - { os: macos-latest,   name: mac,   ext: "",     sep: ":" }
+          - { os: ubuntu-latest,  name: linux, ext: "",     sep: ":" }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller -r external-backend/requirements.txt
+      # El conector sirve un dashboard estático (StaticFiles) → va como data en el
+      # bundle (server.py lo busca en sys._MEIPASS al estar congelado). uvicorn/fastapi/
+      # pydantic/websockets/bcrypt importan submódulos dinámicamente → --collect-all.
+      - run: >
+          pyinstaller --onefile --name DiagraMind-Connector-${{ matrix.name }}
+          --add-data "external-backend/dashboard${{ matrix.sep }}dashboard"
+          --collect-all uvicorn
+          --collect-all fastapi
+          --collect-all pydantic
+          --collect-all websockets
+          --collect-all bcrypt
+          --hidden-import multipart
+          external-backend/server.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DiagraMind-Connector-${{ matrix.name }}
+          path: dist/DiagraMind-Connector-${{ matrix.name }}${{ matrix.ext }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')   # solo publica en tags
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generar zip (versión script)
+        run: bash external-backend/build_zip.sh
+      - uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true          # protege el `releases/latest` del backend local
+          files: |
+            artifacts/DiagraMind-Connector-*
+            descargas/Instalar-DiagraMind-Connector-win.bat
+            descargas/Instalar-DiagraMind-Connector-mac.command
+            descargas/Instalar-DiagraMind-Connector-linux.sh
+            descargas/instalar-connector-win.ps1
+            diagramind-connector.zip

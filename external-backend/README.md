@@ -54,6 +54,48 @@ sin `DMC_ADMIN_MUST_CHANGE` (el dueño cambia la password en su primer ingreso).
 como usuario no-root (`connector`, uid 1000); el repo git se inicializa solo con
 identidad local (los commits funcionan sin config global).
 
+## Distribución self-host (ejecutable / instalador / script)
+
+Además de la imagen Docker (SaaS/prod), el conector se ofrece para **auto-hospedar**
+desde la web de DiagraMind (panel **IA → "Download external"**, debajo de "Download
+local"), en las **tres formas** del backend local:
+
+| Forma | Asset del Release | Requisito |
+|---|---|---|
+| **Ejecutable** (Win/Mac/Linux) | `DiagraMind-Connector-<os>` | git instalado (versionado) |
+| **Instalador** (Win/Mac/Linux) | `Instalar-DiagraMind-Connector-<os>` | baja el binario + auto-inicio |
+| **Script .py** | `diagramind-connector.zip` | Python 3 + git |
+
+- El ejecutable lo compila **PyInstaller** (`--onefile`): bundlea las deps
+  (`requirements.txt`) y el `dashboard/` estático (`--add-data`; `server.py` lo busca
+  en `sys._MEIPASS` cuando está congelado). El `.zip` trae el código + un launcher que
+  crea un `.venv` e instala las deps la primera vez.
+- **git** debe estar en el sistema (el conector versiona los proyectos con git por
+  `subprocess`). La imagen Docker ya lo trae; el self-host lo pide en el LEEME/instalador.
+- El server escucha en `127.0.0.1:8770` por default; para exponerlo a internet, nginx +
+  HTTPS/WSS (ver más abajo) o Docker.
+
+### Pipe de release (mismo repo que el local, versionado separado)
+
+El conector **comparte el repo** `diagramind-local` con el backend local, pero tiene su
+**propio workflow y su propio versionado**:
+
+- Local → tags `v*` (`.github/workflows/release.yml`), `VERSION` en `local-backend/server.py`.
+- Conector → tags `connector-v*` (`.github/workflows/release-connector.yml`), `VERSION`
+  en `external-backend/config.py`.
+
+```bash
+# parado en el repo, para publicar el conector:
+git tag connector-v0.6.0 && git push origin connector-v0.6.0
+```
+
+Los releases del conector se marcan **`prerelease: true`**. Motivo: GitHub
+`releases/latest` apunta al release más nuevo **no-prerelease** del repo; el backend
+local sirve sus descargas por `releases/latest/download/…`, así que marcando el conector
+como prerelease **su publicación nunca pisa el `latest` del local**. La web y los
+instaladores del conector resuelven su versión por la **API de GitHub** (el release más
+nuevo con tag `connector-v*`) en vez de `releases/latest`.
+
 ## Endpoints (pasos 1–5)
 
 | Método | Ruta | Quién | Qué |
