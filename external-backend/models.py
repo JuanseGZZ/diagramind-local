@@ -98,6 +98,16 @@ class FsExecBody(BaseModel):
     cmd: str
 
 
+class DocsHashBody(BaseModel):
+    projectId: str
+    hash: str
+
+
+class DocsGcBody(BaseModel):
+    projectId: str
+    keep: list[str] = []         # hashes que el manifiesto sigue referenciando
+
+
 class SvSaveBody(BaseModel):
     projectId: str
     note: str | None = None
