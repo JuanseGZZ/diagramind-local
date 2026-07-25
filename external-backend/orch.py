@@ -5,8 +5,8 @@ Es la segunda implementación del MISMO diseño que corre en el backend local
 fork/join). El orquestador de una carpeta EXTERNA vive y corre ACÁ, server-side
 (decisión M). Divergencias respecto del local, todas por diseño:
 
-- **Cabezas = solo APIs** (Anthropic / OpenAI-compatible). Un nodo con CLI local
-  (Claude Code/Codex/Gemini) → error claro: los CLIs no corren en el server.
+- **Cabezas = solo APIs** (Anthropic / Google / OpenAI-compatible). Un nodo con
+  CLI local (Claude Code/Codex/Gemini) → error claro: no corren en el server.
 - **Solo admin** (decisión Q, enforcement real): TODOS los endpoints /orch/*
   exigen `require_admin`. El run ejecuta las tools de recursos "como" ese admin.
 - **Recursos por namespace canónico** (doc 25 §6): un `agResource` referencia el
@@ -22,7 +22,8 @@ fork/join). El orquestador de una carpeta EXTERNA vive y corre ACÁ, server-side
   autenticado es JWT por header y EventSource no manda headers (doc 25 §10.5).
 
 Storage de runs/memorias/charlas: `<HOME>/orchestrator/<pid>/` (mismo layout que
-el local). Las API keys viven SOLO en RAM (reinicio ⇒ run en error, se relanza).
+el local). Las credenciales son del PROYECTO (keys.json, decisión T) y son VARIAS
+con nombre: cada nodo elige cuál usa (`data.ia.credId`).
 """
 import asyncio
 import hmac
@@ -32,6 +33,7 @@ import secrets
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -203,40 +205,130 @@ def _save(ctx, run):
     _write_json(_run_path(ctx), {k: v for k, v in run.items() if not str(k).startswith("_")})
 
 
-# ===================== API keys DEL ORQUESTADOR (por proyecto) =====================
+# ===================== CREDENCIALES DEL ORQUESTADOR (decisión T) =====================
 # Las credenciales viven EN ESTE CONECTOR (decisión 2026-07-11): el core corre
 # server-side aunque el usuario cierre la web, y no son las keys del chat del
 # usuario. Se guardan en <HOME>/orchestrator/<pid>/keys.json (0600) — FUERA del
-# repo git (nunca se commitean ni viajan por el mirror). Al correr, las del
-# proyecto MANDAN; las del request quedan como fallback (compat).
+# repo git (nunca se commitean ni viajan por el mirror).
+#
+# Desde 2026-07-25 son VARIAS y con NOMBRE (las que el usuario quiera por
+# proveedor) y cada nodo agente elige CUÁL usa (`data.ia.credId`). Forma:
+#     {"creds": [{"id","nombre","provider","key","url"?}], "mcp:<idNodo>": {...}}
+# Las claves legacy por proveedor se MIGRAN a `creds` la primera vez que se leen.
+# Mismo diseño que el backend local (orchestrator.py).
+
+CRED_PROVIDERS = ("anthropic", "google", "openai", "other")
+PROV_LABEL = {"anthropic": "Anthropic", "google": "Google", "openai": "OpenAI", "other": "Otra API"}
+
 
 def _keys_path(ctx):
     return orch_dir(ctx["pid"]) / "keys.json"
 
 
-def keys_read(ctx):
-    return _read_json(_keys_path(ctx), {})
-
-
-def keys_write(ctx, patch):
-    """Setea/borra credenciales por proveedor (valor vacío/None = borrar)."""
-    keys = keys_read(ctx)
-    for prov, val in (patch or {}).items():
-        if prov not in ("anthropic", "openai", "other") and not str(prov).startswith("mcp:"):
-            continue
-        empty = not val or (isinstance(val, dict) and not (val.get("key") or val.get("url")))
-        if empty:
-            keys.pop(prov, None)
-        elif isinstance(val, dict):
-            # merge parcial (p.ej. actualizar solo la URL de "other" sin pisar la key)
-            keys[prov] = {**(keys.get(prov) or {}), **{k: v for k, v in val.items() if v}}
-        else:
-            keys[prov] = val
+def _write_keys(ctx, keys):
     _write_json(_keys_path(ctx), keys)
     try:
         os.chmod(_keys_path(ctx), 0o600)
     except OSError:
         pass
+
+
+def _new_cred_id(creds):
+    used = {c.get("id") for c in creds}
+    n = 1
+    while f"k{n}" in used:
+        n += 1
+    return f"k{n}"
+
+
+def _migrate_keys(keys):
+    """Legacy {proveedor: key} → lista `creds` con nombre. Devuelve (keys, cambió)."""
+    creds = keys.get("creds")
+    changed = not isinstance(creds, list)
+    creds = creds if isinstance(creds, list) else []
+    for prov in ("anthropic", "openai", "other"):
+        if prov not in keys:
+            continue
+        val = keys.pop(prov)
+        changed = True
+        key = val if isinstance(val, str) else (val or {}).get("key")
+        url = (val or {}).get("url") if isinstance(val, dict) else None
+        if not key:
+            continue
+        creds.append({"id": _new_cred_id(creds), "nombre": PROV_LABEL[prov],
+                      "provider": prov, "key": key, **({"url": url} if url else {})})
+    keys["creds"] = creds
+    return keys, changed
+
+
+def keys_read(ctx):
+    keys, changed = _migrate_keys(_read_json(_keys_path(ctx), {}))
+    if changed:
+        _write_keys(ctx, keys)
+    return keys
+
+
+def creds_of(keys, provider=None):
+    """Credenciales utilizables (con key), opcionalmente filtradas por proveedor."""
+    out = [c for c in (keys.get("creds") or []) if isinstance(c, dict) and c.get("key")]
+    return [c for c in out if c.get("provider") == provider] if provider else out
+
+
+def cred_write(ctx, cred):
+    """Alta o edición de una credencial con nombre. En una EDICIÓN sin `key` se
+    conserva la que ya estaba (la UI nunca ve el secreto, solo el hint)."""
+    cred = cred or {}
+    prov = cred.get("provider")
+    if prov not in CRED_PROVIDERS:
+        raise OrchError(400, f"proveedor inválido: {prov!r}")
+    key = (cred.get("key") or "").strip()
+    url = (cred.get("url") or "").strip()
+    nombre = (cred.get("nombre") or "").strip()
+    if prov == "other" and not url:
+        raise OrchError(400, "la credencial de 'Otra API' necesita la URL del endpoint")
+    keys = keys_read(ctx)
+    creds = keys.setdefault("creds", [])
+    cur = next((c for c in creds if c.get("id") == cred.get("id")), None) if cred.get("id") else None
+    if cur is None:
+        if not key:
+            raise OrchError(400, "falta la API key")
+        cur = {"id": _new_cred_id(creds)}
+        creds.append(cur)
+    cur["provider"] = prov
+    if key:
+        cur["key"] = key
+    cur["nombre"] = nombre or PROV_LABEL[prov]
+    if prov == "other":
+        cur["url"] = url
+    else:
+        cur.pop("url", None)
+    _write_keys(ctx, keys)
+    return keys_status(ctx)
+
+
+def cred_delete(ctx, cred_id):
+    keys = keys_read(ctx)
+    keys["creds"] = [c for c in (keys.get("creds") or []) if c.get("id") != cred_id]
+    _write_keys(ctx, keys)
+    return keys_status(ctx)
+
+
+def keys_write(ctx, patch):
+    """Credenciales de nodos MCP/API (`mcp:<idNodo>`): setea/borra (vacío = borrar).
+    Las de los modelos van por cred_write/cred_delete."""
+    keys = keys_read(ctx)
+    for prov, val in (patch or {}).items():
+        if not str(prov).startswith("mcp:"):
+            continue
+        empty = not val or (isinstance(val, dict) and not (val.get("key") or val.get("url")))
+        if empty:
+            keys.pop(prov, None)
+        elif isinstance(val, dict):
+            # merge parcial (p.ej. actualizar solo el header sin pisar la key)
+            keys[prov] = {**(keys.get(prov) or {}), **{k: v for k, v in val.items() if v}}
+        else:
+            keys[prov] = val
+    _write_keys(ctx, keys)
     return keys_status(ctx)
 
 
@@ -245,22 +337,18 @@ def _key_hint(k):
 
 
 def keys_status(ctx):
-    """Estado para la UI: qué proveedores están configurados. NUNCA devuelve los secretos."""
+    """Estado para la UI: las credenciales con su nombre/proveedor/hint (NUNCA el
+    secreto) + las credenciales de los nodos MCP."""
     keys = keys_read(ctx)
-    out = {}
-    for prov in ("anthropic", "openai"):
-        v = keys.get(prov)
-        out[prov] = {"set": bool(v), "hint": _key_hint(v or "")}
-    o = keys.get("other") or {}
-    out["other"] = {"set": bool(o.get("key") and o.get("url")), "url": o.get("url") or "",
-                    "hint": _key_hint(o.get("key") or "")}
+    creds = [{"id": c.get("id"), "nombre": c.get("nombre") or "", "provider": c.get("provider"),
+              "url": c.get("url") or "", "hint": _key_hint(c.get("key") or "")}
+             for c in creds_of(keys)]
     mcp = {}
     for k, v in keys.items():
         if str(k).startswith("mcp:"):
             mcp[str(k).split(":", 1)[1]] = {"set": bool((v or {}).get("key")),
                                             "hint": _key_hint((v or {}).get("key") or "")}
-    out["mcp"] = mcp
-    return {"keys": out}
+    return {"creds": creds, "keys": {"mcp": mcp}}
 
 
 # ===================== MCP / API EXTERNAS (decisión V — salida, fase 6c) =====================
@@ -802,10 +890,70 @@ class AnthropicChat:
              **({"is_error": True} if x.get("is_error") else {})} for x in results]}
 
 
+class GeminiChat:
+    """Google Gemini (generateContent). Transcript nativo: contents con role
+    user/model y parts. Function calling nativo; con thinking, el `thoughtSignature`
+    del functionCall TIENE que volver en el turno siguiente o la API tira 400."""
+    provider = "google"
+    # esfuerzo → thinkingBudget (tokens); "dinámico" = -1 (lo decide el modelo)
+    BUDGET = {"off": 0, "dinámico": -1, "dinamico": -1, "low": 1024, "medium": 8192, "high": 24576}
+
+    def __init__(self, key, model, effort=None):
+        self.key, self.model, self.effort = key, model, effort
+        self.base = os.environ.get("DMO_GOOGLE_BASE",
+                                   "https://generativelanguage.googleapis.com/v1beta/models")
+
+    def tools_spec(self, tools):
+        return [{"functionDeclarations": [
+            {"name": t["name"], "description": t["description"], "parameters": t["schema"]}
+            for t in tools]}]
+
+    def user_msg(self, text):
+        return {"role": "user", "parts": [{"text": text}]}
+
+    def call(self, system, messages, tools):
+        body = {"systemInstruction": {"parts": [{"text": system}]},
+                "contents": messages, "tools": self.tools_spec(tools)}
+        budget = self.BUDGET.get(self.effort) if self.effort else None
+        if budget is not None:
+            body["generationConfig"] = {"thinkingConfig": {"thinkingBudget": budget}}
+        url = f"{self.base}/{self.model}:generateContent?key={urllib.parse.quote(self.key)}"
+        r = _http_json(url, {}, body)
+        parts = ((r.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+        text, calls, keep = "", [], []
+        for i, p in enumerate(parts):
+            if p.get("thought"):
+                continue                      # parte de "pensamiento": no es la respuesta
+            if p.get("text"):
+                text += p["text"]
+                keep.append({"text": p["text"]})
+            elif p.get("functionCall"):
+                fc = p["functionCall"] or {}
+                name = fc.get("name") or ""
+                # el id lleva el NOMBRE adelante: Gemini identifica los resultados por
+                # nombre de función, no por id (ver tool_results_msg)
+                calls.append({"id": f"{name}#{i}", "name": name, "input": fc.get("args") or {}})
+                part = {"functionCall": {"name": name, "args": fc.get("args") or {}}}
+                if p.get("thoughtSignature"):
+                    part["thoughtSignature"] = p["thoughtSignature"]
+                keep.append(part)
+        u = r.get("usageMetadata") or {}
+        return {"text": text, "tool_calls": calls,
+                "usage": {"in": u.get("promptTokenCount", 0), "out": u.get("candidatesTokenCount", 0)},
+                "assistant_msg": {"role": "model", "parts": keep or [{"text": text or ""}]}}
+
+    def tool_results_msg(self, results):
+        # el name sale del id ("<name>#<i>") para que un resultado de CONTROL (que
+        # el motor devuelve con name="control") igual matchee la función llamada
+        return [{"role": "user", "parts": [
+            {"functionResponse": {"name": str(x["id"]).split("#")[0],
+                                  "response": {"result": x["content"]}}} for x in results]}]
+
+
 class OpenAIChat:
     provider = "openai"
 
-    def __init__(self, key, model, effort, base=None):
+    def __init__(self, key, model, effort=None, base=None):
         self.key, self.model = key, model
         self.base = base or os.environ.get("DMO_OPENAI_BASE", "https://api.openai.com/v1/chat/completions")
 
@@ -833,28 +981,46 @@ class OpenAIChat:
         return [{"role": "tool", "tool_call_id": x["id"], "content": x["content"]} for x in results]
 
 
+def pick_cred(keys, node, provider, cred_id):
+    """Resuelve QUÉ credencial usa el nodo: la elegida por id (`ia.credId`) o, si no
+    eligió ninguna (nodos viejos), la primera cargada de ese proveedor."""
+    quien = f"el nodo «{node.get('titulo') or node.get('id')}»"
+    if cred_id:
+        c = next((x for x in creds_of(keys) if x.get("id") == cred_id), None)
+        if c:
+            return c
+        raise OrchError(400, f"{quien} tiene elegida una credencial que ya no existe en este "
+                             "orquestador — elegí otra en el nodo (o cargala con el botón Keys)")
+    disp = creds_of(keys, provider)
+    if not disp:
+        raise OrchError(400, f"{quien} usa {PROV_LABEL.get(provider, provider)} y no hay ninguna "
+                             "credencial de ese proveedor cargada — agregala con el botón Keys y "
+                             "elegila en el nodo")
+    return disp[0]
+
+
 def make_adapter(ctx, node):
     ia = (node.get("data") or {}).get("ia") or {}
     provider = ia.get("provider") or "anthropic"
-    keys = KEYS.get(ctx["pid"]) or {}
+    keys = KEYS.get(ctx["pid"]) or keys_read(ctx)
     if provider in CLI_PROVIDERS:
         raise OrchError(400, f"el nodo «{node.get('titulo')}» usa un CLI local ('{provider}'): en "
                              "conectores EXTERNOS las cabezas son solo APIs (decisión M)")
+    cred = pick_cred(keys, node, provider, ia.get("credId"))
+    provider = cred.get("provider") or provider
+    key = cred.get("key")
     if provider == "anthropic":
-        if not keys.get("anthropic"):
-            raise OrchError(400, f"el nodo «{node.get('titulo')}» usa Anthropic y no llegó esa API key")
-        return AnthropicChat(keys["anthropic"], ia.get("model") or "claude-sonnet-5", ia.get("effort"))
+        return AnthropicChat(key, ia.get("model") or "claude-sonnet-5", ia.get("effort"))
+    if provider == "google":
+        return GeminiChat(key, ia.get("model") or "gemini-2.5-flash", ia.get("effort"))
     if provider == "openai":
-        if not keys.get("openai"):
-            raise OrchError(400, f"el nodo «{node.get('titulo')}» usa OpenAI y no llegó esa API key")
-        return OpenAIChat(keys["openai"], ia.get("model") or "gpt-4o")
+        return OpenAIChat(key, ia.get("model") or "gpt-4o")
     if provider == "other":
-        o = keys.get("other") or {}
-        if not o.get("key") or not o.get("url"):
-            raise OrchError(400, f"el nodo «{node.get('titulo')}» usa 'Otra API' y no llegó su key/URL")
-        return OpenAIChat(o["key"], ia.get("model") or "gpt-4o", None, base=o["url"])
+        if not cred.get("url"):
+            raise OrchError(400, f"la credencial «{cred.get('nombre')}» es de 'Otra API' y no tiene URL")
+        return OpenAIChat(key, ia.get("model") or "gpt-4o", None, base=cred["url"])
     raise OrchError(400, f"el nodo «{node.get('titulo')}» usa el proveedor '{provider}', que este "
-                         "conector no soporta (APIs: Anthropic y OpenAI-compatible)")
+                         "conector no soporta (APIs: Anthropic, Google y OpenAI-compatible)")
 
 
 # ===================== tools =====================
@@ -1339,8 +1505,9 @@ def start_run(ctx, entry_kind, root_node_id, initial_text, api_keys, max_turns=N
                                  "esperá, respondé lo pendiente o matalo")
         graph = load_graph(ctx)
         root = _agent(graph, root_node_id)
-        # las keys DEL PROYECTO mandan; las del request quedan como fallback (compat)
-        KEYS[ctx["pid"]] = {**(api_keys or {}), **keys_read(ctx)}
+        # las credenciales son SIEMPRE las del proyecto (decisión T); `api_keys` del
+        # request se ignora — queda en la firma por compat con webs viejas
+        KEYS[ctx["pid"]] = keys_read(ctx)
         run = {
             "id": "run" + uuid.uuid4().hex[:8], "projectId": ctx["pid"], "entry": entry_kind,
             "status": "running", "rootNodeId": root["id"], "final": None, "error": None,
@@ -1772,7 +1939,9 @@ class OrchNodeBody(BaseModel):
 
 class OrchKeysBody(BaseModel):
     projectId: str
-    keys: dict
+    keys: dict | None = None          # credenciales de nodos MCP (`mcp:<idNodo>`)
+    cred: dict | None = None          # alta/edición de una credencial con nombre
+    deleteCredId: str | None = None
 
 
 def _orch(pid, user, fn):
@@ -1926,6 +2095,10 @@ def orch_keys_get(projectId: str = Query(...), user: dict = Depends(require_admi
 
 @router.post("/orch/keys")
 def orch_keys_set(body: OrchKeysBody, user: dict = Depends(require_admin)):
+    if body.cred:
+        return _orch(body.projectId, user, lambda ctx: cred_write(ctx, body.cred))
+    if body.deleteCredId:
+        return _orch(body.projectId, user, lambda ctx: cred_delete(ctx, body.deleteCredId))
     return _orch(body.projectId, user, lambda ctx: keys_write(ctx, body.keys or {}))
 
 

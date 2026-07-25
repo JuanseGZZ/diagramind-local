@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.6.0"   # cuota por carpeta + modo compartido (doc 26 §3, SaaS free)
+VERSION = "0.7.0"   # orquestador: VARIAS API keys con nombre por proyecto + cabeza Google (doc 28 T)
 NAME = "DiagraMind Connector"
 
 

@@ -63,7 +63,7 @@ from clis import CLIS, run_cli
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 NAME = "diagramind-local"
-VERSION = "0.24.0"   # documents: vista legible by-name/ para la IA (doc 30 fase 5)
+VERSION = "0.25.0"   # orquestador: VARIAS API keys con nombre por proyecto + cabeza Google (doc 28 T)
 
 # ===================== rutas / disco =====================
 
@@ -906,8 +906,13 @@ class Handler(BaseHTTPRequestHandler):
             self._orch(b.get("projectId"), lambda ctx: orchestrator.kill(ctx))
         elif path == "/orch/keys":
             b = self._read_json()
-            self._orch(b.get("projectId"),
-                       lambda ctx: orchestrator.keys_write(ctx, b.get("keys") or {}))
+            def _keys(ctx):
+                if b.get("cred"):                 # alta/edición de una credencial con nombre
+                    return orchestrator.cred_write(ctx, b["cred"])
+                if b.get("deleteCredId"):
+                    return orchestrator.cred_delete(ctx, b["deleteCredId"])
+                return orchestrator.keys_write(ctx, b.get("keys") or {})
+            self._orch(b.get("projectId"), _keys)
         elif path == "/orch/hookreg":
             b = self._read_json()
             def _hr(ctx):
