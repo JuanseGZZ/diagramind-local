@@ -73,7 +73,7 @@ def claude_version(claude_bin):
 
 
 def map_model(m):
-    """La web manda ids tipo claude-opus-4-8; el CLI prefiere alias."""
+    """La web manda ids tipo claude-opus-5; el CLI prefiere alias."""
     if not m:
         return "sonnet"
     low = m.lower()
