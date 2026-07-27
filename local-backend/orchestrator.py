@@ -2625,7 +2625,7 @@ def _tool_sources(ctx, graph, node_id):
         meta = ctx["project_meta"](rpid)
         src[f"r{r['id']}"] = {"origin": "resource", "nodeId": r["id"],
                               "titulo": r.get("titulo"),
-                              "label": (meta or {}).get("name") or "(proyecto borrado)",
+                              "label": (meta or {}).get("name") or "(deleted project)",
                               "tipo": (meta or {}).get("type"),
                               "permiso": (r.get("data") or {}).get("permiso") or "editar",
                               "missing": meta is None}
@@ -2684,40 +2684,38 @@ def inspect_node(ctx, node_id):
                     tools += MCP_FS_WRITE
                 if info["perm"] >= 2:
                     tools += MCP_FS_EXEC
-                refs.append({"origin": "mcp", "label": f"Editor por MCP · {name}",
-                             "note": ("Cada llamada va a /fs de este backend, o sea a editorfs: "
-                                      "rechaza cualquier ruta fuera de la carpeta del editor, "
-                                      "igual que para un agente API."),
+                refs.append({"origin": "mcp", "label": "Editor via MCP", "prefix": name,
+                             "note": ("Every call goes to /fs of this backend, i.e. to editorfs: it rejects "
+                                      "any path outside the editor folder, exactly as for an API agent."),
                              "tools": [{"name": f"mcp__{name}__{t}", "schema": {},
                                         "description": f"{t} sobre ese proyecto editor."}
                                        for t in tools]})
             if add_dirs:
-                refs.append({"origin": "cli", "label": "Nativas de archivos (solo sus diagramas)",
-                             "note": ("Habilitadas porque tiene diagramas cableados; sus únicos "
-                                      "--add-dir son esos subdirectorios, así que no alcanzan "
-                                      "nada más."),
+                refs.append({"origin": "cli", "label": "Native file tools (its diagrams only)",
+                             "note": ("Enabled because it has diagrams wired; its only --add-dir are those "
+                                      "subdirectories, so they reach nothing else."),
                              "tools": [{"name": n, "schema": {}, "description": "",
                                         "disabled": False} for n in CLI_DIAGRAM_TOOLS]})
         else:
-            refs.append({"origin": "cli", "label": "Herramientas nativas de Claude Code",
-                         "note": ("Las declara el CLI, no el motor, así que pueden variar con su "
-                                  "versión — esto es una referencia. Lo que sí fija el motor son "
-                                  "los flags: --permission-mode acceptEdits y --disallowedTools."),
+            refs.append({"origin": "cli", "label": "Claude Code native tools",
+                         "note": ("Declared by the CLI, not the engine, so they can change with its "
+                                  "version — this is a reference. What the engine does fix are the "
+                                  "flags: --permission-mode acceptEdits and --disallowedTools."),
                          "tools": [{"name": n, "description": de, "schema": {},
                                     "disabled": n in CLI_DISALLOWED or (n == "Bash" and not exec_ok)}
                                    for n, de in CLI_NATIVE_TOOLS]})
-        refs.append({"origin": "skills", "label": "Skills instaladas en su workspace",
-                     "note": ("`install_skills` las escribe en <workspace>/.claude/skills/ antes "
-                              "de cada turno: el agente las lee cuando le hacen falta. No son "
-                              "tools — son conocimiento (el esquema de cada tipo de diagrama)."),
+        refs.append({"origin": "skills", "label": "Skills installed in its workspace",
+                     "note": ("`install_skills` writes them to <workspace>/.claude/skills/ before "
+                              "every turn: the agent reads them when it needs them. Not tools — "
+                              "they are knowledge (the schema of each diagram type)."),
                      "tools": [{"name": s["name"], "description": s["description"], "schema": {}}
                                for s in _skill_catalog()]})
         off = list(CLI_DISALLOWED) + ([] if exec_ok else ["Bash"])
         base.update({
             "system": _cli_system(ctx, graph, node, notes),
-            "systemNote": ("Se pasa como --append-system-prompt EN CADA TURNO, entero. "
-                           "El transcript NO se reenvía: lo guarda Claude Code y se "
-                           "recupera con --resume <sessionId>."),
+            "systemNote": ("Passed as --append-system-prompt ON EVERY TURN, whole. The transcript "
+                           "is NOT re-sent: Claude Code stores it and recovers it with "
+                           "--resume <sessionId>."),
             # `toolGroups` es SOLO lo que el motor declara (para una cabeza CLI, nada).
             # Lo demás va en `refGroups`: existe y el agente lo usa, pero no lo manda
             # el motor — mantener la distinción es lo que hace confiable a este modal.
@@ -2727,22 +2725,22 @@ def inspect_node(ctx, node_id):
                     # sesión del AGENTE: si hay una guardada, la próxima delegación la
                     # retoma con --resume en vez de arrancar en frío (y pagarlo)
                     "session": cli_session_get(ctx, node["id"]) if _mem_on(node) else None,
-                    "sessionNote": ("La sesión se conserva entre delegaciones y se corta con "
-                                    "«limpiar memoria»." if _mem_on(node) else
-                                    "Memoria apagada: cada delegación arranca sesión nueva."),
+                    "sessionNote": ("The session is kept across delegations and is cut by «clear memory»."
+                                    if _mem_on(node) else
+                                    "Memory is off: every delegation starts a new session."),
                     "confinado": confinado, "permissionMode": "acceptEdits",
                     "disallowed": [] if confinado else off,
                     "execOk": exec_ok,
                     "warning": (
-                        "Confinado: no tiene la carpeta montada. Toda escritura sobre un editor "
-                        "pasa por editorfs (mismo confinamiento que un agente API); las nativas "
-                        "de archivos solo existen si tiene diagramas cableados, y llegan nada más "
-                        "que a esos subdirectorios."
+                        "Confined: the folder is not mounted. Every write to an editor goes "
+                        "through editorfs (the same confinement as an API agent); the native file "
+                        "tools exist only if it has diagrams wired, and they reach nothing but "
+                        "those subdirectories."
                         if confinado else
-                        "No confinado: usa sus tools nativas, acotadas a los --add-dir de abajo — "
-                        "solo los recursos que le cableaste. Ojo: --add-dir no distingue lectura "
-                        "de escritura (un recurso 'leer' no se monta) y Bash puede salirse de "
-                        "ellos, por eso solo la tiene si algún recurso suyo es 'ejecutar'.")},
+                        "Not confined: it uses its native tools, limited to the --add-dir below — "
+                        "only the resources you wired. Careful: --add-dir does not distinguish "
+                        "read from write (a 'leer' resource is not mounted) and Bash can escape "
+                        "them, which is why it only has Bash if one of its resources is 'ejecutar'.")},
         })
         return base
 
@@ -2757,12 +2755,12 @@ def inspect_node(ctx, node_id):
     groups, buckets = [], {}
     for t in rtools + mtools:
         buckets.setdefault(str(t["name"]).split("_")[0], []).append(t)
-    groups.append({"origin": "control", "label": "Control del orquestador",
-                   "note": ("Siempre presentes. `delegar` aparece solo si el nodo tiene "
-                            "flechas `delega` salientes."), "tools": ctrl})
+    groups.append({"origin": "control", "label": "Orchestrator control",
+                   "note": ("Always present. `delegar` shows up only if the node has outgoing "
+                            "`delega` arrows."), "tools": ctrl})
     if otools:
-        groups.append({"origin": "director", "label": "Director (tick 👑)",
-                       "note": "Gestiona ESTE organigrama. Editar nunca dispara runs.",
+        groups.append({"origin": "director", "label": "Director (crown tick)",
+                       "note": "Manages THIS org chart. Editing never triggers runs.",
                        "tools": otools})
     for prefix, tools in buckets.items():
         info = src.get(prefix) or {"origin": "resource", "label": prefix}
@@ -2775,17 +2773,17 @@ def inspect_node(ctx, node_id):
                     for r in resources_of(graph, node["id"])} - {None, "editor"})
     refs = []
     if tipos:
-        refs.append({"origin": "skills", "label": "Esquemas inyectados en el system",
-                     "note": ("No son tools: el motor mete el esquema de estos tipos como "
-                              "TEXTO en el system prompt (pestaña Context), así el agente "
-                              "sabe cómo escribir su tree.json con set_tree."),
+        refs.append({"origin": "skills", "label": "Schemas injected into the system prompt",
+                     "note": ("Not tools: the engine puts these type schemas as TEXT into the "
+                              "system prompt (Context tab), so the agent knows how to write "
+                              "its tree.json with set_tree."),
                      "tools": [{"name": f"diagramind-{t.lower()}", "schema": {},
                                 "description": f"Esquema del tipo {t}."} for t in tipos]})
     base.update({
         "refGroups": refs,
         "system": system,
-        "systemNote": ("Se REARMA y se manda entero en cada turno (rol + subordinados + "
-                       "recursos + memoria + esquemas). Las tools también se recalculan."),
+        "systemNote": ("REBUILT and sent whole on every turn (role + subordinates + resources "
+                       "+ memory + schemas). The tools are recalculated too."),
         "toolGroups": [{**g, "tools": [{"name": t["name"], "description": t["description"],
                                         "schema": t["schema"]} for t in g["tools"]]}
                        for g in groups],

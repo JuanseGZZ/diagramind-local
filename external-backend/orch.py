@@ -2145,7 +2145,7 @@ def _tool_sources(ctx, graph, node_id):
         meta = project_meta(ctx, (r.get("data") or {}).get("projectId"))
         src[f"r{r['id']}"] = {"origin": "resource", "nodeId": r["id"],
                               "titulo": r.get("titulo"),
-                              "label": (meta or {}).get("name") or "(proyecto borrado)",
+                              "label": (meta or {}).get("name") or "(deleted project)",
                               "tipo": (meta or {}).get("type"),
                               "permiso": (r.get("data") or {}).get("permiso") or "editar",
                               "missing": meta is None}
@@ -2187,8 +2187,8 @@ def inspect_node(ctx, node_id):
     if provider in CLI_PROVIDERS:
         # decisión M: en conectores externos no hay CLIs — el run fallaría igual
         base.update({"system": "", "toolGroups": [], "refGroups": [], "notes": [],
-                     "systemNote": ("Este nodo tiene cabeza CLI y el conector externo solo "
-                                    "soporta cabezas de API (decisión M): el run daría error.")})
+                     "systemNote": ("This node has a CLI head and the external connector only supports "
+                                    "API heads (decision M): the run would fail.")})
         return base
 
     ctrl = control_tools(graph, node["id"])
@@ -2202,12 +2202,12 @@ def inspect_node(ctx, node_id):
     groups, buckets = [], {}
     for t in rtools + mtools:
         buckets.setdefault(str(t["name"]).split("_")[0], []).append(t)
-    groups.append({"origin": "control", "label": "Control del orquestador",
-                   "note": ("Siempre presentes. `delegar` aparece solo si el nodo tiene "
-                            "flechas `delega` salientes."), "tools": ctrl})
+    groups.append({"origin": "control", "label": "Orchestrator control",
+                   "note": ("Always present. `delegar` shows up only if the node has outgoing "
+                            "`delega` arrows."), "tools": ctrl})
     if otools:
-        groups.append({"origin": "director", "label": "Director (tick 👑)",
-                       "note": "Gestiona ESTE organigrama. Editar nunca dispara runs.",
+        groups.append({"origin": "director", "label": "Director (crown tick)",
+                       "note": "Manages THIS org chart. Editing never triggers runs.",
                        "tools": otools})
     for prefix, tools in buckets.items():
         info = src.get(prefix) or {"origin": "resource", "label": prefix}
@@ -2219,17 +2219,17 @@ def inspect_node(ctx, node_id):
                     for r in resources_of(graph, node["id"])} - {None, "editor"})
     refs = []
     if tipos:
-        refs.append({"origin": "skills", "label": "Esquemas inyectados en el system",
-                     "note": ("No son tools: el motor mete el esquema de estos tipos como "
-                              "TEXTO en el system prompt (pestaña Context), así el agente "
-                              "sabe cómo escribir su tree.json con set_tree."),
+        refs.append({"origin": "skills", "label": "Schemas injected into the system prompt",
+                     "note": ("Not tools: the engine puts these type schemas as TEXT into the "
+                              "system prompt (Context tab), so the agent knows how to write "
+                              "its tree.json with set_tree."),
                      "tools": [{"name": f"diagramind-{t.lower()}", "schema": {},
                                 "description": f"Esquema del tipo {t}."} for t in tipos]})
     base.update({
         "refGroups": refs,
         "system": system,
-        "systemNote": ("Se REARMA y se manda entero en cada turno (rol + subordinados + "
-                       "recursos + memoria + esquemas). Las tools también se recalculan."),
+        "systemNote": ("REBUILT and sent whole on every turn (role + subordinates + resources "
+                       "+ memory + schemas). The tools are recalculated too."),
         "toolGroups": [{**g, "tools": [{"name": t["name"], "description": t["description"],
                                         "schema": t["schema"]} for t in g["tools"]]}
                        for g in groups],
