@@ -1257,6 +1257,16 @@ def _skill_body(rtype):
     return content.split("---\n", 2)[-1].strip() if content else ""
 
 
+def _has_editor(ctx, graph, node_id):
+    """¿tiene algún recurso EDITOR cableado? Es el único lugar donde puede escribir
+    archivos de código, así que sin uno hay que mandarlo a preguntar."""
+    for r in resources_of(graph, node_id):
+        meta = project_meta(ctx, (r.get("data") or {}).get("projectId"))
+        if meta and meta.get("type") == "editor":
+            return True
+    return False
+
+
 def build_system(ctx, graph, node, notes):
     d = node.get("data") or {}
     nid = node["id"]
@@ -1299,11 +1309,26 @@ def build_system(ctx, graph, node, notes):
         body = _skill_body("orchestrator")
         if body:
             partes.append(f"ESQUEMA del organigrama (para org_view/org_edit):\n{body[:3500]}")
+    # sin recursos no tiene DÓNDE trabajar: que pregunte en vez de improvisar
+    if not notes:
+        partes.append(
+            "NO TENÉS NINGÚN RECURSO ASIGNADO: no hay ningún archivo ni diagrama que puedas "
+            "tocar. Si la tarea implica leer o escribir algo, NO la intentes — usá "
+            "`preguntar_al_usuario` y pedí que te cableen un recurso. Si es solo pensar o "
+            "responder, hacela normal.")
+    elif not _has_editor(ctx, graph, nid):
+        partes.append(
+            "OJO: no tenés ningún recurso EDITOR asignado, así que no tenés dónde escribir "
+            "código ni archivos sueltos — solo los diagramas de arriba. Si lo que te pidieron "
+            "necesita un proyecto de código, preguntá con `preguntar_al_usuario` para que te "
+            "asignen uno en vez de improvisar.")
     partes.append(
-        "REGLAS: 1) Trabajá SOLO en lo que te pidieron. 2) Usá `preguntar_al_usuario` ante decisiones "
-        "importantes o contexto faltante. 3) Cerrá SIEMPRE tu turno con `responder` (resumen concreto y "
-        "verificable). 4) Antes de editar un diagrama mirá su JSON actual (view_tree) y respetá su esquema "
-        "EXACTO. 5) Respondé en español."
+        "REGLAS: 1) Trabajá SOLO en lo que te pidieron. 2) Todo el trabajo sobre archivos va DENTRO "
+        "de tus recursos, con SUS tools: son el único lugar donde podés escribir y donde el usuario "
+        "puede revisar y deshacer lo que hiciste. 3) Usá `preguntar_al_usuario` ante decisiones "
+        "importantes o contexto faltante. 4) Cerrá SIEMPRE tu turno con `responder` (resumen concreto y "
+        "verificable). 5) Antes de editar un diagrama mirá su JSON actual (view_tree) y respetá su esquema "
+        "EXACTO. 6) Respondé en español."
     )
     return "\n\n".join(partes)
 
@@ -1902,6 +1927,245 @@ def events_since(ctx, since):
     return evs, since + len(evs), run["status"]
 
 
+# ===================== RADIOGRAFÍA DE UN AGENTE (botones Context / Tools) =====================
+# Espejo de `inspect_node` del motor local (doc 28): la web muestra lo que el motor
+# MANDA, calculado con las MISMAS funciones del turno (build_system / control_tools /
+# resource_tools / mcp_tools / org_tools) sobre el grafo del repo. Acá no hay cabezas
+# CLI (decisión M), así que el camino es siempre el de API.
+
+def _norm_blocks(msg):
+    """Normaliza un mensaje de cualquiera de los 3 adapters (Anthropic `content` /
+    Gemini `parts` / OpenAI plano) a {role, blocks:[{kind,name,text}]}."""
+    role = msg.get("role") or "user"
+    content, parts, out = msg.get("content"), msg.get("parts"), []
+    if isinstance(parts, list):                                    # Gemini
+        for p in parts:
+            if p.get("text") is not None:
+                out.append({"kind": "text", "text": p.get("text") or ""})
+            elif p.get("functionCall"):
+                fc = p.get("functionCall") or {}
+                out.append({"kind": "tool_use", "name": fc.get("name") or "",
+                            "text": json.dumps(fc.get("args") or {}, ensure_ascii=False)})
+            elif p.get("functionResponse"):
+                fr = p.get("functionResponse") or {}
+                out.append({"kind": "tool_result", "name": fr.get("name") or "",
+                            "text": str((fr.get("response") or {}).get("result", ""))})
+    elif isinstance(content, list):                                # Anthropic
+        for b in content:
+            kind = b.get("type")
+            if kind == "text":
+                out.append({"kind": "text", "text": b.get("text") or ""})
+            elif kind == "tool_use":
+                out.append({"kind": "tool_use", "name": b.get("name") or "",
+                            "text": json.dumps(b.get("input") or {}, ensure_ascii=False)})
+            elif kind == "tool_result":
+                out.append({"kind": "tool_result", "name": b.get("tool_use_id") or "",
+                            "text": str(b.get("content") or ""), "error": bool(b.get("is_error"))})
+    else:                                                          # OpenAI (content plano)
+        if content:
+            out.append({"kind": "tool_result" if role == "tool" else "text",
+                        "name": msg.get("tool_call_id") or "", "text": str(content)})
+        for tc in (msg.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            out.append({"kind": "tool_use", "name": fn.get("name") or "",
+                        "text": fn.get("arguments") or "{}"})
+    if role in ("assistant", "model"):
+        role = "assistant"
+    elif any(b["kind"] == "tool_result" for b in out):
+        role = "tool"
+    else:
+        role = "user"
+    return {"role": role, "blocks": out, "chars": sum(len(b.get("text") or "") for b in out)}
+
+
+def _transcript_of(ctx, node_id):
+    """Los frames de ESTE nodo en el run vivo o, si no hay, en el último terminado
+    (run.json). Los runs archivados NO guardan frames (ver _archive_run)."""
+    with LOCK:
+        live = RUNS.get(ctx["pid"])
+        src = json.loads(json.dumps({k: v for k, v in live.items()
+                                     if not str(k).startswith("_")})) if live else None
+    is_live = src is not None
+    if src is None:
+        src = _read_json(_run_path(ctx), None)
+    if not src:
+        return None
+    frames = [f for f in (src.get("frames") or {}).values() if int(f["nodeId"]) == int(node_id)]
+    frames.sort(key=lambda f: int(str(f["id"])[1:]))
+    out = []
+    for f in frames:
+        out.append({"frameId": f["id"], "entry": f.get("entry"), "kind": f.get("kind"),
+                    "status": f.get("status"), "parentId": f.get("parentId"),
+                    "firstText": f.get("firstText") or "", "iters": f.get("iters", 0),
+                    "sessionId": f.get("sessionId"),
+                    "messages": [_norm_blocks(m) for m in (f.get("messages") or [])]})
+    return {"runId": src.get("id"), "status": src.get("status"), "live": is_live,
+            "createdAt": src.get("createdAt"), "frames": out}
+
+
+def _stats_of(ctx, node_id):
+    """Pestaña Info: en cuántos runs laburó este nodo y cuánto gastó (acumulado de los
+    runs archivados + el vivo/último) y en qué estado está ahora."""
+    key = str(node_id)
+    zero = {"turns": 0, "in": 0, "out": 0, "usd": 0.0}
+    acc, runs = dict(zero), 0
+
+    def add(dst, sp):
+        for k in ("turns", "in", "out"):
+            dst[k] += sp.get(k, 0) or 0
+        dst["usd"] = round(dst["usd"] + (sp.get("usd", 0.0) or 0.0), 6)
+
+    idx = _read_json(_runs_index_path(ctx), [])
+    for row in idx:
+        data = _read_json(_runs_dir(ctx) / f"{row.get('id')}.json", None)
+        sp = ((data or {}).get("spend") or {}).get(key)
+        if not sp:
+            continue
+        runs += 1
+        add(acc, sp)
+
+    with LOCK:
+        live = RUNS.get(ctx["pid"])
+        cur = json.loads(json.dumps({k: v for k, v in live.items()
+                                     if not str(k).startswith("_")})) if live else None
+    is_live = cur is not None
+    if cur is None:
+        cur = _read_json(_run_path(ctx), None)
+    last = None
+    if cur:
+        sp = (cur.get("spend") or {}).get(key)
+        archived = any(r.get("id") == cur.get("id") for r in idx)
+        if sp:
+            if not archived:
+                runs += 1
+                add(acc, sp)
+            last = {"runId": cur.get("id"), "status": cur.get("status"), "live": is_live,
+                    "createdAt": cur.get("createdAt"), **sp}
+    estado = ((cur or {}).get("nodeStates") or {}).get(key, {}) if is_live else {}
+    return {"runs": runs, "acumulado": acc, "ultimo": last,
+            "estado": estado.get("status") or ("idle" if is_live else None)}
+
+
+def _wiring_of(graph, node_id):
+    """El cableado del nodo tal como lo lee el motor: la fuente de TODO lo que recibe."""
+    nid = int(node_id)
+    inbound = [graph["nodos"].get(int(f["fromId"])) for f in graph["flechas"]
+               if f.get("kind") == "delega" and int(f.get("toId", -1)) == nid]
+    entradas = [f.get("kind") for f in graph["flechas"]
+                if int(f.get("toId", -1)) == nid and f.get("kind") in ("task", "trigger")]
+    return {
+        "delegaA": [{"id": t["id"], "titulo": t.get("titulo")} for t in delega_targets(graph, nid)],
+        "leDelegan": [{"id": n["id"], "titulo": n.get("titulo")} for n in inbound if n],
+        "recursos": [{"id": r["id"], "titulo": r.get("titulo"),
+                      "projectId": (r.get("data") or {}).get("projectId"),
+                      "permiso": (r.get("data") or {}).get("permiso") or "editar"}
+                     for r in resources_of(graph, nid)],
+        "mcps": [{"id": m["id"], "titulo": m.get("titulo"),
+                  "tipo": (m.get("data") or {}).get("tipo")} for m in mcps_of(graph, nid)],
+        "entradas": entradas,
+    }
+
+
+def _tool_sources(ctx, graph, node_id):
+    """prefijo (`r5`/`m8`) → nodo del canvas del que viene la tool."""
+    src = {}
+    for r in resources_of(graph, node_id):
+        meta = project_meta(ctx, (r.get("data") or {}).get("projectId"))
+        src[f"r{r['id']}"] = {"origin": "resource", "nodeId": r["id"],
+                              "titulo": r.get("titulo"),
+                              "label": (meta or {}).get("name") or "(proyecto borrado)",
+                              "tipo": (meta or {}).get("type"),
+                              "permiso": (r.get("data") or {}).get("permiso") or "editar",
+                              "missing": meta is None}
+    for m in mcps_of(graph, node_id):
+        d = m.get("data") or {}
+        src[f"m{m['id']}"] = {"origin": "mcp", "nodeId": m["id"], "titulo": m.get("titulo"),
+                              "label": m.get("titulo") or f"m{m['id']}",
+                              "tipo": d.get("tipo"), "preset": d.get("preset")}
+    return src
+
+
+def inspect_node(ctx, node_id):
+    """System prompt y tools EXACTOS que recibiría este agente si girara ahora, más
+    el transcript de lo que se le mandó. Si algo no aparece acá, el agente NO lo tiene."""
+    graph = load_graph(ctx)
+    node = _agent(graph, node_id)
+    d = node.get("data") or {}
+    ia = d.get("ia") or {}
+    provider = ia.get("provider") or "anthropic"
+    author = f"IA ({node.get('titulo') or node['id']})"
+    mem = mem_read(ctx, node["id"])
+    mchars = mem_chars(ctx, node["id"])
+    base = {
+        "nodeId": node["id"], "titulo": node.get("titulo"),
+        "kind": "cli" if provider in CLI_PROVIDERS else "api",
+        "ia": {"provider": provider, "model": ia.get("model"), "effort": ia.get("effort"),
+               "credId": ia.get("credId")},
+        "director": bool(d.get("director")), "secuencial": bool(d.get("secuencial")),
+        # el system inyecta SOLO las últimas 12 entradas de memoria (build_system)
+        "memoria": {"enabled": (d.get("memoria") or {}).get("enabled", True),
+                    "total": len(mem), "enviadas": min(len(mem), 12),
+                    "chars": mchars, "heavy": mchars > MEM_HEAVY_CHARS, "entries": mem},
+        "wiring": _wiring_of(graph, node["id"]),
+        "stats": _stats_of(ctx, node["id"]),
+        "graph": {"nodos": len(graph["nodos"]), "flechas": len(graph["flechas"])},
+        "transcript": _transcript_of(ctx, node["id"]),
+        "rearmed": True,
+    }
+    if provider in CLI_PROVIDERS:
+        # decisión M: en conectores externos no hay CLIs — el run fallaría igual
+        base.update({"system": "", "toolGroups": [], "refGroups": [], "notes": [],
+                     "systemNote": ("Este nodo tiene cabeza CLI y el conector externo solo "
+                                    "soporta cabezas de API (decisión M): el run daría error.")})
+        return base
+
+    ctrl = control_tools(graph, node["id"])
+    rtools, _rexecs, rnotes = resource_tools(ctx, graph, node["id"], author)
+    mtools, _mexecs, mnotes = mcp_tools(ctx, graph, node["id"])
+    otools = []
+    if d.get("director"):
+        otools, _oexecs = org_tools(ctx, graph, {"id": "inspect"}, node)
+    system = build_system(ctx, graph, node, rnotes + mnotes)
+    src = _tool_sources(ctx, graph, node["id"])
+    groups, buckets = [], {}
+    for t in rtools + mtools:
+        buckets.setdefault(str(t["name"]).split("_")[0], []).append(t)
+    groups.append({"origin": "control", "label": "Control del orquestador",
+                   "note": ("Siempre presentes. `delegar` aparece solo si el nodo tiene "
+                            "flechas `delega` salientes."), "tools": ctrl})
+    if otools:
+        groups.append({"origin": "director", "label": "Director (tick 👑)",
+                       "note": "Gestiona ESTE organigrama. Editar nunca dispara runs.",
+                       "tools": otools})
+    for prefix, tools in buckets.items():
+        info = src.get(prefix) or {"origin": "resource", "label": prefix}
+        groups.append({**info, "prefix": prefix, "tools": tools})
+    # los ESQUEMAS de los tipos no son tools: build_system los inyecta como texto en
+    # el system, por eso el agente sabe escribir un tree.json sin una tool para eso.
+    # Van en refGroups, separados de lo que el motor declara de verdad.
+    tipos = sorted({(project_meta(ctx, (r["data"] or {}).get("projectId")) or {}).get("type")
+                    for r in resources_of(graph, node["id"])} - {None, "editor"})
+    refs = []
+    if tipos:
+        refs.append({"origin": "skills", "label": "Esquemas inyectados en el system",
+                     "note": ("No son tools: el motor mete el esquema de estos tipos como "
+                              "TEXTO en el system prompt (pestaña Context), así el agente "
+                              "sabe cómo escribir su tree.json con set_tree."),
+                     "tools": [{"name": f"diagramind-{t.lower()}", "schema": {},
+                                "description": f"Esquema del tipo {t}."} for t in tipos]})
+    base.update({
+        "refGroups": refs,
+        "system": system,
+        "systemNote": ("Se REARMA y se manda entero en cada turno (rol + subordinados + "
+                       "recursos + memoria + esquemas). Las tools también se recalculan."),
+        "toolGroups": [{**g, "tools": [{"name": t["name"], "description": t["description"],
+                                        "schema": t["schema"]} for t in g["tools"]]}
+                       for g in groups],
+        "notes": rnotes + mnotes,
+    })
+    return base
+
+
 # ===================== endpoints (TODOS solo-admin: decisión Q) =====================
 
 router = APIRouter(tags=["orchestrator"])
@@ -2111,3 +2375,11 @@ def orch_runs(projectId: str = Query(...), user: dict = Depends(require_admin)):
 def orch_rundetail(projectId: str = Query(...), runId: str = Query(...),
                    user: dict = Depends(require_admin)):
     return _orch(projectId, user, lambda ctx: run_detail(ctx, runId))
+
+
+@router.get("/orch/inspect")
+def orch_inspect(projectId: str = Query(...), nodeId: int = Query(...),
+                 user: dict = Depends(require_admin)):
+    # radiografía de un agente: el system y las tools EXACTOS que recibiría si
+    # girara ahora + lo que se le mandó (botones Context / Tools de la web)
+    return _orch(projectId, user, lambda ctx: inspect_node(ctx, nodeId))

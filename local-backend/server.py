@@ -62,6 +62,9 @@ from clis import CLIS, run_cli
 
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+# puerto REAL en el que quedó escuchando (lo fija main()): los agentes CLI confinados
+# del orquestador necesitan la URL propia para hablarle al MCP del editor.
+PORT = DEFAULT_PORT
 NAME = "diagramind-local"
 VERSION = "0.25.0"   # orquestador: VARIAS API keys con nombre por proyecto + cabeza Google (doc 28 T)
 
@@ -276,7 +279,11 @@ def orch_ctx(pid):
     return {
         "pid": pid, "app_dir": app_dir(),
         "graph_path": os.path.join(tree_dir(folder, meta.get("name") or pid), "tree.json"),
-        "work_dir": folder_dir(folder),      # cwd de los agentes CLI (fase 4)
+        "work_dir": folder_dir(folder),      # carpeta del mirror (diagramas-recurso)
+        # para los agentes CLI CONFINADOS (decisión X): sus escrituras van por el MCP
+        # del editor contra ESTE backend, o sea por editorfs con su confinamiento.
+        "local_url": f"http://{HOST}:{PORT}",
+        "local_token": get_token(),
         "tree_path_of": tree_path_of, "sv_dir_of": sv_dir_of, "project_meta": project_meta,
         # el watcher del mirror ya detecta los tree.json tocados (mtime → SSE a la web)
         "notify_edit": lambda rpid: None,
@@ -739,6 +746,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/orch/rundetail":
             self._orch(q.get("projectId", [None])[0],
                        lambda ctx: orchestrator.run_detail(ctx, q.get("runId", [None])[0]))
+        elif path == "/orch/inspect":
+            # radiografía de un agente: el system y las tools EXACTOS que recibiría
+            # si girara ahora + lo que se le mandó (botones Context / Tools)
+            self._orch(q.get("projectId", [None])[0],
+                       lambda ctx: orchestrator.inspect_node(ctx, int(q.get("nodeId", ["0"])[0])))
         else:
             self._json(404, {"error": "not found", "path": path})
 
@@ -1399,6 +1411,8 @@ def main():
     # watcher del state mirror (poll de mtime → SSE)
     threading.Thread(target=watch_state, daemon=True).start()
 
+    global PORT
+    PORT = args.port
     server = ThreadingHTTPServer((HOST, args.port), Handler)
     print(f"DiagraMind local backend v{VERSION} → http://{HOST}:{args.port}")
     print(f"Claude Code: {'OK · ' + (claude_version(cb) or '') if cb else 'NO ENCONTRADO'}")

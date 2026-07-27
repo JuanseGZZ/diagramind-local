@@ -49,10 +49,11 @@ import urllib.request
 import uuid
 
 import subprocess
+import tempfile
 
 import editorfs
 import sourcever
-from claude import EFFORT_THINK, find_claude, map_model
+from claude import EFFORT_THINK, find_claude, map_model, _self_cmd
 from skills import SKILLS as TYPE_SKILLS, install_skills
 from util import safe_name
 
@@ -1218,11 +1219,26 @@ def build_system(ctx, graph, node, notes):
         body = _skill_body("orchestrator")
         if body:
             partes.append(f"ESQUEMA del organigrama (para org_view/org_edit):\n{body[:3500]}")
+    # sin recursos no tiene DÓNDE trabajar: que pregunte en vez de improvisar
+    if not notes:
+        partes.append(
+            "NO TENÉS NINGÚN RECURSO ASIGNADO: no hay ningún archivo ni diagrama que puedas "
+            "tocar. Si la tarea implica leer o escribir algo, NO la intentes — usá "
+            "`preguntar_al_usuario` y pedí que te cableen un recurso. Si es solo pensar o "
+            "responder, hacela normal.")
+    elif not _has_editor(ctx, graph, nid):
+        partes.append(
+            "OJO: no tenés ningún recurso EDITOR asignado, así que no tenés dónde escribir "
+            "código ni archivos sueltos — solo los diagramas de arriba. Si lo que te pidieron "
+            "necesita un proyecto de código, preguntá con `preguntar_al_usuario` para que te "
+            "asignen uno en vez de improvisar.")
     partes.append(
-        "REGLAS: 1) Trabajá SOLO en lo que te pidieron. 2) Usá `preguntar_al_usuario` ante decisiones "
-        "importantes o contexto faltante. 3) Cerrá SIEMPRE tu turno con `responder` (resumen concreto y "
-        "verificable). 4) En proyectos editor, guardá una versión (sv_save) antes de una tanda de cambios. "
-        "5) Respondé en español."
+        "REGLAS: 1) Trabajá SOLO en lo que te pidieron. 2) Todo el trabajo sobre archivos va DENTRO "
+        "de tus recursos, con SUS tools: son el único lugar donde podés escribir y donde el usuario "
+        "puede revisar y deshacer lo que hiciste. 3) Usá `preguntar_al_usuario` ante decisiones "
+        "importantes o contexto faltante. 4) Cerrá SIEMPRE tu turno con `responder` (resumen concreto y "
+        "verificable). 5) En proyectos editor, guardá una versión (sv_save) antes de una tanda de cambios. "
+        "6) Respondé en español."
     )
     return "\n\n".join(partes)
 
@@ -1745,32 +1761,88 @@ CLI_PROTOCOL = (
 )
 
 
+def _cli_workspace(ctx, node_id):
+    """cwd propio del agente CLI: `<orch>/<pid>/cli/<nodeId>`.
+
+    ANTES el cwd era la carpeta ENTERA del mirror, así que un agente CLI podía leer y
+    escribir CUALQUIER proyecto de la carpeta aunque no fuera recurso suyo (decisión X,
+    2026-07-26). Ahora arranca en un directorio propio y vacío —con las skills
+    instaladas— y lo único que alcanza es lo que se le agrega por `--add-dir`, que sale
+    de SU cableado."""
+    d = os.path.join(orch_dir(ctx["app_dir"], ctx["pid"]), "cli", str(node_id))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def _cli_resource_notes(ctx, graph, node):
-    """Notas de recursos para un agente CLI (rutas reales, no tools) + add_dirs."""
-    notes, add_dirs = [], []
+    """Cómo llega un agente CLI a sus recursos (decisión X). Devuelve
+    (notas, add_dirs, mcp, exec_ok):
+
+    - `confinado` OFF → **tools nativas con los --add-dir acotados**: solo la carpeta
+      real de SUS editores y el subdirectorio de SUS diagramas. Conserva Read/Write/
+      Bash (codea bien), pero no ve el resto de la carpeta.
+    - `confinado` ON → **todo por el MCP del editor**: un server `dmfs<id>` por editor
+      contra ESTE backend, así cada escritura pasa por `editorfs` con su chequeo
+      "path escapes target", igual que un agente API. Sin --add-dir para editores.
+
+    `exec_ok` es True si ALGÚN recurso tiene permiso `ejecutar`: si no, se le saca Bash.
+    """
+    confinado = bool((node.get("data") or {}).get("confinado"))
+    notes, add_dirs, mcp, exec_ok = [], [], {}, False
     for r in resources_of(graph, node["id"]):
         rpid = r["data"]["projectId"]
         meta = ctx["project_meta"](rpid)
         if not meta:
             continue
         perm = (r["data"] or {}).get("permiso") or "editar"
+        lvl = PERM_LEVEL.get(perm, 1)
+        exec_ok = exec_ok or lvl >= 2
         if meta.get("type") == "editor":
             target = editorfs.get_target(ctx["app_dir"], rpid)
-            if target:
+            if not target:
+                notes.append(f"- «{meta.get('name')}» (editor): sin carpeta configurada — no usar")
+                continue
+            if confinado:
+                name = f"dmfs{r['id']}"
+                mcp[name] = {"projectId": rpid, "perm": lvl}
+                tools = "leer" if lvl < 1 else ("leer/escribir/ejecutar" if lvl >= 2 else "leer/escribir")
+                notes.append(f"- «{meta.get('name')}» (editor, permiso {perm}): usá SOLO las tools "
+                             f"`mcp__{name}__*` ({tools}). NO tenés la carpeta montada: no la busques "
+                             "en el disco, todo va por esas tools.")
+            elif lvl >= 1:
+                add_dirs.append(target)
                 notes.append(f"- «{meta.get('name')}» (editor, permiso {perm}): la carpeta real "
                              f"{target} — trabajá DIRECTO ahí con tus herramientas de archivos")
-                if PERM_LEVEL.get(perm, 1) >= 1:
-                    add_dirs.append(target)
+            else:
+                notes.append(f"- «{meta.get('name')}» (editor, permiso leer): NO lo tenés montado "
+                             "(las tools nativas no distinguen lectura de escritura). Si necesitás "
+                             "leerlo, pedile al humano que lo ponga en modo confinado.")
         else:
-            rel = f"./{safe_name(meta.get('name') or rpid)}/tree.json"
+            # diagrama: es UN archivo dentro del mirror. Se monta su subdirectorio, no
+            # la carpeta entera (en confinado también: no hay MCP de diagramas todavía).
+            sub = os.path.join(ctx.get("work_dir") or ctx["app_dir"], safe_name(meta.get("name") or rpid))
+            if lvl >= 1:
+                add_dirs.append(sub)
+            rel = os.path.join(sub, "tree.json")
             notes.append(f"- «{meta.get('name')}» ({meta.get('type')}, permiso {perm}): el diagrama "
                          f"{rel} — editalo respetando el esquema EXACTO de su tipo "
                          f"(skill diagramind-{str(meta.get('type')).lower()})")
-    return notes, add_dirs
+    return notes, add_dirs, mcp, exec_ok
+
+
+def _has_editor(ctx, graph, node_id):
+    """¿tiene algún recurso EDITOR cableado? Es el único lugar donde un agente puede
+    escribir archivos de código, así que sin uno hay que mandarlo a preguntar."""
+    for r in resources_of(graph, node_id):
+        meta = ctx["project_meta"]((r.get("data") or {}).get("projectId"))
+        if meta and meta.get("type") == "editor":
+            return True
+    return False
 
 
 def _cli_system(ctx, graph, node, notes):
     d = node.get("data") or {}
+    any_editor = _has_editor(ctx, graph, node["id"])
     partes = [
         f"Sos «{node.get('titulo') or 'agente'}», un empleado IA de la empresa (IA Orchestrator de DiagraMinder).",
         f"TU ROL: {d.get('rol') or '(sin rol definido — trabajá con criterio)'}",
@@ -1799,8 +1871,53 @@ def _cli_system(ctx, graph, node, notes):
                       "contadores). Podés crear/editar/borrar agentes, recursos y flechas, incluso a "
                       "vos mismo. REGLAS: editar el grafo NUNCA dispara runs; hacé SOLO los cambios "
                       "que te pidieron y conservá el resto.")
-    partes.append("REGLAS: 1) Trabajá SOLO en lo que te pidieron. 2) Tocá ÚNICAMENTE tus recursos "
-                  "(no otros proyectos de la carpeta). 3) Respondé en español, concreto.")
+    if d.get("confinado"):
+        # Decirle QUÉ tiene, no solo qué le falta: si no, gasta turnos buscando Read/Bash
+        # y "descubriendo" que no están. Los nombres son los del server de cada recurso.
+        partes.append(
+            "SOS UN AGENTE CONFINADO (decisión X): NO tenés la carpeta de proyectos montada y "
+            "tus tools nativas de archivos (Read/Write/Edit/Bash/Glob/Grep) están DESHABILITADAS. "
+            "No las busques ni intentes `cd`: no existen para vos.\n"
+            "TRABAJÁS CON ESTAS, una tanda por recurso editor (`<id>` es el del recurso, mirá "
+            "TUS RECURSOS más arriba):\n"
+            "- `mcp__dmfs<id>__fs_tree` — listar UN nivel (el equivalente a `ls`; pasá `dir` "
+            "para bajar a un subdirectorio)\n"
+            "- `mcp__dmfs<id>__fs_read` — leer un archivo · `mcp__dmfs<id>__fs_grep` — buscar "
+            "texto (acepta `glob`, es tu `grep -r`)\n"
+            "- `mcp__dmfs<id>__fs_write` — escribir un archivo COMPLETO (leé primero, mandá todo "
+            "el contenido nuevo) · `fs_mkdir` / `fs_rename` / `fs_delete`\n"
+            "- `mcp__dmfs<id>__sv_save` — guardá una VERSIÓN antes de una tanda de cambios · "
+            "`sv_list` / `sv_restore`\n"
+            "- `mcp__dmfs<id>__fs_exec` — SOLO si el recurso tiene permiso `ejecutar`: es una "
+            "shell REAL con el cwd en la carpeta del editor, ahí corrés `ls`, `find`, tests, "
+            "build, git, lo que necesites.\n"
+            "Es el mismo juego de herramientas que usan los agentes de API: alcanza de sobra "
+            "para codear. Si te falta algo, pedilo con preguntar_al_usuario en vez de inventar "
+            "un camino por afuera.")
+    reglas = ["Trabajá SOLO en lo que te pidieron.",
+              "Tocá ÚNICAMENTE tus recursos (no otros proyectos de la carpeta).",
+              "Respondé en español, concreto."]
+    if not notes:
+        # sin recursos cableados no tiene DÓNDE trabajar: que pregunte en vez de
+        # inventar una ruta (antes tenía el mirror entero montado y "algo" hacía).
+        partes.append(
+            "NO TENÉS NINGÚN RECURSO ASIGNADO. No hay ninguna carpeta ni archivo que puedas "
+            "tocar, y no tenés que buscarte uno: si la tarea implica leer o escribir código o "
+            "archivos, NO la intentes — usá `CONTROL: {\"accion\":\"preguntar_al_usuario\", "
+            "\"pregunta\":\"...\"}` y pedí que te cableen un recurso editor (o preguntá dónde "
+            "querés que trabaje). Si la tarea es solo pensar o responder, hacela normal.")
+    elif not any_editor:
+        partes.append(
+            "OJO: no tenés ningún recurso EDITOR asignado, así que no tenés dónde escribir "
+            "código ni archivos sueltos — solo los diagramas de arriba. Si lo que te pidieron "
+            "necesita un proyecto de código, NO improvises una ruta: preguntá con "
+            "`CONTROL: {\"accion\":\"preguntar_al_usuario\",\"pregunta\":\"...\"}` para que te "
+            "asignen un recurso editor.")
+    else:
+        reglas.insert(1, "Todo el trabajo sobre archivos va DENTRO de tus recursos editor: son "
+                         "el único lugar donde podés escribir y donde el usuario puede revisar y "
+                         "deshacer lo que hiciste. No crees archivos en ningún otro lado.")
+    partes.append("REGLAS: " + " ".join(f"{i}) {r}" for i, r in enumerate(reglas, 1)))
     partes.append(CLI_PROTOCOL)
     return "\n\n".join(partes)
 
@@ -1825,36 +1942,98 @@ def _parse_control(text):
     return limpiar, final, "\n".join(visibles).strip()
 
 
+# tools que expone el MCP del editor (editor_mcp.py) según el permiso del recurso
+MCP_FS_READ = ["fs_tree", "fs_read", "fs_grep", "sv_list"]
+MCP_FS_WRITE = ["fs_write", "fs_mkdir", "fs_rename", "fs_delete", "sv_save", "sv_restore"]
+MCP_FS_EXEC = ["fs_exec"]
+# nativas mínimas para tocar un diagrama-recurso cuando el agente está confinado:
+# su único --add-dir es el subdirectorio de ESE diagrama, así que quedan encerradas ahí
+CLI_DIAGRAM_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep"]
+
+
+def _rm(path):
+    if path:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _cli_cmd(ctx, graph, node, frame, message, cli_bin):
+    """(cmd, cwd, mcp_cfg_path) del turno CLI. Acá vive la decisión X: qué alcanza a
+    tocar el agente. El cwd ya NO es la carpeta del mirror (ver `_cli_workspace`)."""
+    d = node.get("data") or {}
+    confinado = bool(d.get("confinado"))
+    notes, add_dirs, mcp, exec_ok = _cli_resource_notes(ctx, graph, node)
+    system = _cli_system(ctx, graph, node, notes)
+    ia = d.get("ia") or {}
+    kw = EFFORT_THINK.get(ia.get("effort") or "", "")
+    msg = message + (f"\n\n{kw}" if kw else "")
+    cwd = _cli_workspace(ctx, node["id"])
+    try:
+        install_skills(cwd)               # las skills viven en SU workspace, no en el mirror
+    except Exception:
+        pass
+    cmd = [cli_bin, "-p", msg, "--output-format", "stream-json", "--verbose",
+           "--model", map_model(ia.get("model")), "--permission-mode", "acceptEdits",
+           "--append-system-prompt", system]
+    for x in add_dirs:
+        cmd += ["--add-dir", x]
+
+    cfg = None
+    if confinado:
+        # whitelist: SOLO las tools del MCP (una por editor, según permiso) y, si tiene
+        # diagramas cableados, las nativas de archivo — que solo alcanzan sus add_dirs.
+        servers, allowed = {}, []
+        for name, info in mcp.items():
+            servers[name] = {
+                **_self_cmd(),
+                "env": {"DMFS_URL": ctx.get("local_url") or "http://127.0.0.1:8765",
+                        "DMFS_TOKEN": ctx.get("local_token") or "",
+                        "DMFS_PROJECT": info["projectId"], "DMFS_AUTH": "local"},
+            }
+            tools = list(MCP_FS_READ)
+            if info["perm"] >= 1:
+                tools += MCP_FS_WRITE
+            if info["perm"] >= 2:
+                tools += MCP_FS_EXEC
+            allowed += [f"mcp__{name}__{t}" for t in tools]
+        if add_dirs:
+            allowed += CLI_DIAGRAM_TOOLS
+        if servers:
+            fd, cfg = tempfile.mkstemp(prefix=f"dmorch-mcp-{node['id']}-", suffix=".json")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"mcpServers": servers}, f)
+            os.chmod(cfg, 0o600)          # tiene el token del backend local
+            cmd += ["--mcp-config", cfg]
+        # sin tools permitidas el agente no puede hacer NADA con archivos: igual puede
+        # razonar y responder, que es lo correcto para un nodo sin recursos cableados.
+        cmd += ["--allowedTools", ",".join(allowed)]
+    else:
+        # blacklist: conserva su toolbelt nativo, acotado por los --add-dir de arriba.
+        # Bash es la vía de escape de los --add-dir, así que se la damos SOLO si algún
+        # recurso suyo tiene permiso `ejecutar`.
+        off = ["WebFetch", "WebSearch"] + ([] if exec_ok else ["Bash"])
+        cmd += ["--disallowedTools"] + off
+    if frame.get("sessionId"):
+        cmd += ["--resume", str(frame["sessionId"])]
+    return cmd, cwd, cfg
+
+
 def _run_cli_turn(ctx, graph, run, node, frame, message):
     """Lanza `claude -p` para un turno del agente y devuelve (texto, session_id, costo)."""
     cli_bin = find_claude()
     if not cli_bin:
         raise OrchError(400, f"el nodo «{node.get('titulo')}» usa Claude Code y el binario `claude` "
                              "no está en esta máquina")
-    notes, add_dirs = _cli_resource_notes(ctx, graph, node)
-    system = _cli_system(ctx, graph, node, notes)
-    ia = (node.get("data") or {}).get("ia") or {}
-    kw = EFFORT_THINK.get(ia.get("effort") or "", "")
-    msg = message + (f"\n\n{kw}" if kw else "")
-    work_dir = ctx.get("work_dir") or ctx["app_dir"]
+    cmd, cwd, cfg = _cli_cmd(ctx, graph, node, frame, message, cli_bin)
     try:
-        install_skills(work_dir)
-    except Exception:
-        pass
-    cmd = [cli_bin, "-p", msg, "--output-format", "stream-json", "--verbose",
-           "--model", map_model(ia.get("model")), "--permission-mode", "acceptEdits",
-           "--add-dir", work_dir,
-           "--disallowedTools", "WebFetch", "WebSearch",
-           "--append-system-prompt", system]
-    for d in add_dirs:
-        cmd += ["--add-dir", d]
-    if frame.get("sessionId"):
-        cmd += ["--resume", str(frame["sessionId"])]
-    try:
-        proc = subprocess.Popen(cmd, cwd=work_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, bufsize=1, encoding="utf-8", errors="replace")
     except Exception as e:
+        _rm(cfg)
         raise OrchError(400, f"no pude lanzar Claude Code: {e}")
+    frame["_mcpCfg"] = cfg
     rt = _rt(ctx["pid"])
     rt["procs"][frame["id"]] = proc
     session_id, result_text, texts, cost, deadline = None, None, [], 0.0, time.time() + CLI_TIMEOUT
@@ -1889,6 +2068,7 @@ def _run_cli_turn(ctx, graph, run, node, frame, message):
         proc.wait()
     finally:
         rt["procs"].pop(frame["id"], None)
+        _rm(frame.pop("_mcpCfg", None))   # el config MCP lleva el token del backend local
     if run.get("_kill"):
         raise OrchError(400, "turno CLI cancelado")
     if proc.returncode not in (0, None) and result_text is None:
@@ -2105,3 +2285,360 @@ def events_since(ctx, since):
         return [], 0, "none"
     evs = run["events"][since:]
     return evs, since + len(evs), run["status"]
+
+
+# ===================== RADIOGRAFÍA DE UN AGENTE (botones Context / Tools) =====================
+# Lo que la web muestra tiene que ser lo que el motor MANDA — no una reconstrucción
+# paralela que se desincroniza al primer cambio. Por eso `inspect_node` llama a las
+# MISMAS funciones que usa el turno (build_system / control_tools / resource_tools /
+# mcp_tools / org_tools) sobre el grafo del MIRROR. Responde dos preguntas:
+#   1) "si gira AHORA, ¿qué recibe?" → system + tools calculados en vivo (el caso
+#      «cablié un recurso, ¿lo ve?»: si no aparece acá, el agente NO lo tiene).
+#   2) "¿qué se le mandó de verdad?" → el transcript del run vivo o, si no hay, el
+#      del último terminado (`run.json`). Los runs ARCHIVADOS no guardan frames
+#      (ver _archive_run), así que de ahí para atrás solo quedan los events/logs.
+# Recordá que system y tools se REARMAN en cada turno: esto no es una foto del
+# arranque, es lo que se manda una y otra vez.
+
+# Toolbelt nativo de Claude Code. NO lo declara el motor (por eso no está en
+# `control_tools`/`resource_tools`): lo trae el CLI y puede variar con su versión —
+# se lista como REFERENCIA para que el usuario vea con qué trabaja un nodo CLI.
+# Lo que sí controlamos son los flags: `--disallowedTools` y `--permission-mode`.
+CLI_NATIVE_TOOLS = [
+    ("Read", "Lee un archivo del disco."),
+    ("Write", "Escribe un archivo completo."),
+    ("Edit", "Reemplaza texto exacto dentro de un archivo."),
+    ("Bash", "Ejecuta comandos de shell."),
+    ("Glob", "Busca archivos por patrón."),
+    ("Grep", "Busca texto dentro de los archivos."),
+    ("Task", "Lanza subagentes propios del CLI."),
+    ("TodoWrite", "Lista de tareas interna del turno."),
+    ("NotebookEdit", "Edita notebooks Jupyter."),
+    ("WebFetch", "Trae una URL."),
+    ("WebSearch", "Busca en la web."),
+]
+CLI_DISALLOWED = ["WebFetch", "WebSearch"]
+
+
+def _skill_catalog():
+    """Las skills que `install_skills` deja en <work_dir>/.claude/skills/: el agente CLI
+    las tiene disponibles aunque no sean tools. Nombre + description del frontmatter."""
+    out = []
+    for name, content in TYPE_SKILLS.items():
+        desc = ""
+        for line in content.splitlines():
+            if line.startswith("description:"):
+                desc = line[len("description:"):].strip()
+                break
+        out.append({"name": name, "description": desc})
+    return out
+
+
+def _norm_blocks(msg):
+    """Normaliza un mensaje de CUALQUIERA de los 3 adapters (Anthropic `content` /
+    Gemini `parts` / OpenAI plano) a {role, blocks:[{kind,name,text}]} para que la
+    web pinte los tres transcripts igual."""
+    role = msg.get("role") or "user"
+    content, parts, out = msg.get("content"), msg.get("parts"), []
+    if isinstance(parts, list):                                    # Gemini
+        for p in parts:
+            if p.get("text") is not None:
+                out.append({"kind": "text", "text": p.get("text") or ""})
+            elif p.get("functionCall"):
+                fc = p.get("functionCall") or {}
+                out.append({"kind": "tool_use", "name": fc.get("name") or "",
+                            "text": json.dumps(fc.get("args") or {}, ensure_ascii=False)})
+            elif p.get("functionResponse"):
+                fr = p.get("functionResponse") or {}
+                out.append({"kind": "tool_result", "name": fr.get("name") or "",
+                            "text": str((fr.get("response") or {}).get("result", ""))})
+    elif isinstance(content, list):                                # Anthropic
+        for b in content:
+            kind = b.get("type")
+            if kind == "text":
+                out.append({"kind": "text", "text": b.get("text") or ""})
+            elif kind == "tool_use":
+                out.append({"kind": "tool_use", "name": b.get("name") or "",
+                            "text": json.dumps(b.get("input") or {}, ensure_ascii=False)})
+            elif kind == "tool_result":
+                out.append({"kind": "tool_result", "name": b.get("tool_use_id") or "",
+                            "text": str(b.get("content") or ""), "error": bool(b.get("is_error"))})
+    else:                                                          # OpenAI (content plano)
+        if content:
+            out.append({"kind": "tool_result" if role == "tool" else "text",
+                        "name": msg.get("tool_call_id") or "", "text": str(content)})
+        for tc in (msg.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            out.append({"kind": "tool_use", "name": fn.get("name") or "",
+                        "text": fn.get("arguments") or "{}"})
+    if role in ("assistant", "model"):
+        role = "assistant"
+    elif any(b["kind"] == "tool_result" for b in out):
+        role = "tool"                                              # Anthropic los manda como user
+    else:
+        role = "user"
+    return {"role": role, "blocks": out, "chars": sum(len(b.get("text") or "") for b in out)}
+
+
+def _transcript_of(ctx, node_id):
+    """Lo que EFECTIVAMENTE se le mandó a este nodo: los frames del run vivo (RAM,
+    bajo LOCK) o, si no hay ninguno corriendo, los del último run terminado que
+    quedó en run.json. Un frame = una delegación: cada uno arranca con messages
+    vacío, así que acá se ve por qué un agente 'no se acuerda' de la anterior."""
+    with LOCK:
+        live = RUNS.get(ctx["pid"])
+        src = json.loads(json.dumps({k: v for k, v in live.items()
+                                     if not str(k).startswith("_")})) if live else None
+    is_live = src is not None
+    if src is None:
+        src = _read_json(_run_path(ctx), None)
+    if not src:
+        return None
+    frames = [f for f in (src.get("frames") or {}).values() if int(f["nodeId"]) == int(node_id)]
+    frames.sort(key=lambda f: int(str(f["id"])[1:]))
+    out = []
+    for f in frames:
+        out.append({"frameId": f["id"], "entry": f.get("entry"), "kind": f.get("kind"),
+                    "status": f.get("status"), "parentId": f.get("parentId"),
+                    "firstText": f.get("firstText") or "", "iters": f.get("iters", 0),
+                    "sessionId": f.get("sessionId"),
+                    "messages": [_norm_blocks(m) for m in (f.get("messages") or [])]})
+    return {"runId": src.get("id"), "status": src.get("status"), "live": is_live,
+            "createdAt": src.get("createdAt"), "frames": out}
+
+
+def _stats_of(ctx, node_id):
+    """Pestaña Info: en cuántos runs laburó este nodo y cuánto gastó. El acumulado
+    sale de los runs ARCHIVADOS (runs/<id>.json guarda el spend por nodo, aunque no
+    los frames) + el vivo/último. El estado actual sale del run en curso."""
+    key = str(node_id)
+    zero = {"turns": 0, "in": 0, "out": 0, "usd": 0.0}
+    acc, runs = dict(zero), 0
+
+    def add(dst, sp):
+        for k in ("turns", "in", "out"):
+            dst[k] += sp.get(k, 0) or 0
+        dst["usd"] = round(dst["usd"] + (sp.get("usd", 0.0) or 0.0), 6)
+
+    idx = _read_json(_runs_index_path(ctx), [])
+    for row in idx:
+        data = _read_json(os.path.join(_runs_dir(ctx), f"{row.get('id')}.json"), None)
+        sp = ((data or {}).get("spend") or {}).get(key)
+        if not sp:
+            continue
+        runs += 1
+        add(acc, sp)
+
+    with LOCK:
+        live = RUNS.get(ctx["pid"])
+        cur = json.loads(json.dumps({k: v for k, v in live.items()
+                                     if not str(k).startswith("_")})) if live else None
+    is_live = cur is not None
+    if cur is None:
+        cur = _read_json(_run_path(ctx), None)
+    last = None
+    if cur and not (is_live and cur.get("_archived")):
+        sp = (cur.get("spend") or {}).get(key)
+        archived = any(r.get("id") == cur.get("id") for r in idx)
+        if sp:
+            if not archived:                     # el vivo todavía no está en el índice
+                runs += 1
+                add(acc, sp)
+            last = {"runId": cur.get("id"), "status": cur.get("status"), "live": is_live,
+                    "createdAt": cur.get("createdAt"), **sp}
+    estado = ((cur or {}).get("nodeStates") or {}).get(key, {}) if is_live else {}
+    return {"runs": runs, "acumulado": acc, "ultimo": last,
+            "estado": estado.get("status") or ("idle" if is_live else None)}
+
+
+def _wiring_of(graph, node_id):
+    """El cableado del nodo tal como lo lee el motor: a quién delega, quién le
+    delega, qué recursos y qué MCPs tiene. Es la fuente de TODO lo que recibe."""
+    nid = int(node_id)
+    inbound = [graph["nodos"].get(int(f["fromId"])) for f in graph["flechas"]
+               if f.get("kind") == "delega" and int(f.get("toId", -1)) == nid]
+    entradas = [f.get("kind") for f in graph["flechas"]
+                if int(f.get("toId", -1)) == nid and f.get("kind") in ("task", "trigger")]
+    return {
+        "delegaA": [{"id": t["id"], "titulo": t.get("titulo")} for t in delega_targets(graph, nid)],
+        "leDelegan": [{"id": n["id"], "titulo": n.get("titulo")} for n in inbound if n],
+        "recursos": [{"id": r["id"], "titulo": r.get("titulo"),
+                      "projectId": (r.get("data") or {}).get("projectId"),
+                      "permiso": (r.get("data") or {}).get("permiso") or "editar"}
+                     for r in resources_of(graph, nid)],
+        "mcps": [{"id": m["id"], "titulo": m.get("titulo"),
+                  "tipo": (m.get("data") or {}).get("tipo")} for m in mcps_of(graph, nid)],
+        "entradas": entradas,
+    }
+
+
+def _tool_sources(ctx, graph, node_id):
+    """prefijo (`r5`/`m8`) → de qué nodo del canvas viene. El prefijo lo define el
+    propio motor al armar las tools, así que agrupar por él no duplica lógica."""
+    src = {}
+    for r in resources_of(graph, node_id):
+        rpid = (r.get("data") or {}).get("projectId")
+        meta = ctx["project_meta"](rpid)
+        src[f"r{r['id']}"] = {"origin": "resource", "nodeId": r["id"],
+                              "titulo": r.get("titulo"),
+                              "label": (meta or {}).get("name") or "(proyecto borrado)",
+                              "tipo": (meta or {}).get("type"),
+                              "permiso": (r.get("data") or {}).get("permiso") or "editar",
+                              "missing": meta is None}
+    for m in mcps_of(graph, node_id):
+        d = m.get("data") or {}
+        src[f"m{m['id']}"] = {"origin": "mcp", "nodeId": m["id"], "titulo": m.get("titulo"),
+                              "label": m.get("titulo") or f"m{m['id']}",
+                              "tipo": d.get("tipo"), "preset": d.get("preset")}
+    return src
+
+
+def inspect_node(ctx, node_id):
+    """System prompt y tools EXACTOS que recibiría este agente si girara ahora,
+    más el transcript de lo que se le mandó. Todo calculado con las funciones del
+    motor: si algo no aparece acá, el agente NO lo tiene."""
+    graph = load_graph(ctx)
+    node = _agent(graph, node_id)
+    d = node.get("data") or {}
+    ia = d.get("ia") or {}
+    provider = ia.get("provider") or "anthropic"
+    is_cli = provider in CLI_PROVIDERS
+    author = f"IA ({node.get('titulo') or node['id']})"
+    mem = mem_read(ctx, node["id"])
+    mchars = mem_chars(ctx, node["id"])
+    base = {
+        "nodeId": node["id"], "titulo": node.get("titulo"),
+        "kind": "cli" if is_cli else "api",
+        "ia": {"provider": provider, "model": ia.get("model"), "effort": ia.get("effort"),
+               "credId": ia.get("credId")},
+        "director": bool(d.get("director")), "secuencial": bool(d.get("secuencial")),
+        "confinado": bool(d.get("confinado")),
+        # el system inyecta SOLO las últimas 12 entradas (build_system): el resto
+        # está en disco pero el agente no lo ve.
+        "memoria": {"enabled": (d.get("memoria") or {}).get("enabled", True),
+                    "total": len(mem), "enviadas": min(len(mem), 12),
+                    "chars": mchars, "heavy": mchars > MEM_HEAVY_CHARS, "entries": mem},
+        "wiring": _wiring_of(graph, node["id"]),
+        "stats": _stats_of(ctx, node["id"]),
+        "graph": {"nodos": len(graph["nodos"]), "flechas": len(graph["flechas"])},
+        "transcript": _transcript_of(ctx, node["id"]),
+        "rearmed": True,          # system y tools se recalculan EN CADA TURNO
+    }
+    if is_cli:
+        # Cabeza CLI: no le mandamos tools JSON — usa las NATIVAS de Claude Code y
+        # el control va por protocolo de texto. El transcript vive en la sesión del
+        # CLI (--resume), no acá: por eso los frames CLI no tienen `messages`.
+        confinado = bool(d.get("confinado"))
+        notes, add_dirs, mcp, exec_ok = _cli_resource_notes(ctx, graph, node)
+        cwd = _cli_workspace(ctx, node["id"])
+        refs = []
+        if confinado:
+            # el whitelist real: una entrada por editor cableado, según su permiso
+            for name, info in mcp.items():
+                tools = list(MCP_FS_READ)
+                if info["perm"] >= 1:
+                    tools += MCP_FS_WRITE
+                if info["perm"] >= 2:
+                    tools += MCP_FS_EXEC
+                refs.append({"origin": "mcp", "label": f"Editor por MCP · {name}",
+                             "note": ("Cada llamada va a /fs de este backend, o sea a editorfs: "
+                                      "rechaza cualquier ruta fuera de la carpeta del editor, "
+                                      "igual que para un agente API."),
+                             "tools": [{"name": f"mcp__{name}__{t}", "schema": {},
+                                        "description": f"{t} sobre ese proyecto editor."}
+                                       for t in tools]})
+            if add_dirs:
+                refs.append({"origin": "cli", "label": "Nativas de archivos (solo sus diagramas)",
+                             "note": ("Habilitadas porque tiene diagramas cableados; sus únicos "
+                                      "--add-dir son esos subdirectorios, así que no alcanzan "
+                                      "nada más."),
+                             "tools": [{"name": n, "schema": {}, "description": "",
+                                        "disabled": False} for n in CLI_DIAGRAM_TOOLS]})
+        else:
+            refs.append({"origin": "cli", "label": "Herramientas nativas de Claude Code",
+                         "note": ("Las declara el CLI, no el motor, así que pueden variar con su "
+                                  "versión — esto es una referencia. Lo que sí fija el motor son "
+                                  "los flags: --permission-mode acceptEdits y --disallowedTools."),
+                         "tools": [{"name": n, "description": de, "schema": {},
+                                    "disabled": n in CLI_DISALLOWED or (n == "Bash" and not exec_ok)}
+                                   for n, de in CLI_NATIVE_TOOLS]})
+        refs.append({"origin": "skills", "label": "Skills instaladas en su workspace",
+                     "note": ("`install_skills` las escribe en <workspace>/.claude/skills/ antes "
+                              "de cada turno: el agente las lee cuando le hacen falta. No son "
+                              "tools — son conocimiento (el esquema de cada tipo de diagrama)."),
+                     "tools": [{"name": s["name"], "description": s["description"], "schema": {}}
+                               for s in _skill_catalog()]})
+        off = list(CLI_DISALLOWED) + ([] if exec_ok else ["Bash"])
+        base.update({
+            "system": _cli_system(ctx, graph, node, notes),
+            "systemNote": ("Se pasa como --append-system-prompt EN CADA TURNO, entero. "
+                           "El transcript NO se reenvía: lo guarda Claude Code y se "
+                           "recupera con --resume <sessionId>."),
+            # `toolGroups` es SOLO lo que el motor declara (para una cabeza CLI, nada).
+            # Lo demás va en `refGroups`: existe y el agente lo usa, pero no lo manda
+            # el motor — mantener la distinción es lo que hace confiable a este modal.
+            "toolGroups": [],
+            "refGroups": refs,
+            "cli": {"addDirs": add_dirs, "workDir": cwd, "protocol": CLI_PROTOCOL,
+                    "confinado": confinado, "permissionMode": "acceptEdits",
+                    "disallowed": [] if confinado else off,
+                    "execOk": exec_ok,
+                    "warning": (
+                        "Confinado: no tiene la carpeta montada. Toda escritura sobre un editor "
+                        "pasa por editorfs (mismo confinamiento que un agente API); las nativas "
+                        "de archivos solo existen si tiene diagramas cableados, y llegan nada más "
+                        "que a esos subdirectorios."
+                        if confinado else
+                        "No confinado: usa sus tools nativas, acotadas a los --add-dir de abajo — "
+                        "solo los recursos que le cableaste. Ojo: --add-dir no distingue lectura "
+                        "de escritura (un recurso 'leer' no se monta) y Bash puede salirse de "
+                        "ellos, por eso solo la tiene si algún recurso suyo es 'ejecutar'.")},
+        })
+        return base
+
+    ctrl = control_tools(graph, node["id"])
+    rtools, _rexecs, rnotes = resource_tools(ctx, graph, node["id"], author)
+    mtools, _mexecs, mnotes = mcp_tools(ctx, graph, node["id"])
+    otools = []
+    if d.get("director"):
+        otools, _oexecs = org_tools(ctx, graph, {"id": "inspect"}, node)
+    system = build_system(ctx, graph, node, rnotes + mnotes)
+    src = _tool_sources(ctx, graph, node["id"])
+    groups, buckets = [], {}
+    for t in rtools + mtools:
+        buckets.setdefault(str(t["name"]).split("_")[0], []).append(t)
+    groups.append({"origin": "control", "label": "Control del orquestador",
+                   "note": ("Siempre presentes. `delegar` aparece solo si el nodo tiene "
+                            "flechas `delega` salientes."), "tools": ctrl})
+    if otools:
+        groups.append({"origin": "director", "label": "Director (tick 👑)",
+                       "note": "Gestiona ESTE organigrama. Editar nunca dispara runs.",
+                       "tools": otools})
+    for prefix, tools in buckets.items():
+        info = src.get(prefix) or {"origin": "resource", "label": prefix}
+        groups.append({**info, "prefix": prefix, "tools": tools})
+    # los ESQUEMAS de los tipos de diagrama no son tools: build_system los inyecta
+    # como texto en el system (por eso un agente API sabe escribir un tree.json sin
+    # tener una tool para eso). Van en refGroups para que no parezca que "le faltan
+    # tools", sin ensuciar la lista de lo que el motor declara de verdad.
+    tipos = sorted({(ctx["project_meta"]((r["data"] or {}).get("projectId")) or {}).get("type")
+                    for r in resources_of(graph, node["id"])} - {None, "editor"})
+    refs = []
+    if tipos:
+        refs.append({"origin": "skills", "label": "Esquemas inyectados en el system",
+                     "note": ("No son tools: el motor mete el esquema de estos tipos como "
+                              "TEXTO en el system prompt (pestaña Context), así el agente "
+                              "sabe cómo escribir su tree.json con set_tree."),
+                     "tools": [{"name": f"diagramind-{t.lower()}", "schema": {},
+                                "description": f"Esquema del tipo {t}."} for t in tipos]})
+    base.update({
+        "refGroups": refs,
+        "system": system,
+        "systemNote": ("Se REARMA y se manda entero en cada turno (rol + subordinados + "
+                       "recursos + memoria + esquemas). Las tools también se recalculan."),
+        "toolGroups": [{**g, "tools": [{"name": t["name"], "description": t["description"],
+                                        "schema": t["schema"]} for t in g["tools"]]}
+                       for g in groups],
+        "notes": rnotes + mnotes,
+    })
+    return base

@@ -23,6 +23,11 @@ import urllib.request
 BASE = ""
 TOKEN = ""
 PROJECT = ""
+# Cómo se manda el token. "bearer" (default) = conector externo, header Authorization.
+# "local" = ESTE backend, que usa X-DiagraMind-Token — lo usan los agentes CLI
+# CONFINADOS del orquestador (doc 28 decisión X): sus escrituras van por /fs, o sea
+# por editorfs, con el mismo chequeo "path escapes target" que un agente API.
+AUTH = "bearer"
 
 _STR = {"type": "string"}
 
@@ -108,7 +113,10 @@ TOOLS = [
 def _http(method, path, body=None):
     """(json, err). El token va como Bearer; los errores HTTP vuelven legibles."""
     req = urllib.request.Request(BASE + path, method=method)
-    req.add_header("Authorization", "Bearer " + TOKEN)
+    if AUTH == "local":
+        req.add_header("X-DiagraMind-Token", TOKEN)
+    else:
+        req.add_header("Authorization", "Bearer " + TOKEN)
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -179,10 +187,11 @@ def _reply(mid, result=None, error=None):
 
 
 def main():
-    global BASE, TOKEN, PROJECT
+    global BASE, TOKEN, PROJECT, AUTH
     BASE = (os.environ.get("DMFS_URL") or "").rstrip("/")
     TOKEN = os.environ.get("DMFS_TOKEN") or ""
     PROJECT = os.environ.get("DMFS_PROJECT") or ""
+    AUTH = (os.environ.get("DMFS_AUTH") or "bearer").strip().lower()
     if not BASE or not TOKEN or not PROJECT:
         print("faltan DMFS_URL / DMFS_TOKEN / DMFS_PROJECT", file=sys.stderr)
         sys.exit(2)
