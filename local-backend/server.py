@@ -411,15 +411,44 @@ def _read_tree_file(folder, name):
         return None
 
 
-def _emit_state(folder, pid, content):
-    """Agrega un evento de cambio al log (asume STATE_LOCK tomado). Devuelve el seq."""
+def _emit_state(folder, pid, content, name=None, is_new=False):
+    """Agrega un evento de cambio al log (asume STATE_LOCK tomado). Devuelve el seq.
+    `name`/`is_new` viajan para que la web pueda CREAR el proyecto si no lo conoce
+    (lo creó la IA/CLI en disco); ver stateMirror.applyIncoming."""
     global STATE_SEQ
     STATE_SEQ += 1
-    STATE_LOG.append({"seq": STATE_SEQ, "folder": folder, "id": pid,
-                      "treeJson": content, "ts": time.time()})
+    STATE_LOG.append({"seq": STATE_SEQ, "folder": folder, "id": pid, "name": name,
+                      "new": bool(is_new), "treeJson": content, "ts": time.time()})
     if len(STATE_LOG) > STATE_LOG_MAX:
         del STATE_LOG[: len(STATE_LOG) - STATE_LOG_MAX]
     return STATE_SEQ
+
+
+def register_disk_project(folder, dirname, content):
+    """Un proyecto que apareció EN DISCO (lo creó la IA por el CLI local) y que la
+    web todavía no conoce: le asignamos un id y lo anotamos en el index.json de su
+    carpeta, para que el evento del watcher pueda crearlo en la web. Devuelve
+    (id, is_new). Si la carpeta no tiene index.json todavía NO inventamos nada (esa
+    carpeta no está sincronizada; lo resuelve el conflicto disco↔web al conectar)."""
+    idx = read_folder_index(folder)
+    projects = idx.get("projects")
+    if projects is None:
+        return dirname, False
+    for p in projects:
+        if safe_name(p.get("name", "")) == dirname:
+            return p.get("id") or dirname, False
+    try:
+        ptype = (json.loads(content) or {}).get("type") or "cart"
+    except Exception:
+        return dirname, False                      # tree.json a medio escribir: esperar
+    pid = "d" + secrets.token_hex(6)
+    projects.append({"id": pid, "name": dirname, "type": ptype})
+    try:
+        with open(os.path.join(folder_dir(folder), "index.json"), "w", encoding="utf-8") as fp:
+            json.dump(idx, fp, ensure_ascii=False, indent=2)
+    except OSError:
+        return dirname, False
+    return pid, True
 
 
 def iter_disk_trees():
@@ -456,8 +485,12 @@ def watch_state(interval=0.5):
                         content = _read_tree_file(folder, tname)
                         seq = (prev or {}).get("seq", 0)
                         if content is not None:
-                            # el evento usa el ID de la web (resuelto vía index.json)
-                            seq = _emit_state(folder, resolve_tree_id(folder, tname), content)
+                            # el evento usa el ID de la web (resuelto vía index.json).
+                            # Si el proyecto NO está en el index, lo creó la IA en
+                            # disco: le damos id y lo marcamos `new` para que la web
+                            # lo cree en su lista (si no, el manifiesto lo podaría).
+                            pid, is_new = register_disk_project(folder, tname, content)
+                            seq = _emit_state(folder, pid, content, name=tname, is_new=is_new)
                         STATE[key] = {"mtime": mtime, "seq": seq}
         except Exception:
             pass
@@ -1128,7 +1161,9 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 continue
             rid = resolve_tree_id(folder, tname)   # id de la web (vía index.json)
-            by_folder.setdefault(folder, []).append({"id": rid, "treeJson": content})
+            # `name` = la carpeta del proyecto en disco (su nombre real): la web la
+            # usa al reconstruirse desde el mirror ("quedarse con el disco").
+            by_folder.setdefault(folder, []).append({"id": rid, "name": tname, "treeJson": content})
         folders = [{"name": k, "projects": v} for k, v in sorted(by_folder.items())]
         with STATE_LOCK:
             seq = STATE_SEQ
