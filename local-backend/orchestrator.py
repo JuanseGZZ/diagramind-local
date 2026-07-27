@@ -67,7 +67,27 @@ KEYS = {}                     # pid -> apiKeys (SOLO RAM)
 LOCK = threading.Lock()       # protege RUNS/run dicts; los workers lo sueltan para llamar al LLM
 RUNTIME = {}                  # pid -> {cv, procs, alive} (NUNCA se serializa)
 
-CONTROL_TOOLS = {"delegar", "responder", "preguntar_al_usuario"}
+# Tools de control. Los nombres van al MODELO → en inglés (ver doc 20 §L). Los
+# nombres viejos en español quedan como ALIAS para no romper runs en vuelo ni
+# sesiones CLI que ya los venían usando.
+CONTROL_TOOLS = {"delegate", "respond", "ask_user",
+                 "delegar", "responder", "preguntar_al_usuario"}
+CONTROL_ALIAS = {"delegar": "delegate", "responder": "respond",
+                 "preguntar_al_usuario": "ask_user", "limpiar_memoria": "clear_memory"}
+
+
+def _ctl(name):
+    """Nombre canónico (inglés) de una acción/tool de control."""
+    return CONTROL_ALIAS.get(name, name)
+
+
+def _arg(inp, *names):
+    """Primer argumento presente entre `names` (acepta los nombres viejos)."""
+    for n in names:
+        v = (inp or {}).get(n)
+        if v not in (None, ""):
+            return v
+    return None
 CLI_PROVIDERS = {"local", "local-codex", "local-gemini"}
 CLI_TIMEOUT = 15 * 60        # tope de un turno CLI
 
@@ -347,11 +367,11 @@ def data_block(graph, node_id):
         txt = ((d.get("data") or {}).get("contenido") or "").strip()
         if not txt:
             continue
-        partes.append(f"### {d.get('titulo') or 'sin titulo'}\n{txt}")
+        partes.append(f"### {d.get('titulo') or 'untitled'}\n{txt}")
     if not partes:
         return ""
-    return ("CONTEXTO FIJO DE TU EMPRESA (reglas, convenciones y aclaraciones que te "
-            "dejaron por escrito — valen para TODO lo que hagas, no las contradigas):\n\n"
+    return ("FIXED CONTEXT OF YOUR COMPANY (rules, conventions and clarifications written "
+            "down for you — they hold for EVERYTHING you do, don't contradict them):\n\n"
             + "\n\n".join(partes))
 
 
@@ -1092,42 +1112,42 @@ def _s(desc, props=None, req=None):
 
 
 def control_tools(graph, node_id):
-    names = ", ".join(f"«{t.get('titulo') or t['id']}»" for t in delega_targets(graph, node_id)) or "(nadie)"
+    names = ", ".join(f"«{t.get('titulo') or t['id']}»" for t in delega_targets(graph, node_id)) or "(nobody)"
     tools = [
-        dict(name="responder", **_s(
-            "Terminá tu trabajo respondiéndole a quien te llamó (o al usuario si sos la raíz). SIEMPRE cerrá tu turno con esta tool.",
-            {"mensaje": {"type": "string", "description": "tu respuesta/resultado, concreto"}}, ["mensaje"])),
-        dict(name="preguntar_al_usuario", **_s(
-            "Pausa el trabajo y le pregunta al USUARIO humano (validación, decisión, contexto que falta). Usala ante la duda.",
-            {"pregunta": {"type": "string"}}, ["pregunta"])),
-        dict(name="limpiar_memoria", **_s(
-            "Borra la memoria persistente: la tuya (sin argumento) o la de un subordinado directo (nombre). Usala cuando una tarea se cierra.",
-            {"agente": {"type": "string", "description": "nombre del subordinado (opcional; default: vos)"}})),
+        dict(name="respond", **_s(
+            "Finish your work by answering whoever called you (or the user if you are the root). ALWAYS close your turn with this tool.",
+            {"message": {"type": "string", "description": "your answer/result, concrete"}}, ["message"])),
+        dict(name="ask_user", **_s(
+            "Pauses the work and asks the HUMAN user (validation, a decision, missing context). Use it whenever you are in doubt.",
+            {"question": {"type": "string"}}, ["question"])),
+        dict(name="clear_memory", **_s(
+            "Wipes persistent memory: yours (no argument) or a direct subordinate's (by name). Use it when a task is closed.",
+            {"agent": {"type": "string", "description": "name of the subordinate (optional; defaults to yourself)"}})),
     ]
     if delega_targets(graph, node_id):
         node = graph["nodos"].get(int(node_id)) or {}
         if (node.get("data") or {}).get("secuencial"):
             # agente SECUENCIAL (decisión W): delega de a UNO, nunca forkea
-            tools.insert(0, dict(name="delegar", **_s(
-                f"Delegá trabajo a UN subordinado directo y ESPERÁ su respuesta (podés delegar a: {names}). "
-                "Sos un agente SECUENCIAL: delegás de a UNO por vez, nunca en paralelo — si necesitás a "
-                "varios, andá uno por uno esperando cada respuesta. El mensaje debe ser concreto y verificable.",
-                {"agente": {"type": "string", "description": "nombre del agente destino"},
-                 "mensaje": {"type": "string", "description": "qué tiene que hacer, con el contexto necesario"}},
-                ["agente", "mensaje"])))
+            tools.insert(0, dict(name="delegate", **_s(
+                f"Delegate work to ONE direct subordinate and WAIT for their answer (you may delegate to: {names}). "
+                "You are a SEQUENTIAL agent: you delegate ONE at a time, never in parallel — if you need "
+                "several, go one by one waiting for each answer. The message must be concrete and verifiable.",
+                {"agent": {"type": "string", "description": "name of the target agent"},
+                 "message": {"type": "string", "description": "what they have to do, with the context they need"}},
+                ["agent", "message"])))
         else:
-            tools.insert(0, dict(name="delegar", **_s(
-                f"Delegá trabajo a subordinados directos y ESPERÁ su(s) respuesta(s) (podés delegar a: {names}). "
-                "Para UNO usá `agente`; para VARIOS EN PARALELO usá `agentes` y elegí `join`: \"todos\" te despierta "
-                "UNA vez con todas las respuestas juntas (default, para validar en conjunto) o \"cada_una\" te "
-                "despierta con CADA respuesta a medida que llega. El mensaje debe ser concreto y verificable.",
-                {"agente": {"type": "string", "description": "nombre del agente destino (delegación simple)"},
-                 "agentes": {"type": "array", "items": {"type": "string"},
-                             "description": "varios destinos: trabajan EN PARALELO"},
-                 "mensaje": {"type": "string", "description": "qué tienen que hacer, con el contexto necesario"},
-                 "join": {"type": "string", "enum": ["todos", "cada_una"],
-                          "description": "cómo te despierto si delegás a varios (default: todos)"}},
-                ["mensaje"])))
+            tools.insert(0, dict(name="delegate", **_s(
+                f"Delegate work to direct subordinates and WAIT for their answer(s) (you may delegate to: {names}). "
+                "For ONE use `agent`; for SEVERAL IN PARALLEL use `agents` and pick `join`: \"all\" wakes you "
+                "ONCE with every answer together (default, to validate them as a whole) or \"each\" wakes you "
+                "with EACH answer as it arrives. The message must be concrete and verifiable.",
+                {"agent": {"type": "string", "description": "name of the target agent (simple delegation)"},
+                 "agents": {"type": "array", "items": {"type": "string"},
+                            "description": "several targets: they work IN PARALLEL"},
+                 "message": {"type": "string", "description": "what they have to do, with the context they need"},
+                 "join": {"type": "string", "enum": ["all", "each"],
+                          "description": "how I wake you up if you delegate to several (default: all)"}},
+                ["message"])))
     return tools
 
 
@@ -1143,10 +1163,10 @@ def resource_tools(ctx, graph, node_id, author):
         perm = PERM_LEVEL.get((r["data"] or {}).get("permiso") or "editar", 1)
         meta = ctx["project_meta"](rpid)          # {name, type} o None
         if not meta:
-            notes.append(f"- {rid}: (proyecto borrado — no usar)")
+            notes.append(f"- {rid}: (project deleted — do not use)")
             continue
         rtype = meta.get("type")
-        label = f"{meta.get('name')} ({rtype}, permiso {r['data'].get('permiso')})"
+        label = f"{meta.get('name')} ({rtype}, permission {r['data'].get('permiso')})"
         notes.append(f"- {rid}: {label}")
         if rtype == "editor":
             _editor_tools(ctx, rid, rpid, perm, tools, execs, author)
@@ -1165,42 +1185,42 @@ def _editor_tools(ctx, rid, rpid, perm, tools, execs, author):
     def add(name, spec, fn):
         tools.append(dict(name=f"{rid}_{name}", **spec))
         execs[f"{rid}_{name}"] = fn
-    add("fs_tree", _s("Lista UN nivel del proyecto editor (dirs primero).",
+    add("fs_tree", _s("Lists ONE level of the editor project (dirs first).",
                       {"dir": {"type": "string"}}),
         lambda i: _fs(editorfs.fs_tree, app, rpid, i.get("dir") or ""))
-    add("fs_read", _s("Lee un archivo (ruta relativa).", {"path": {"type": "string"}}, ["path"]),
+    add("fs_read", _s("Reads a file (relative path).", {"path": {"type": "string"}}, ["path"]),
         lambda i: _fs(editorfs.fs_read, app, rpid, i.get("path")))
-    add("fs_grep", _s("Busca texto en los archivos.", {"q": {"type": "string"}, "glob": {"type": "string"}}, ["q"]),
+    add("fs_grep", _s("Searches text across the files.", {"q": {"type": "string"}, "glob": {"type": "string"}}, ["q"]),
         lambda i: _fs(editorfs.fs_grep, app, rpid, i.get("q"), i.get("glob") or ""))
     def sv_ctx():
         return ctx["sv_dir_of"](rpid), editorfs.get_target(app, rpid)
     def sv_list(i):
         svd, _t = sv_ctx()
         return json.dumps(sourcever.sv_list(svd), ensure_ascii=False), False
-    add("sv_list", _s("Historial de versiones del proyecto."), sv_list)
+    add("sv_list", _s("Version history of the project."), sv_list)
     if perm >= 1:
-        add("fs_write", _s("Escribe un archivo COMPLETO (crea dirs).",
+        add("fs_write", _s("Writes a COMPLETE file (creating dirs).",
                            {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
             lambda i: _fs(editorfs.fs_write, app, rpid, i.get("path"), i.get("content") or ""))
-        add("fs_mkdir", _s("Crea un directorio.", {"path": {"type": "string"}}, ["path"]),
+        add("fs_mkdir", _s("Creates a directory.", {"path": {"type": "string"}}, ["path"]),
             lambda i: _fs(editorfs.fs_mkdir, app, rpid, i.get("path")))
-        add("fs_rename", _s("Renombra/mueve dentro del proyecto.",
+        add("fs_rename", _s("Renames/moves inside the project.",
                             {"from": {"type": "string"}, "to": {"type": "string"}}, ["from", "to"]),
             lambda i: _fs(editorfs.fs_rename, app, rpid, i.get("from"), i.get("to")))
-        add("fs_delete", _s("Borra archivo o dir (recursivo).", {"path": {"type": "string"}}, ["path"]),
+        add("fs_delete", _s("Deletes a file or dir (recursive).", {"path": {"type": "string"}}, ["path"]),
             lambda i: _fs(editorfs.fs_delete, app, rpid, i.get("path")))
         def sv_save(i):
             svd, t = sv_ctx()
             return json.dumps(sourcever.sv_save(svd, t, author, i.get("note") or ""), ensure_ascii=False), False
-        add("sv_save", _s("Guarda una VERSIÓN (snapshot) del proyecto. Usala ANTES de una tanda de cambios.",
+        add("sv_save", _s("Saves a VERSION (snapshot) of the project. Use it BEFORE a batch of changes.",
                           {"note": {"type": "string"}}), sv_save)
         def sv_restore(i):
             svd, t = sv_ctx()
             return json.dumps(sourcever.sv_restore(svd, t, i.get("id"), author), ensure_ascii=False), False
-        add("sv_restore", _s("Vuelve el proyecto a una versión (con snapshot de seguridad previo). Solo si te lo piden.",
+        add("sv_restore", _s("Takes the project back to a version (with a safety snapshot first). Only if you are asked to.",
                              {"id": {"type": "string"}}, ["id"]), sv_restore)
     if perm >= 2:
-        add("fs_exec", _s("Ejecuta un comando de shell en el proyecto (timeout 60s).",
+        add("fs_exec", _s("Runs a shell command in the project (60s timeout).",
                           {"cmd": {"type": "string"}}, ["cmd"]),
             lambda i: _fs(editorfs.fs_exec, app, rpid, i.get("cmd")))
 
@@ -1213,10 +1233,10 @@ def org_tools(ctx, graph, run, node):
     def org_view(i):
         tree = _read_json(ctx["graph_path"], None)
         if tree is None:
-            return "el organigrama no está sincronizado", True
+            return "the org chart is not synced", True
         return json.dumps(tree, ensure_ascii=False), False
     tools.append(dict(name="org_view", **_s(
-        "Devuelve el JSON completo del organigrama de TU empresa (este orquestador).")))
+        "Returns the complete JSON of YOUR company org chart (this orchestrator).")))
     execs["org_view"] = org_view
 
     def org_edit(i):
@@ -1224,10 +1244,10 @@ def org_tools(ctx, graph, run, node):
         try:
             obj = json.loads(raw) if isinstance(raw, str) else raw
         except Exception as e:
-            return f"JSON inválido: {e}", True
+            return f"invalid JSON: {e}", True
         err = validate_graph(ctx, obj)
         if err:
-            return f"organigrama inválido: {err}", True
+            return f"invalid org chart: {err}", True
         try:                                     # snapshot pre-edición (decisión I)
             d = os.path.join(orch_dir(ctx["app_dir"], ctx["pid"]), "snapshots")
             os.makedirs(d, exist_ok=True)
@@ -1242,12 +1262,12 @@ def org_tools(ctx, graph, run, node):
             graph["nodos"] = {int(n["id"]): n for n in obj.get("nodos", [])}
             graph["flechas"] = obj.get("flechas", [])
             emit(run, "log", nodeId=node["id"], text="👑 editó el organigrama (org_edit)")
-        return "OK: organigrama actualizado. NO se disparó ningún run.", False
+        return "OK: org chart updated. NO run was triggered.", False
     tools.append(dict(name="org_edit", **_s(
-        "Reemplaza el organigrama ENTERO de tu empresa con un JSON válido de tipo orchestrator "
-        "(usá org_view primero y respetá su esquema EXACTO; conservá lo que no te pidieron tocar). "
-        "Editar NUNCA ejecuta nada: hacé SOLO los cambios que te pidieron.",
-        {"json": {"type": "string", "description": "el tree.json completo del orquestador"}}, ["json"])))
+        "Replaces the ENTIRE org chart of your company with a valid orchestrator-type JSON "
+        "(use org_view first and respect its EXACT schema; keep whatever you were not asked to touch). "
+        "Editing NEVER executes anything: make ONLY the changes you were asked for.",
+        {"json": {"type": "string", "description": "the complete tree.json of the orchestrator"}}, ["json"])))
     execs["org_edit"] = org_edit
     return tools, execs
 
@@ -1256,9 +1276,9 @@ def _diagram_tools(ctx, rid, rpid, rtype, perm, tools, execs):
     def view(i):
         tree = _read_json(ctx["tree_path_of"](rpid), None)
         if tree is None:
-            return "el proyecto no está sincronizado", True
+            return "the project is not synced", True
         return json.dumps(tree, ensure_ascii=False), False
-    tools.append(dict(name=f"{rid}_view_tree", **_s(f"Devuelve el JSON del diagrama ({rtype}).")))
+    tools.append(dict(name=f"{rid}_view_tree", **_s(f"Returns the JSON of the diagram ({rtype}).")))
     execs[f"{rid}_view_tree"] = view
     if perm >= 1:
         def set_tree(i):
@@ -1266,15 +1286,15 @@ def _diagram_tools(ctx, rid, rpid, rtype, perm, tools, execs):
             try:
                 obj = json.loads(raw) if isinstance(raw, str) else raw
             except Exception as e:
-                return f"JSON inválido: {e}", True
+                return f"invalid JSON: {e}", True
             if not isinstance(obj, dict) or obj.get("type") != rtype:
-                return f"el JSON debe ser un objeto con type='{rtype}'", True
+                return f"the JSON must be an object with type='{rtype}'", True
             _write_json(ctx["tree_path_of"](rpid), obj)
             ctx["notify_edit"](rpid)
-            return "OK: diagrama actualizado.", False
+            return "OK: diagram updated.", False
         tools.append(dict(name=f"{rid}_set_tree", **_s(
-            f"Reemplaza el diagrama ENTERO con un JSON válido de tipo {rtype} (respetá su esquema EXACTO).",
-            {"json": {"type": "string", "description": "el tree.json completo"}}, ["json"])))
+            f"Replaces the ENTIRE diagram with a valid {rtype}-type JSON (respect its EXACT schema).",
+            {"json": {"type": "string", "description": "the complete tree.json"}}, ["json"])))
         execs[f"{rid}_set_tree"] = set_tree
 
 
@@ -1286,24 +1306,26 @@ def _skill_body(rtype):
 
 
 def build_system(ctx, graph, node, notes):
+    """System prompt del agente (cabeza API). Va al MODELO → en inglés (doc 20 §L);
+    el `rol` que escribió el humano se inyecta tal cual, en su idioma."""
     d = node.get("data") or {}
     nid = node["id"]
     partes = [
-        f"Sos «{node.get('titulo') or 'agente'}», un empleado IA de la empresa (IA Orchestrator de DiagraMinder).",
-        f"TU ROL: {d.get('rol') or '(sin rol definido — trabajá con criterio)'}",
+        f"You are «{node.get('titulo') or 'agent'}», an AI employee of the company (DiagraMinder's IA Orchestrator).",
+        f"YOUR ROLE: {d.get('rol') or '(no role defined — use your best judgement)'}",
     ]
     targets = delega_targets(graph, nid)
     if targets:
         if d.get("secuencial"):
-            partes.append("SUBORDINADOS (sos SECUENCIAL: delegás de a UNO por vez con `delegar` y esperás "
-                          "cada respuesta — nunca en paralelo): " +
+            partes.append("SUBORDINATES (you are SEQUENTIAL: you delegate to ONE at a time with `delegate` and "
+                          "wait for each answer — never in parallel): " +
                           "; ".join(f"«{t.get('titulo') or t['id']}» ({(t.get('data') or {}).get('rol', '')[:80]})" for t in targets))
         else:
-            partes.append("SUBORDINADOS (podés delegarles con la tool `delegar` — a varios EN PARALELO con "
-                          "`agentes` — y esperás su(s) respuesta(s)): " +
+            partes.append("SUBORDINATES (you can delegate to them with the `delegate` tool — to several IN "
+                          "PARALLEL with `agents` — and you wait for their answer(s)): " +
                           "; ".join(f"«{t.get('titulo') or t['id']}» ({(t.get('data') or {}).get('rol', '')[:80]})" for t in targets))
     if notes:
-        partes.append("TUS RECURSOS (tools con el prefijo indicado):\n" + "\n".join(notes))
+        partes.append("YOUR RESOURCES (tools with the given prefix):\n" + "\n".join(notes))
     blk = data_block(graph, nid)
     if blk:
         partes.append(blk)
@@ -1313,42 +1335,42 @@ def build_system(ctx, graph, node, notes):
         if mem:
             lines = [f"- [{time.strftime('%Y-%m-%d %H:%M', time.localtime(m['ts'] / 1000))}] {m['texto']}"
                      for m in mem[-12:]]
-            partes.append("TU MEMORIA (trabajos y charlas anteriores):\n" + "\n".join(lines))
+            partes.append("YOUR MEMORY (previous work and conversations):\n" + "\n".join(lines))
     tipos = {ctx["project_meta"](r["data"]["projectId"]).get("type")
              for r in resources_of(graph, nid)
              if ctx["project_meta"](r["data"].get("projectId"))}
     for t in sorted(x for x in tipos if x and x != "editor"):
         body = _skill_body(t)
         if body:
-            partes.append(f"ESQUEMA del tipo {t} (para view/set_tree):\n{body[:3500]}")
+            partes.append(f"SCHEMA of type {t} (for view/set_tree):\n{body[:3500]}")
     if d.get("director"):
-        partes.append("👑 SOS DIRECTOR de esta empresa (decisión U): podés gestionar el organigrama "
-                      "con `org_view` y `org_edit` — crear/editar/borrar agentes, recursos y flechas, "
-                      "incluso modificarte a vos mismo. REGLAS del director: editar el grafo NUNCA "
-                      "dispara runs; hacé SOLO los cambios que te pidieron y conservá el resto.")
+        partes.append("👑 YOU ARE THE DIRECTOR of this company (decision U): you can manage the org chart "
+                      "with `org_view` and `org_edit` — create/edit/delete agents, resources and arrows, "
+                      "including modifying yourself. DIRECTOR RULES: editing the graph NEVER "
+                      "triggers runs; make ONLY the changes you were asked for and keep the rest.")
         body = _skill_body("orchestrator")
         if body:
-            partes.append(f"ESQUEMA del organigrama (para org_view/org_edit):\n{body[:3500]}")
+            partes.append(f"SCHEMA of the org chart (for org_view/org_edit):\n{body[:3500]}")
     # sin recursos no tiene DÓNDE trabajar: que pregunte en vez de improvisar
     if not notes:
         partes.append(
-            "NO TENÉS NINGÚN RECURSO ASIGNADO: no hay ningún archivo ni diagrama que puedas "
-            "tocar. Si la tarea implica leer o escribir algo, NO la intentes — usá "
-            "`preguntar_al_usuario` y pedí que te cableen un recurso. Si es solo pensar o "
-            "responder, hacela normal.")
+            "YOU HAVE NO RESOURCES ASSIGNED: there is no file and no diagram you can "
+            "touch. If the task involves reading or writing anything, do NOT attempt it — use "
+            "`ask_user` and ask them to wire a resource to you. If it is just thinking or "
+            "answering, do it normally.")
     elif not _has_editor(ctx, graph, nid):
         partes.append(
-            "OJO: no tenés ningún recurso EDITOR asignado, así que no tenés dónde escribir "
-            "código ni archivos sueltos — solo los diagramas de arriba. Si lo que te pidieron "
-            "necesita un proyecto de código, preguntá con `preguntar_al_usuario` para que te "
-            "asignen uno en vez de improvisar.")
+            "HEADS UP: you have no EDITOR resource assigned, so you have nowhere to write "
+            "code or loose files — only the diagrams above. If what you were asked for "
+            "needs a code project, ask with `ask_user` so they assign you "
+            "one instead of improvising.")
     partes.append(
-        "REGLAS: 1) Trabajá SOLO en lo que te pidieron. 2) Todo el trabajo sobre archivos va DENTRO "
-        "de tus recursos, con SUS tools: son el único lugar donde podés escribir y donde el usuario "
-        "puede revisar y deshacer lo que hiciste. 3) Usá `preguntar_al_usuario` ante decisiones "
-        "importantes o contexto faltante. 4) Cerrá SIEMPRE tu turno con `responder` (resumen concreto y "
-        "verificable). 5) En proyectos editor, guardá una versión (sv_save) antes de una tanda de cambios. "
-        "6) Respondé en español."
+        "RULES: 1) Work ONLY on what you were asked for. 2) All file work happens INSIDE "
+        "your resources, with THEIR tools: they are the only place where you can write and where the user "
+        "can review and undo what you did. 3) Use `ask_user` for important "
+        "decisions or missing context. 4) ALWAYS close your turn with `respond` (a concrete, "
+        "verifiable summary). 5) In editor projects, save a version (sv_save) before a batch of changes. "
+        "6) Write your answers in the same language the user/your caller writes to you in."
     )
     return "\n\n".join(partes)
 
@@ -1478,7 +1500,7 @@ def _finish_node(ctx, run, graph, frame, mensaje):
     if (d.get("memoria") or {}).get("enabled", True):
         chat_id = run.get("chatId") if frame["entry"] == "chat" else None
         mem_append(ctx, node["id"], frame["entry"],
-                   f"Tarea: {frame['firstText'][:400]} → Resultado: {mensaje[:700]}", chat_id)
+                   f"Task: {frame['firstText'][:400]} → Result: {mensaje[:700]}", chat_id)
     set_node_state(ctx, run, node["id"], "done")
     emit(run, "log", nodeId=node["id"], text=f"← responde: {mensaje[:200]}")
 
@@ -1497,12 +1519,12 @@ def _do_responder(ctx, graph, run, frame, mensaje):
         return
     parent = run["frames"][parent_id]
     child = _agent(graph, frame["nodeId"])
-    texto = f"Respuesta de «{child.get('titulo') or child['id']}»: {mensaje}"
+    texto = f"Answer from «{child.get('titulo') or child['id']}»: {mensaje}"
     parent["waiting"].pop(frame["id"], None)
     if parent.get("join") == "cada_una":
         quedan = len(parent["waiting"])
         if quedan:
-            texto += f"\n(seguís esperando {quedan} respuesta(s) más)"
+            texto += f"\n(you are still waiting for {quedan} more answer(s))"
         parent["inbox"].append({"text": texto})
         if parent["status"] == "waiting_children":
             parent["status"] = "ready"
@@ -1531,10 +1553,12 @@ def _do_delegar(ctx, graph, run, frame, node, inp):
     error (sin tocar nada) o None si delegó y el frame quedó esperando hijos."""
     if frame["waiting"]:
         faltan = ", ".join(f"«{v}»" for v in frame["waiting"].values())
-        return f"ya tenés delegaciones en curso ({faltan}): esperá esas respuestas antes de volver a delegar"
-    wanted = [w for w in (inp.get("agentes") if isinstance(inp.get("agentes"), list) else []) if str(w or "").strip()]
-    if str(inp.get("agente") or "").strip():
-        wanted.insert(0, inp["agente"])
+        return f"you already have delegations in flight ({faltan}): wait for those answers before delegating again"
+    _agents = _arg(inp, "agents", "agentes")
+    wanted = [w for w in (_agents if isinstance(_agents, list) else []) if str(w or "").strip()]
+    _one = str(_arg(inp, "agent", "agente") or "").strip()
+    if _one:
+        wanted.insert(0, _one)
     seen, names = set(), []
     for w in wanted:
         k = str(w).strip().lower()
@@ -1542,25 +1566,25 @@ def _do_delegar(ctx, graph, run, frame, node, inp):
             seen.add(k)
             names.append(str(w))
     if not names:
-        return "decí a quién delegás: `agente` (uno) o `agentes` (varios en paralelo)"
+        return "say who you are delegating to: `agent` (one) or `agents` (several in parallel)"
     targets, ids = [], set()
     for w in names:
         t = _resolve_target(graph, node["id"], w)
         if not t:
-            return f"no podés delegar a «{w}»: no está conectado por una flecha delega"
+            return f"you cannot delegate to «{w}»: they are not connected by a delega arrow"
         if t["id"] not in ids:
             ids.add(t["id"])
             targets.append(t)
     if len(targets) > 1 and (node.get("data") or {}).get("secuencial"):
-        return ("sos un agente SECUENCIAL (lo definió el humano): delegá de a UNO con `agente` "
-                "y esperá cada respuesta antes de la siguiente")
-    join = "cada_una" if str(inp.get("join") or "").strip().lower() in ("cada_una", "cada una") else "todos"
-    msg = str(inp.get("mensaje") or "")
+        return ("you are a SEQUENTIAL agent (the human set it): delegate to ONE with `agent` "
+                "and wait for each answer before the next one")
+    join = "cada_una" if str(inp.get("join") or "").strip().lower() in ("each", "cada_una", "cada una") else "todos"
+    msg = str(_arg(inp, "message", "mensaje") or "")
     frame["join"], frame["collected"] = join, []
     frame["status"] = "waiting_children"
     set_node_state(ctx, run, node["id"], "waiting")
     _release_locks(run, frame["id"])
-    texto = f"«{node.get('titulo') or node['id']}» te delega: {msg}"
+    texto = f"«{node.get('titulo') or node['id']}» delegates to you: {msg}"
     for t in targets:
         child = _new_frame(ctx, graph, run, t, "delegado", texto, parent_id=frame["id"])
         frame["waiting"][child["id"]] = t.get("titulo") or str(t["id"])
@@ -1707,7 +1731,7 @@ def _deliver_inbox(adapter, frame):
     como mensajes de usuario."""
     items, frame["inbox"] = frame["inbox"], []
     if frame.get("pendingToolId"):
-        first = items.pop(0) if items else {"text": "(continuá)"}
+        first = items.pop(0) if items else {"text": "(carry on)"}
         results = frame["stash"] + [{"id": frame["pendingToolId"], "name": "control",
                                      "content": first["text"],
                                      **({"is_error": True} if first.get("is_error") else {})}]
@@ -1767,19 +1791,19 @@ def _turn_api(ctx, graph, run, frame):
         add_spend(run, node["id"], res["usage"])
         frame["messages"].append(res["assistant_msg"])
         if not res["tool_calls"]:
-            _implicit_end(ctx, graph, run, frame, res["text"] or "(sin respuesta)")
+            _implicit_end(ctx, graph, run, frame, res["text"] or "(no answer)")
             _save(ctx, run)
             return
         if frame["iters"] > MAX_TOOL_ITERS:
             _implicit_end(ctx, graph, run, frame,
-                          (res["text"] or "") + "\n(corté: demasiadas iteraciones en este turno)")
+                          (res["text"] or "") + "\n(cut off: too many iterations in this turn)")
             _save(ctx, run)
             return
         control, plain, ignored = None, [], []
         for tc in res["tool_calls"]:
             if control is not None:
                 ignored.append({"id": tc["id"], "name": tc["name"], "is_error": True,
-                                "content": "ignorada: primero se resuelve la acción de control anterior"})
+                                "content": "ignored: the previous control action is resolved first"})
             elif tc["name"] in CONTROL_TOOLS:
                 control = tc
             else:
@@ -1797,22 +1821,23 @@ def _turn_api(ctx, graph, run, frame):
             _save(ctx, run)
             return
         inp = control["input"] or {}
-        if control["name"] == "responder":
+        cname = _ctl(control["name"])
+        if cname == "respond":
             if frame["waiting"]:
                 faltan = ", ".join(f"«{v}»" for v in frame["waiting"].values())
                 _reject_control(frame, control, results,
-                                f"todavía esperás las respuestas de: {faltan} — no podés responder hasta que lleguen")
+                                f"you are still waiting for the answers of: {faltan} — you cannot respond until they arrive")
             else:
-                _do_responder(ctx, graph, run, frame, str(inp.get("mensaje") or ""))
-        elif control["name"] == "delegar":
+                _do_responder(ctx, graph, run, frame, str(_arg(inp, "message", "mensaje") or ""))
+        elif cname == "delegate":
             err = _do_delegar(ctx, graph, run, frame, node, inp)
             if err:
                 _reject_control(frame, control, results, err)
             else:
                 frame["pendingToolId"] = control["id"]
                 frame["stash"] = results
-        else:                                   # preguntar_al_usuario
-            pregunta = str(inp.get("pregunta") or "")
+        else:                                   # ask_user
+            pregunta = str(_arg(inp, "question", "pregunta") or "")
             frame["pendingToolId"] = control["id"]
             frame["stash"] = results
             frame["status"] = "waiting_human"
@@ -1831,23 +1856,23 @@ def _exec_tool(ctx, graph, run, node, rexecs, tc):
     with LOCK:
         emit(run, "log", nodeId=node["id"], text=f"tool {name}({json.dumps(inp, ensure_ascii=False)[:160]})")
     try:
-        if name == "limpiar_memoria":
-            who = (inp.get("agente") or "").strip()
+        if _ctl(name) == "clear_memory":
+            who = str(_arg(inp, "agent", "agente") or "").strip()
             if not who:
                 mem_clear(ctx, node["id"])
-                return {"id": tc["id"], "name": name, "content": "OK: tu memoria quedó limpia."}
+                return {"id": tc["id"], "name": name, "content": "OK: your memory is now empty."}
             target = _resolve_target(graph, node["id"], who)
             if not target:
                 return {"id": tc["id"], "name": name, "is_error": True,
-                        "content": f"«{who}» no es un subordinado directo tuyo"}
+                        "content": f"«{who}» is not a direct subordinate of yours"}
             mem_clear(ctx, target["id"])
             with LOCK:
                 set_node_state(ctx, run, target["id"],
                                run["nodeStates"].get(str(target["id"]), {}).get("status", "idle"))
-            return {"id": tc["id"], "name": name, "content": f"OK: memoria de «{target.get('titulo')}» limpia."}
+            return {"id": tc["id"], "name": name, "content": f"OK: memory of «{target.get('titulo')}» cleared."}
         fn = rexecs.get(name)
         if not fn:
-            return {"id": tc["id"], "name": name, "is_error": True, "content": f"tool desconocida: {name}"}
+            return {"id": tc["id"], "name": name, "is_error": True, "content": f"unknown tool: {name}"}
         content, is_err = fn(inp)
         out = {"id": tc["id"], "name": name, "content": content[:60000]}
         if is_err:
@@ -1856,7 +1881,7 @@ def _exec_tool(ctx, graph, run, node, rexecs, tc):
     except sourcever.SvError as e:
         return {"id": tc["id"], "name": name, "is_error": True, "content": e.msg}
     except Exception as e:
-        return {"id": tc["id"], "name": name, "is_error": True, "content": f"error ejecutando {name}: {e}"}
+        return {"id": tc["id"], "name": name, "is_error": True, "content": f"error running {name}: {e}"}
 
 
 # ===================== turnos CLI (Claude Code — fase 4) =====================
@@ -1867,17 +1892,17 @@ def _exec_tool(ctx, graph, run, node, rexecs, tc):
 # delegaciones/preguntas usa --resume (sesión por frame).
 
 CLI_PROTOCOL = (
-    "PROTOCOLO DE CONTROL (OBLIGATORIO — sos un empleado del orquestador): tu respuesta "
-    "DEBE terminar con UNA línea exacta `CONTROL: {json}` con una de estas acciones:\n"
-    'CONTROL: {"accion":"responder","mensaje":"<tu resultado, concreto y verificable>"}\n'
-    'CONTROL: {"accion":"delegar","agente":"<nombre subordinado>","mensaje":"<qué tiene que hacer>"}\n'
-    'CONTROL: {"accion":"delegar","agentes":["<nombre A>","<nombre B>"],"join":"todos","mensaje":"<qué tienen que hacer>"} '
-    '— delega a VARIOS EN PARALELO; join "todos" = te despierto una vez con todas las respuestas juntas, '
-    '"cada_una" = te despierto con cada respuesta a medida que llega\n'
-    'CONTROL: {"accion":"preguntar_al_usuario","pregunta":"<qué necesitás que decida el humano>"}\n'
-    "Además podés emitir líneas `CONTROL: {\"accion\":\"limpiar_memoria\",\"agente\":\"<opcional>\"}` "
-    "ANTES de la línea final. Si delegás o preguntás, vas a recibir la(s) respuesta(s) en el próximo turno "
-    "de esta misma conversación. NUNCA termines sin la línea CONTROL."
+    "CONTROL PROTOCOL (MANDATORY — you are an employee of the orchestrator): your answer "
+    "MUST end with ONE exact line `CONTROL: {json}` carrying one of these actions:\n"
+    'CONTROL: {"action":"respond","message":"<your result, concrete and verifiable>"}\n'
+    'CONTROL: {"action":"delegate","agent":"<subordinate name>","message":"<what they have to do>"}\n'
+    'CONTROL: {"action":"delegate","agents":["<name A>","<name B>"],"join":"all","message":"<what they have to do>"} '
+    '— delegates to SEVERAL IN PARALLEL; join "all" = I wake you once with every answer together, '
+    '"each" = I wake you with each answer as it arrives\n'
+    'CONTROL: {"action":"ask_user","question":"<what you need the human to decide>"}\n'
+    'You may also emit `CONTROL: {"action":"clear_memory","agent":"<optional>"}` lines '
+    "BEFORE the final line. If you delegate or ask, you will receive the answer(s) on the next turn "
+    "of this same conversation. NEVER finish without the CONTROL line."
 )
 
 
@@ -1920,23 +1945,23 @@ def _cli_resource_notes(ctx, graph, node):
         if meta.get("type") == "editor":
             target = editorfs.get_target(ctx["app_dir"], rpid)
             if not target:
-                notes.append(f"- «{meta.get('name')}» (editor): sin carpeta configurada — no usar")
+                notes.append(f"- «{meta.get('name')}» (editor): no folder configured — do not use")
                 continue
             if confinado:
                 name = f"dmfs{r['id']}"
                 mcp[name] = {"projectId": rpid, "perm": lvl}
-                tools = "leer" if lvl < 1 else ("leer/escribir/ejecutar" if lvl >= 2 else "leer/escribir")
-                notes.append(f"- «{meta.get('name')}» (editor, permiso {perm}): usá SOLO las tools "
-                             f"`mcp__{name}__*` ({tools}). NO tenés la carpeta montada: no la busques "
-                             "en el disco, todo va por esas tools.")
+                tools = "read" if lvl < 1 else ("read/write/exec" if lvl >= 2 else "read/write")
+                notes.append(f"- «{meta.get('name')}» (editor, permission {perm}): use ONLY the "
+                             f"`mcp__{name}__*` tools ({tools}). You do NOT have the folder mounted: don't "
+                             "look for it on disk, everything goes through those tools.")
             elif lvl >= 1:
                 add_dirs.append(target)
-                notes.append(f"- «{meta.get('name')}» (editor, permiso {perm}): la carpeta real "
-                             f"{target} — trabajá DIRECTO ahí con tus herramientas de archivos")
+                notes.append(f"- «{meta.get('name')}» (editor, permission {perm}): the real folder "
+                             f"{target} — work DIRECTLY there with your file tools")
             else:
-                notes.append(f"- «{meta.get('name')}» (editor, permiso leer): NO lo tenés montado "
-                             "(las tools nativas no distinguen lectura de escritura). Si necesitás "
-                             "leerlo, pedile al humano que lo ponga en modo confinado.")
+                notes.append(f"- «{meta.get('name')}» (editor, permission leer): it is NOT mounted "
+                             "(native tools don't tell reading from writing apart). If you need to "
+                             "read it, ask the human to switch it to confined mode.")
         else:
             # diagrama: es UN archivo dentro del mirror. Se monta su subdirectorio, no
             # la carpeta entera (en confinado también: no hay MCP de diagramas todavía).
@@ -1944,8 +1969,8 @@ def _cli_resource_notes(ctx, graph, node):
             if lvl >= 1:
                 add_dirs.append(sub)
             rel = os.path.join(sub, "tree.json")
-            notes.append(f"- «{meta.get('name')}» ({meta.get('type')}, permiso {perm}): el diagrama "
-                         f"{rel} — editalo respetando el esquema EXACTO de su tipo "
+            notes.append(f"- «{meta.get('name')}» ({meta.get('type')}, permission {perm}): the diagram "
+                         f"{rel} — edit it respecting the EXACT schema of its type "
                          f"(skill diagramind-{str(meta.get('type')).lower()})")
     return notes, add_dirs, mcp, exec_ok
 
@@ -1961,23 +1986,24 @@ def _has_editor(ctx, graph, node_id):
 
 
 def _cli_system(ctx, graph, node, notes):
+    """System prompt de una cabeza CLI. Va al MODELO → en inglés (doc 20 §L)."""
     d = node.get("data") or {}
     any_editor = _has_editor(ctx, graph, node["id"])
     partes = [
-        f"Sos «{node.get('titulo') or 'agente'}», un empleado IA de la empresa (IA Orchestrator de DiagraMinder).",
-        f"TU ROL: {d.get('rol') or '(sin rol definido — trabajá con criterio)'}",
+        f"You are «{node.get('titulo') or 'agent'}», an AI employee of the company (DiagraMinder's IA Orchestrator).",
+        f"YOUR ROLE: {d.get('rol') or '(no role defined — use your best judgement)'}",
     ]
     targets = delega_targets(graph, node["id"])
     if targets:
         if d.get("secuencial"):
-            partes.append("SUBORDINADOS (sos SECUENCIAL: delegá de a UNO — accion delegar con `agente` — y "
-                          "esperá cada respuesta; NUNCA uses `agentes` múltiple): " +
+            partes.append("SUBORDINATES (you are SEQUENTIAL: delegate to ONE at a time — the delegate action "
+                          "with `agent` — and wait for each answer; NEVER use the multiple `agents`): " +
                           "; ".join(f"«{t.get('titulo') or t['id']}» ({(t.get('data') or {}).get('rol', '')[:80]})" for t in targets))
         else:
-            partes.append("SUBORDINADOS (podés delegarles — a varios EN PARALELO — y esperás su(s) respuesta(s)): " +
+            partes.append("SUBORDINATES (you can delegate to them — to several IN PARALLEL — and you wait for their answer(s)): " +
                           "; ".join(f"«{t.get('titulo') or t['id']}» ({(t.get('data') or {}).get('rol', '')[:80]})" for t in targets))
     if notes:
-        partes.append("TUS RECURSOS:\n" + "\n".join(notes))
+        partes.append("YOUR RESOURCES:\n" + "\n".join(notes))
     blk = data_block(graph, node["id"])
     if blk:
         partes.append(blk)
@@ -1987,67 +2013,71 @@ def _cli_system(ctx, graph, node, notes):
         if mem:
             lines = [f"- [{time.strftime('%Y-%m-%d %H:%M', time.localtime(m['ts'] / 1000))}] {m['texto']}"
                      for m in mem[-12:]]
-            partes.append("TU MEMORIA (trabajos y charlas anteriores):\n" + "\n".join(lines))
+            partes.append("YOUR MEMORY (previous work and conversations):\n" + "\n".join(lines))
     if d.get("director"):
-        partes.append("👑 SOS DIRECTOR de esta empresa (decisión U): podés gestionar el organigrama "
-                      f"editando DIRECTO el archivo {ctx['graph_path']} (seguí la skill "
-                      "diagramind-orchestrator y respetá su esquema EXACTO — org completo, ids únicos, "
-                      "contadores). Podés crear/editar/borrar agentes, recursos y flechas, incluso a "
-                      "vos mismo. REGLAS: editar el grafo NUNCA dispara runs; hacé SOLO los cambios "
-                      "que te pidieron y conservá el resto.")
+        partes.append("👑 YOU ARE THE DIRECTOR of this company (decision U): you can manage the org chart "
+                      f"by editing the file {ctx['graph_path']} DIRECTLY (follow the "
+                      "diagramind-orchestrator skill and respect its EXACT schema — the whole org, unique ids, "
+                      "counters). You can create/edit/delete agents, resources and arrows, including "
+                      "yourself. RULES: editing the graph NEVER triggers runs; make ONLY the changes "
+                      "you were asked for and keep the rest.")
     if d.get("confinado"):
         # Decirle QUÉ tiene, no solo qué le falta: si no, gasta turnos buscando Read/Bash
         # y "descubriendo" que no están. Los nombres son los del server de cada recurso.
         partes.append(
-            "SOS UN AGENTE CONFINADO (decisión X): NO tenés la carpeta de proyectos montada y "
-            "tus tools nativas de archivos (Read/Write/Edit/Bash/Glob/Grep) están DESHABILITADAS. "
-            "No las busques ni intentes `cd`: no existen para vos.\n"
-            "TRABAJÁS CON ESTAS, una tanda por recurso editor (`<id>` es el del recurso, mirá "
-            "TUS RECURSOS más arriba):\n"
-            "- `mcp__dmfs<id>__fs_tree` — listar UN nivel (el equivalente a `ls`; pasá `dir` "
-            "para bajar a un subdirectorio)\n"
-            "- `mcp__dmfs<id>__fs_read` — leer un archivo · `mcp__dmfs<id>__fs_grep` — buscar "
-            "texto (acepta `glob`, es tu `grep -r`)\n"
-            "- `mcp__dmfs<id>__fs_write` — escribir un archivo COMPLETO (leé primero, mandá todo "
-            "el contenido nuevo) · `fs_mkdir` / `fs_rename` / `fs_delete`\n"
-            "- `mcp__dmfs<id>__sv_save` — guardá una VERSIÓN antes de una tanda de cambios · "
+            "YOU ARE A CONFINED AGENT (decision X): you do NOT have the projects folder mounted and "
+            "your native file tools (Read/Write/Edit/Bash/Glob/Grep) are DISABLED. "
+            "Don't look for them and don't try to `cd`: they don't exist for you.\n"
+            "YOU WORK WITH THESE, one batch per editor resource (`<id>` is the resource's, see "
+            "YOUR RESOURCES above):\n"
+            "- `mcp__dmfs<id>__fs_tree` — list ONE level (the equivalent of `ls`; pass `dir` "
+            "to go down into a subdirectory)\n"
+            "- `mcp__dmfs<id>__fs_read` — read a file · `mcp__dmfs<id>__fs_grep` — search "
+            "text (it takes a `glob`, it is your `grep -r`)\n"
+            "- `mcp__dmfs<id>__fs_write` — write a COMPLETE file (read first, send all "
+            "the new content) · `fs_mkdir` / `fs_rename` / `fs_delete`\n"
+            "- `mcp__dmfs<id>__sv_save` — save a VERSION before a batch of changes · "
             "`sv_list` / `sv_restore`\n"
-            "- `mcp__dmfs<id>__fs_exec` — SOLO si el recurso tiene permiso `ejecutar`: es una "
-            "shell REAL con el cwd en la carpeta del editor, ahí corrés `ls`, `find`, tests, "
-            "build, git, lo que necesites.\n"
-            "Es el mismo juego de herramientas que usan los agentes de API: alcanza de sobra "
-            "para codear. Si te falta algo, pedilo con preguntar_al_usuario en vez de inventar "
-            "un camino por afuera.")
-    reglas = ["Trabajá SOLO en lo que te pidieron.",
-              "Tocá ÚNICAMENTE tus recursos (no otros proyectos de la carpeta).",
-              "Respondé en español, concreto."]
+            "- `mcp__dmfs<id>__fs_exec` — ONLY if the resource has the `ejecutar` permission: it is a "
+            "REAL shell with cwd in the editor folder, that's where you run `ls`, `find`, tests, "
+            "builds, git, whatever you need.\n"
+            "It is the same toolset the API agents use: it is more than enough "
+            "to write code. If something is missing, ask for it with the ask_user action instead of "
+            "inventing a way around it.")
+    reglas = ["Work ONLY on what you were asked for.",
+              "Touch ONLY your resources (not other projects of the folder).",
+              "Answer concretely, in the same language the user/your caller writes to you in."]
     if not notes:
         # sin recursos cableados no tiene DÓNDE trabajar: que pregunte en vez de
         # inventar una ruta (antes tenía el mirror entero montado y "algo" hacía).
         partes.append(
-            "NO TENÉS NINGÚN RECURSO ASIGNADO. No hay ninguna carpeta ni archivo que puedas "
-            "tocar, y no tenés que buscarte uno: si la tarea implica leer o escribir código o "
-            "archivos, NO la intentes — usá `CONTROL: {\"accion\":\"preguntar_al_usuario\", "
-            "\"pregunta\":\"...\"}` y pedí que te cableen un recurso editor (o preguntá dónde "
-            "querés que trabaje). Si la tarea es solo pensar o responder, hacela normal.")
+            "YOU HAVE NO RESOURCES ASSIGNED. There is no folder and no file you can "
+            "touch, and you are not supposed to find one yourself: if the task involves reading or "
+            "writing code or files, do NOT attempt it — use `CONTROL: {\"action\":\"ask_user\", "
+            "\"question\":\"...\"}` and ask them to wire an editor resource to you (or ask where "
+            "they want you to work). If the task is just thinking or answering, do it normally.")
     elif not any_editor:
         partes.append(
-            "OJO: no tenés ningún recurso EDITOR asignado, así que no tenés dónde escribir "
-            "código ni archivos sueltos — solo los diagramas de arriba. Si lo que te pidieron "
-            "necesita un proyecto de código, NO improvises una ruta: preguntá con "
-            "`CONTROL: {\"accion\":\"preguntar_al_usuario\",\"pregunta\":\"...\"}` para que te "
-            "asignen un recurso editor.")
+            "HEADS UP: you have no EDITOR resource assigned, so you have nowhere to write "
+            "code or loose files — only the diagrams above. If what you were asked for "
+            "needs a code project, do NOT improvise a path: ask with "
+            "`CONTROL: {\"action\":\"ask_user\",\"question\":\"...\"}` so they "
+            "assign you an editor resource.")
     else:
-        reglas.insert(1, "Todo el trabajo sobre archivos va DENTRO de tus recursos editor: son "
-                         "el único lugar donde podés escribir y donde el usuario puede revisar y "
-                         "deshacer lo que hiciste. No crees archivos en ningún otro lado.")
-    partes.append("REGLAS: " + " ".join(f"{i}) {r}" for i, r in enumerate(reglas, 1)))
+        reglas.insert(1, "All file work happens INSIDE your editor resources: they are "
+                         "the only place where you can write and where the user can review and "
+                         "undo what you did. Do not create files anywhere else.")
+    partes.append("RULES: " + " ".join(f"{i}) {r}" for i, r in enumerate(reglas, 1)))
     partes.append(CLI_PROTOCOL)
     return "\n\n".join(partes)
 
 
 def _parse_control(text):
-    """(acciones_limpiar, accion_final|None, texto_sin_lineas_control)."""
+    """(acciones_limpiar, accion_final|None, texto_sin_lineas_control).
+
+    El protocolo es `{"action": "respond|delegate|ask_user|clear_memory", ...}`; se
+    aceptan además la clave vieja `accion` y los nombres viejos en español (alias),
+    para no romper sesiones CLI que ya venían con el protocolo anterior."""
     limpiar, final, visibles = [], None, []
     for line in (text or "").splitlines():
         stripped = line.strip()
@@ -2057,7 +2087,8 @@ def _parse_control(text):
             except Exception:
                 visibles.append(line)
                 continue
-            if obj.get("accion") == "limpiar_memoria":
+            obj["action"] = _ctl(obj.get("action") or obj.get("accion"))
+            if obj["action"] == "clear_memory":
                 limpiar.append(obj)
             else:
                 final = obj
@@ -2206,7 +2237,7 @@ def _turn_cli(ctx, graph, run, frame):
     cv = _rt(ctx["pid"])["cv"]
     with cv:
         items, frame["inbox"] = frame["inbox"], []
-        message = "\n\n".join(("⚠ " if it.get("is_error") else "") + it["text"] for it in items) or "(continuá)"
+        message = "\n\n".join(("⚠ " if it.get("is_error") else "") + it["text"] for it in items) or "(carry on)"
         frame["iters"] += 1
         set_node_state(ctx, run, node["id"], "running")
     try:
@@ -2240,7 +2271,7 @@ def _turn_cli(ctx, graph, run, frame):
         limpiar, accion, visible = _parse_control(text)
 
         for lm in limpiar:
-            who = (lm.get("agente") or "").strip()
+            who = str(_arg(lm, "agent", "agente") or "").strip()
             if not who:
                 mem_clear(ctx, node["id"])
                 emit(run, "log", nodeId=node["id"], text="limpió su memoria")
@@ -2251,33 +2282,33 @@ def _turn_cli(ctx, graph, run, frame):
                     emit(run, "log", nodeId=node["id"], text=f"limpió la memoria de «{target.get('titulo')}»")
 
         if accion is None:
-            _implicit_end(ctx, graph, run, frame, visible or "(sin respuesta)")
-        elif accion.get("accion") == "responder":
+            _implicit_end(ctx, graph, run, frame, visible or "(no answer)")
+        elif accion.get("action") == "respond":
             if frame["waiting"]:
                 faltan = ", ".join(f"«{v}»" for v in frame["waiting"].values())
-                frame["inbox"].append({"text": f"todavía esperás las respuestas de: {faltan} — "
-                                               "no podés responder hasta que lleguen", "is_error": True})
+                frame["inbox"].append({"text": f"you are still waiting for the answers of: {faltan} — "
+                                               "you cannot respond until they arrive", "is_error": True})
                 frame["status"] = "ready"
             else:
-                _do_responder(ctx, graph, run, frame, str(accion.get("mensaje") or visible or "(sin respuesta)"))
+                _do_responder(ctx, graph, run, frame, str(_arg(accion, "message", "mensaje") or visible or "(no answer)"))
         elif frame["iters"] > MAX_TOOL_ITERS:
-            _implicit_end(ctx, graph, run, frame, visible + "\n(corté: demasiadas iteraciones)")
-        elif accion.get("accion") == "delegar":
+            _implicit_end(ctx, graph, run, frame, visible + "\n(cut off: too many iterations)")
+        elif accion.get("action") == "delegate":
             err = _do_delegar(ctx, graph, run, frame, node, accion)
             if err:
-                frame["inbox"].append({"text": err + ". Elegí un subordinado válido o respondé.", "is_error": True})
+                frame["inbox"].append({"text": err + ". Pick a valid subordinate or respond.", "is_error": True})
                 frame["status"] = "ready"
-        elif accion.get("accion") == "preguntar_al_usuario":
+        elif accion.get("action") == "ask_user":
             frame["status"] = "waiting_human"
             _release_locks(run, frame["id"])
-            p = {"frameId": frame["id"], "nodeId": node["id"], "question": str(accion.get("pregunta") or "")}
+            p = {"frameId": frame["id"], "nodeId": node["id"], "question": str(_arg(accion, "question", "pregunta") or "")}
             run["pendings"].append(p)
             run["pending"] = run["pendings"][0]
             set_node_state(ctx, run, node["id"], "asking")
             emit(run, "ask", nodeId=node["id"], question=p["question"])
         else:
-            frame["inbox"].append({"text": f"acción CONTROL desconocida: {accion.get('accion')}. "
-                                           "Usá responder/delegar/preguntar_al_usuario.", "is_error": True})
+            frame["inbox"].append({"text": f"unknown CONTROL action: {accion.get('action')}. "
+                                           "Use respond/delegate/ask_user.", "is_error": True})
             frame["status"] = "ready"
         _save(ctx, run)
 
@@ -2327,7 +2358,7 @@ def answer(ctx, text, node_id=None):
         frame = run["frames"][p["frameId"]]
         emit(run, "log", nodeId=p["nodeId"], text=f"usuario responde: {text[:200]}")
         # la respuesta del humano va PRIMERA (resuelve el tool_result de la pregunta)
-        frame["inbox"].insert(0, {"text": f"Respuesta del usuario: {text}"})
+        frame["inbox"].insert(0, {"text": f"Answer from the user: {text}"})
         frame["status"] = "ready"
         pendings.remove(p)
         run["pending"] = pendings[0] if pendings else None
@@ -2756,7 +2787,7 @@ def inspect_node(ctx, node_id):
     for t in rtools + mtools:
         buckets.setdefault(str(t["name"]).split("_")[0], []).append(t)
     groups.append({"origin": "control", "label": "Orchestrator control",
-                   "note": ("Always present. `delegar` shows up only if the node has outgoing "
+                   "note": ("Always present. `delegate` shows up only if the node has outgoing "
                             "`delega` arrows."), "tools": ctrl})
     if otools:
         groups.append({"origin": "director", "label": "Director (crown tick)",

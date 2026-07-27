@@ -11,12 +11,15 @@ from util import safe_name
 from runs import set_status
 
 
+# IDIOMA: estas notas van al MODELO (system prompt / prompt del CLI) → SIEMPRE en
+# inglés, sin importar el idioma de la app. Ver doc 20 §L.
+
 def _focus_note(folder, focus_name):
     return (
-        f"ESTÁS TRABAJANDO EN LA CARPETA «{folder}». Sus proyectos están en "
-        f"./index.json y cada uno en ./<Nombre>/tree.json. El proyecto en FOCO es "
-        f"«{focus_name}» → ./{safe_name(focus_name)}/tree.json: escribí ahí salvo que "
-        f"el usuario te indique otro proyecto de ESTA carpeta."
+        f"YOU ARE WORKING IN THE FOLDER «{folder}». Its projects are listed in "
+        f"./index.json and each one lives in ./<Name>/tree.json. The FOCUSED project is "
+        f"«{focus_name}» → ./{safe_name(focus_name)}/tree.json: write there unless "
+        f"the user points you at another project of THIS folder."
     )
 
 
@@ -24,12 +27,12 @@ def _editor_note(folder, focus_name, target):
     """Nota de foco cuando el proyecto es tipo `editor` (doc 27): el trabajo real es
     la carpeta target (accesible por --add-dir), NO el tree.json del mirror."""
     return (
-        f"ESTÁS TRABAJANDO EN LA CARPETA «{folder}». El proyecto en FOCO, "
-        f"«{focus_name}», es un proyecto EDITOR: abre la carpeta real «{target}» y "
-        f"tenés acceso directo a ella. Trabajá DIRECTAMENTE sobre los archivos de "
-        f"esa carpeta con tus herramientas normales (leer/editar/bash). NO toques "
-        f"./{safe_name(focus_name)}/tree.json (es solo un puntero {{type, target}}) "
-        f"y los esquemas diagramind-* NO aplican a este proyecto."
+        f"YOU ARE WORKING IN THE FOLDER «{folder}». The FOCUSED project, "
+        f"«{focus_name}», is an EDITOR project: it opens the real folder «{target}» and "
+        f"you have direct access to it. Work DIRECTLY on the files of that folder with "
+        f"your normal tools (read/edit/bash). Do NOT touch "
+        f"./{safe_name(focus_name)}/tree.json (it is only a {{type, target}} pointer) "
+        f"and the diagramind-* schemas do NOT apply to this project."
     )
 
 
@@ -37,20 +40,20 @@ def _editor_relay_note(folder, focus_name):
     """Nota de foco para un editor cuyo target vive en un CONECTOR EXTERNO: los
     archivos NO están en esta máquina; se opera con las tools MCP mcp__dmfs__*."""
     return (
-        f"ESTÁS TRABAJANDO EN LA CARPETA «{folder}». El proyecto en FOCO, "
-        f"«{focus_name}», es un proyecto EDITOR cuyo contenido vive en un CONECTOR "
-        f"EXTERNO: sus archivos NO están en este disco. Para explorarlos y editarlos "
-        f"usá EXCLUSIVAMENTE las tools MCP del server «dmfs» (mcp__dmfs__fs_tree, "
-        f"fs_read, fs_write, fs_mkdir, fs_rename, fs_delete, fs_grep, fs_exec), con "
-        f"rutas RELATIVAS a la raíz del proyecto. Flujo típico: fs_tree para "
-        f"orientarte → fs_grep/fs_read para entender → fs_write con el archivo "
-        f"COMPLETO para editar. fs_exec requiere ser admin del conector (si da 403, "
-        f"no insistas). ANTES de una tanda de cambios guardá una VERSIÓN con "
-        f"mcp__dmfs__sv_save({{note}}) — permite deshacer lo tuyo; sv_list muestra el "
-        f"historial y sv_restore vuelve a una versión SOLO si el usuario lo pide. "
-        f"NO uses tus herramientas locales de archivos para este "
-        f"proyecto: ./{safe_name(focus_name)}/tree.json es solo un puntero y los "
-        f"esquemas diagramind-* no aplican."
+        f"YOU ARE WORKING IN THE FOLDER «{folder}». The FOCUSED project, "
+        f"«{focus_name}», is an EDITOR project whose content lives on an EXTERNAL "
+        f"CONNECTOR: its files are NOT on this disk. To explore and edit them "
+        f"use EXCLUSIVELY the MCP tools of the «dmfs» server (mcp__dmfs__fs_tree, "
+        f"fs_read, fs_write, fs_mkdir, fs_rename, fs_delete, fs_grep, fs_exec), with "
+        f"paths RELATIVE to the project root. Typical flow: fs_tree to get your "
+        f"bearings → fs_grep/fs_read to understand → fs_write with the COMPLETE file "
+        f"to edit. fs_exec requires being an admin of the connector (if it returns 403, "
+        f"don't insist). BEFORE a batch of changes save a VERSION with "
+        f"mcp__dmfs__sv_save({{note}}) — it lets the user undo your work; sv_list shows the "
+        f"history and sv_restore rolls back to a version ONLY if the user asks. "
+        f"Do NOT use your local file tools for this "
+        f"project: ./{safe_name(focus_name)}/tree.json is only a pointer and the "
+        f"diagramind-* schemas do not apply."
     )
 
 
@@ -60,19 +63,20 @@ def _headless_prompt(folder, focus_name, message):
     preguntan en vez de actuar. Por eso la orden imperativa va al principio Y al final."""
     focus_path = f"./{safe_name(focus_name)}/tree.json"
     return (
-        "SOS UN AGENTE QUE EDITA ARCHIVOS, NO UN CHAT. En ESTE MISMO TURNO tenés que "
-        f"ABRIR y MODIFICAR el archivo `{focus_path}` con tus herramientas de escritura, "
-        "para cumplir la instrucción del usuario. Está PROHIBIDO terminar sin haber "
-        "editado el archivo, y PROHIBIDO responder con preguntas o pidiendo confirmación.\n\n"
+        "YOU ARE AN AGENT THAT EDITS FILES, NOT A CHAT. In THIS VERY TURN you have to "
+        f"OPEN and MODIFY the file `{focus_path}` with your writing tools, "
+        "to carry out the user's instruction. It is FORBIDDEN to finish without having "
+        "edited the file, and FORBIDDEN to answer with questions or asking for confirmation.\n\n"
         + _focus_note(folder, focus_name) +
-        "\n\nREGLAS:\n"
-        f"1. Editá DIRECTAMENTE `{focus_path}` (no describas lo que harías: HACELO).\n"
-        "2. Respetá EXACTAMENTE el esquema de su tipo (está en AGENTS.md) y dejá el JSON válido.\n"
-        "3. Si la instrucción es vaga ('los que quieras', 'algo', 'lo que sea'), DECIDÍ "
-        "   vos y hacelo igual. NO preguntes.\n"
-        "4. Cuando termines, respondé en UNA sola línea qué cambiaste.\n\n"
-        f"INSTRUCCIÓN DEL USUARIO: {message}\n\n"
-        f"AHORA editá `{focus_path}` y aplicá ese cambio. No respondas sin haberlo hecho."
+        "\n\nRULES:\n"
+        f"1. Edit `{focus_path}` DIRECTLY (don't describe what you would do: DO IT).\n"
+        "2. Respect the EXACT schema of its type (it is in AGENTS.md) and leave valid JSON.\n"
+        "3. If the instruction is vague ('whichever you want', 'something', 'anything'), "
+        "   DECIDE yourself and do it anyway. Do NOT ask.\n"
+        "4. When you are done, answer in ONE single line what you changed, in the same "
+        "   language the user wrote to you in.\n\n"
+        f"USER INSTRUCTION: {message}\n\n"
+        f"NOW edit `{focus_path}` and apply that change. Don't answer without having done it."
     )
 
 
