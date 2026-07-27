@@ -852,7 +852,31 @@ def _http_json(url, headers, body):
         raise OrchError(502, f"no pude hablar con la API: {e}")
 
 
+CACHE_CONTROL = {"type": "ephemeral"}          # TTL 5 min: break-even a los 2 requests
+
+
+def _cached_messages(messages):
+    """`messages` con `cache_control` en el ÚLTIMO bloque del ÚLTIMO mensaje.
+
+    Copia el camino que toca en vez de mutar el transcript guardado: un marcador
+    pegado en el historial se acumularía uno por turno y la API rechaza el request
+    a partir del quinto (máximo 4 breakpoints)."""
+    if not messages:
+        return messages
+    last = messages[-1]
+    blocks = last.get("content")
+    if not isinstance(blocks, list) or not blocks or not isinstance(blocks[-1], dict):
+        return messages
+    marked = {**blocks[-1], "cache_control": CACHE_CONTROL}
+    return messages[:-1] + [{**last, "content": blocks[:-1] + [marked]}]
+
+
 class AnthropicChat:
+    """Adapter de Anthropic CON prompt caching (2026-07-27). El orden de render es
+    tools → system → messages, así que un breakpoint al final del system cachea
+    tools + system juntos y otro al final del transcript cachea lo ya visto. Leer de
+    caché sale 0,1× y escribir 1,25×: a partir del segundo turno del frame conviene."""
+
     provider = "anthropic"
 
     def __init__(self, key, model, effort):
@@ -867,8 +891,10 @@ class AnthropicChat:
         return {"role": "user", "content": [{"type": "text", "text": text}]}
 
     def call(self, system, messages, tools):
-        body = {"model": self.model, "max_tokens": 8192, "system": system,
-                "messages": messages, "tools": self.tools_spec(tools)}
+        # el system va como lista de bloques (la forma string no admite cache_control)
+        body = {"model": self.model, "max_tokens": 8192,
+                "system": [{"type": "text", "text": system, "cache_control": CACHE_CONTROL}],
+                "messages": _cached_messages(messages), "tools": self.tools_spec(tools)}
         if self.effort:
             body["output_config"] = {"effort": self.effort}
         r = _http_json(self.base + "/v1/messages",
@@ -881,7 +907,10 @@ class AnthropicChat:
                 calls.append({"id": b["id"], "name": b["name"], "input": b.get("input") or {}})
         usage = r.get("usage", {})
         return {"text": text, "tool_calls": calls,
-                "usage": {"in": usage.get("input_tokens", 0), "out": usage.get("output_tokens", 0)},
+                "usage": {"in": usage.get("input_tokens", 0), "out": usage.get("output_tokens", 0),
+                          # cacheW = tokens escritos a caché (1,25×) · cacheR = leídos (0,1×)
+                          "cacheW": usage.get("cache_creation_input_tokens", 0),
+                          "cacheR": usage.get("cache_read_input_tokens", 0)},
                 "assistant_msg": {"role": "assistant", "content": r.get("content", [])}}
 
     def tool_results_msg(self, results):
@@ -1350,11 +1379,15 @@ def set_node_state(ctx, run, node_id, status):
 
 
 def add_spend(run, node_id, usage):
+    # cacheW/cacheR solo los reporta el adapter de Anthropic; en los otros quedan en 0
     for key in (str(node_id), "total"):
         s = run["spend"].setdefault(key, {"turns": 0, "in": 0, "out": 0})
         s["turns"] += 1
         s["in"] += usage.get("in", 0)
         s["out"] += usage.get("out", 0)
+        for k in ("cacheW", "cacheR"):
+            if usage.get(k):
+                s[k] = s.get(k, 0) + usage[k]
     emit(run, "spend", total=run["spend"]["total"])
 
 
@@ -2007,11 +2040,11 @@ def _stats_of(ctx, node_id):
     """Pestaña Info: en cuántos runs laburó este nodo y cuánto gastó (acumulado de los
     runs archivados + el vivo/último) y en qué estado está ahora."""
     key = str(node_id)
-    zero = {"turns": 0, "in": 0, "out": 0, "usd": 0.0}
+    zero = {"turns": 0, "in": 0, "out": 0, "cacheW": 0, "cacheR": 0, "usd": 0.0}
     acc, runs = dict(zero), 0
 
     def add(dst, sp):
-        for k in ("turns", "in", "out"):
+        for k in ("turns", "in", "out", "cacheW", "cacheR"):
             dst[k] += sp.get(k, 0) or 0
         dst["usd"] = round(dst["usd"] + (sp.get("usd", 0.0) or 0.0), 6)
 
