@@ -375,6 +375,35 @@ def mcps_of(graph, node_id):
     return out
 
 
+def datas_of(graph, node_id):
+    """Nodos agData conectados por `contexto` (doc 28, decisión Y). Contexto estático
+    —reglas, convenciones, aclaraciones— que se inyecta en el SYSTEM del agente."""
+    out = []
+    for f in graph["flechas"]:
+        if f.get("kind") == "contexto" and int(f.get("fromId", -1)) == int(node_id):
+            d = graph["nodos"].get(int(f["toId"]))
+            if d and d.get("type") == "agData":
+                out.append(d)
+    return out
+
+
+def data_block(graph, node_id):
+    """El bloque de contexto estático para el system, o "" si no tiene ninguno.
+    Va SIEMPRE (no a demanda): una regla que el agente decide si leer es una regla
+    que se saltea. Con prompt caching el reenvío sale 0,1x por turno."""
+    partes = []
+    for d in datas_of(graph, node_id):
+        txt = ((d.get("data") or {}).get("contenido") or "").strip()
+        if not txt:
+            continue
+        partes.append(f"### {d.get('titulo') or 'sin titulo'}\n{txt}")
+    if not partes:
+        return ""
+    return ("CONTEXTO FIJO DE TU EMPRESA (reglas, convenciones y aclaraciones que te "
+            "dejaron por escrito — valen para TODO lo que hagas, no las contradigas):\n\n"
+            + "\n\n".join(partes))
+
+
 def _mcp_headers(ctx, node_id):
     cred = keys_read(ctx).get(f"mcp:{node_id}") or {}
     key = cred.get("key")
@@ -684,10 +713,12 @@ def _after_run(ctx, run):
 
 # ===================== grafo =====================
 
-NODE_TYPES = {"agAgent", "agResource", "agTask", "agDept", "agWebhook", "agMcp"}
+NODE_TYPES = {"agAgent", "agResource", "agTask", "agDept", "agWebhook", "agMcp",
+              "agData"}
 ARROW_OK = {("delega", "agAgent", "agAgent"), ("usa", "agAgent", "agResource"),
             ("usa", "agAgent", "agMcp"), ("task", "agTask", "agAgent"),
-            ("trigger", "agWebhook", "agAgent")}
+            ("trigger", "agWebhook", "agAgent"),
+            ("contexto", "agAgent", "agData")}
 
 
 def validate_graph(ctx, obj):
@@ -1315,6 +1346,10 @@ def build_system(ctx, graph, node, notes):
                           "; ".join(f"«{t.get('titulo') or t['id']}» ({(t.get('data') or {}).get('rol', '')[:80]})" for t in targets))
     if notes:
         partes.append("TUS RECURSOS (tools con el prefijo indicado):\n" + "\n".join(notes))
+    blk = data_block(graph, nid)
+    if blk:
+        partes.append(blk)
+
     if (d.get("memoria") or {}).get("enabled", True):
         mem = mem_read(ctx, nid)
         if mem:
@@ -2095,6 +2130,10 @@ def _wiring_of(graph, node_id):
                      for r in resources_of(graph, nid)],
         "mcps": [{"id": m["id"], "titulo": m.get("titulo"),
                   "tipo": (m.get("data") or {}).get("tipo")} for m in mcps_of(graph, nid)],
+        # contexto estático (decisión Y): el peso importa, viaja en CADA turno
+        "datas": [{"id": d["id"], "titulo": d.get("titulo"),
+                   "chars": len(((d.get("data") or {}).get("contenido") or "").strip())}
+                  for d in datas_of(graph, nid)],
         "entradas": entradas,
     }
 
