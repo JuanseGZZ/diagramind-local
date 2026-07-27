@@ -762,6 +762,46 @@ def mem_clear(ctx, node_id):
         os.remove(_mem_path(ctx, node_id))
     except OSError:
         pass
+    cli_session_clear(ctx, node_id)     # la sesión CLI vive y muere con la memoria
+
+
+# ---- sesión CLI por AGENTE (2026-07-27) ----
+# Antes el `sessionId` de Claude Code vivía en el FRAME, así que cada delegación
+# arrancaba una sesión nueva: el mismo Dev, llamado dos veces en un run, no se
+# acordaba de lo que acababa de escribir y releía todo pagando cache-write de nuevo
+# (medido: los frames en frío salieron ~3× por turno que los del PM, que sí encadena
+# sus turnos con --resume). Ahora la sesión es del NODO y persiste entre runs, igual
+# que la memoria — y `limpiar_memoria` la corta: cuando el PM cierra una tarea y le
+# limpia la memoria al empleado, también arranca sesión nueva. Esa es la frontera
+# natural (decisión N: "la memoria perdura POR TAREA").
+#
+# Si la memoria del nodo está DESHABILITADA no se persiste nada: el humano pidió que
+# no recuerde, y una sesión viva lo haría recordar igual por la ventana del CLI.
+
+def _mem_on(node):
+    return ((node.get("data") or {}).get("memoria") or {}).get("enabled", True)
+
+
+def _cli_sessions_path(ctx):
+    return os.path.join(orch_dir(ctx["app_dir"], ctx["pid"]), "cli_sessions.json")
+
+
+def cli_session_get(ctx, node_id):
+    return (_read_json(_cli_sessions_path(ctx), {}) or {}).get(str(node_id))
+
+
+def cli_session_set(ctx, node_id, session_id):
+    d = _read_json(_cli_sessions_path(ctx), {}) or {}
+    if d.get(str(node_id)) == session_id:
+        return
+    d[str(node_id)] = session_id
+    _write_json(_cli_sessions_path(ctx), d)
+
+
+def cli_session_clear(ctx, node_id):
+    d = _read_json(_cli_sessions_path(ctx), {}) or {}
+    if d.pop(str(node_id), None) is not None:
+        _write_json(_cli_sessions_path(ctx), d)
 
 
 def chat_read(ctx, node_id):
@@ -1380,7 +1420,12 @@ def _new_frame(ctx, graph, run, node, entry_kind, initial_text, parent_id=None):
         if provider != "local":
             raise OrchError(400, f"el nodo «{node.get('titulo')}» usa '{provider}': como cabeza CLI "
                                  "por ahora solo está soportado Claude Code (fase 4 v1)")
-        frame = {**base, "kind": "cli", "sessionId": None}
+        # retoma la sesión del AGENTE (no del frame): si ya laburó antes y no le
+        # limpiaron la memoria, sigue donde iba en vez de arrancar en frío
+        prev = cli_session_get(ctx, node["id"]) if _mem_on(node) else None
+        frame = {**base, "kind": "cli", "sessionId": prev}
+        if prev:
+            emit(run, "log", nodeId=node["id"], text="retoma su sesión (--resume)")
     else:
         make_adapter(ctx, node)   # valida ya mismo que la key del proveedor esté
         frame = {**base, "kind": "api", "messages": [], "pendingToolId": None, "stash": []}
@@ -2125,13 +2170,29 @@ def _turn_cli(ctx, graph, run, frame):
         message = "\n\n".join(("⚠ " if it.get("is_error") else "") + it["text"] for it in items) or "(continuá)"
         frame["iters"] += 1
         set_node_state(ctx, run, node["id"], "running")
-    text, session_id, cost = _run_cli_turn(ctx, graph, run, node, frame, message)   # ← sin lock
+    try:
+        text, session_id, cost = _run_cli_turn(ctx, graph, run, node, frame, message)   # ← sin lock
+    except OrchError:
+        # el `--resume` puede fallar con una sesión que el CLI ya no tiene (podada,
+        # otra máquina, `claude` reinstalado). Se descarta y se reintenta EN FRÍO una
+        # sola vez, en vez de dejar el run muerto por una sesión vencida.
+        if not frame.get("sessionId") or run.get("_kill"):
+            raise
+        with cv:
+            emit(run, "log", nodeId=node["id"],
+                 text="la sesión guardada ya no existe — arranco una nueva")
+        cli_session_clear(ctx, node["id"])
+        frame["sessionId"] = None
+        text, session_id, cost = _run_cli_turn(ctx, graph, run, node, frame, message)
     with cv:
         if run["status"] != "running" or run.get("_kill"):
             return
         run["turns"] += 1
         if session_id:
             frame["sessionId"] = session_id
+            # persistida a nivel NODO: la próxima delegación la retoma
+            if _mem_on(node):
+                cli_session_set(ctx, node["id"], session_id)
         add_spend(run, node["id"], {"in": 0, "out": 0})
         if cost:
             for key in (str(node["id"]), "total"):
@@ -2620,6 +2681,12 @@ def inspect_node(ctx, node_id):
             "toolGroups": [],
             "refGroups": refs,
             "cli": {"addDirs": add_dirs, "workDir": cwd, "protocol": CLI_PROTOCOL,
+                    # sesión del AGENTE: si hay una guardada, la próxima delegación la
+                    # retoma con --resume en vez de arrancar en frío (y pagarlo)
+                    "session": cli_session_get(ctx, node["id"]) if _mem_on(node) else None,
+                    "sessionNote": ("La sesión se conserva entre delegaciones y se corta con "
+                                    "«limpiar memoria»." if _mem_on(node) else
+                                    "Memoria apagada: cada delegación arranca sesión nueva."),
                     "confinado": confinado, "permissionMode": "acceptEdits",
                     "disallowed": [] if confinado else off,
                     "execOk": exec_ok,
