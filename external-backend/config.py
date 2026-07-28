@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.8.0"   # orquestador: trazabilidad de delegaciones + reanudar un run muerto (doc 28 fase 13)
+VERSION = "0.9.0"   # orquestador: fs_edit + memoria fuera del system (doc 28 fase 14)
 NAME = "DiagraMind Connector"
 
 

@@ -66,7 +66,7 @@ DEFAULT_PORT = 8765
 # del orquestador necesitan la URL propia para hablarle al MCP del editor.
 PORT = DEFAULT_PORT
 NAME = "diagramind-local"
-VERSION = "0.27.0"   # orquestador: trazabilidad de delegaciones + reanudar un run muerto (doc 28 fase 13)
+VERSION = "0.28.0"   # orquestador: fs_edit + memoria fuera del system (doc 28 fase 14)
 
 # ===================== rutas / disco =====================
 
@@ -823,6 +823,12 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/fs/write":
             b = self._read_json()
             self._json(*editorfs.fs_write(app_dir(), b.get("projectId"), b.get("path"), b.get("content")))
+        elif path == "/fs/edit":
+            # reemplazo de texto exacto: la vía barata de cambiar unas líneas (la usan
+            # el modo editor, los agentes API y el MCP de los CLI confinados)
+            b = self._read_json()
+            self._json(*editorfs.fs_edit(app_dir(), b.get("projectId"), b.get("path"),
+                                         b.get("old"), b.get("new") or "", bool(b.get("all"))))
         elif path == "/fs/mkdir":
             b = self._read_json()
             self._json(*editorfs.fs_mkdir(app_dir(), b.get("projectId"), b.get("path")))

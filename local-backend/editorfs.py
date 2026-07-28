@@ -109,6 +109,47 @@ def fs_write(app_dir, pid, rel, content):
     return 200, {"ok": True}
 
 
+def fs_edit(app_dir, pid, rel, old, new, all_hits=False):
+    """Reemplazo de texto EXACTO dentro de un archivo (el equivalente del Edit nativo).
+
+    Por qué existe: sin esto, cambiar dos líneas de un archivo de 8 KB obligaba al
+    agente a mandarlo ENTERO por `fs_write` (~3.000 tokens de salida por corrección),
+    y copiar el archivo a mano le mete bugs — el caso real fue un `\\n` literal que
+    se colonó en el código y costó una tercera reescritura.
+
+    `old` tiene que aparecer UNA sola vez, si no se rechaza pidiendo más contexto
+    (`all_hits=True` reemplaza todas). Devuelve cuántos reemplazos hizo.
+    """
+    err, _, p = _resolve(app_dir, pid, rel)
+    if err:
+        return err
+    if not os.path.isfile(p):
+        return 404, {"error": "file not found"}
+    if not old:
+        return 400, {"error": "`old` is required: the exact text to replace (use fs_write to create a file)"}
+    if old == new:
+        return 400, {"error": "`old` and `new` are identical: nothing to do"}
+    with open(p, "rb") as f:
+        raw = f.read(MAX_READ + 1)
+    if len(raw) > MAX_READ:
+        return 400, {"error": "file too big to edit: use fs_write"}
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return 400, {"error": "binary file"}
+    hits = content.count(old)
+    if hits == 0:
+        return 400, {"error": "`old` does not appear in the file EXACTLY as sent "
+                              "(watch the indentation and the line breaks): read it with fs_read and copy it verbatim"}
+    if hits > 1 and not all_hits:
+        return 400, {"error": f"`old` appears {hits} times: add surrounding lines to make it unique, "
+                              f"or pass all=true to replace all {hits}"}
+    out = content.replace(old, new if new is not None else "", -1 if all_hits else 1)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(out)
+    return 200, {"ok": True, "replaced": hits if all_hits else 1}
+
+
 def fs_mkdir(app_dir, pid, rel):
     err, _, p = _resolve(app_dir, pid, rel)
     if err:

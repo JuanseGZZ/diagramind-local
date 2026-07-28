@@ -144,6 +144,53 @@ def fs_write(body: FsWriteBody, user: dict = Depends(current_user)):
     return {"ok": True}
 
 
+@router.post("/fs/edit")
+def fs_edit(body: FsEditBody, user: dict = Depends(current_user)):
+    """Reemplazo de texto EXACTO dentro de un archivo (el equivalente del Edit nativo).
+
+    Sin esto, cambiar dos líneas de un archivo de 8 KB obligaba al agente a mandarlo
+    ENTERO por `/fs/write` (~3.000 tokens de salida por corrección) y a copiarlo a
+    mano, que es cómo se le colonó un `\\n` literal en el código en un run real.
+    `old` tiene que ser único en el archivo salvo que se pase `all=true`.
+    """
+    _need(user, body.projectId, "write")
+    _, p = _resolve(body.projectId, body.path)
+    if not os.path.isfile(p):
+        raise HTTPException(status_code=404, detail="file not found")
+    if not body.old:
+        raise HTTPException(status_code=400, detail="`old` is required: the exact text to replace "
+                                                   "(use /fs/write to create a file)")
+    new = body.new or ""
+    if body.old == new:
+        raise HTTPException(status_code=400, detail="`old` and `new` are identical: nothing to do")
+    with open(p, "rb") as f:
+        raw = f.read(MAX_READ + 1)
+    if len(raw) > MAX_READ:
+        raise HTTPException(status_code=400, detail="file too big to edit: use /fs/write")
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="binary file")
+    hits = content.count(body.old)
+    if hits == 0:
+        raise HTTPException(status_code=400, detail="`old` does not appear in the file EXACTLY as sent "
+                                                   "(watch the indentation and the line breaks): read it "
+                                                   "with /fs/read and copy it verbatim")
+    if hits > 1 and not body.all:
+        raise HTTPException(status_code=400, detail=f"`old` appears {hits} times: add surrounding lines to "
+                                                   f"make it unique, or pass all=true to replace all {hits}")
+    out = content.replace(body.old, new, -1 if body.all else 1)
+    fid = quota.folder_of_path(p)
+    if fid:
+        try:
+            quota.ensure_room(fid, len(out.encode("utf-8")), replaces=p)
+        except quota.QuotaExceeded as e:
+            raise HTTPException(status_code=413, detail=str(e))
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(out)
+    return {"ok": True, "replaced": hits if body.all else 1}
+
+
 @router.post("/fs/mkdir")
 def fs_mkdir(body: FsPathBody, user: dict = Depends(current_user)):
     _need(user, body.projectId, "write")

@@ -81,6 +81,15 @@ class FsWriteBody(BaseModel):
     content: str
 
 
+class FsEditBody(BaseModel):
+    # reemplazo de texto exacto: `old` único en el archivo salvo `all=true`
+    projectId: str
+    path: str
+    old: str
+    new: str = ""
+    all: bool = False
+
+
 class FsPathBody(BaseModel):
     projectId: str
     path: str

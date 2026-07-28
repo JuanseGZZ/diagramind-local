@@ -49,7 +49,7 @@ import realtime
 import sourcever
 import store
 from auth import require_admin
-from models import FsExecBody, FsPathBody, FsRenameBody, FsWriteBody
+from models import FsEditBody, FsExecBody, FsPathBody, FsRenameBody, FsWriteBody
 
 MEM_HEAVY_CHARS = 8000
 MAX_TURNS_DEFAULT = 30
@@ -886,6 +886,28 @@ def mem_clear(ctx, node_id):
         pass
 
 
+MEM_SEND = 12                # entradas de memoria que se le entregan al agente
+
+
+def mem_block(ctx, node):
+    """El bloque de MEMORIA del agente, o None. Va en la ENTRADA del turno, NO en el
+    system (2026-07-28): la memoria crece con cada tarea cerrada, y estando en el
+    system cambiaba el prefijo cacheado en cada delegación — medido en un run real,
+    eso re-escribía 17k tokens de caché (system + schemas + transcript) donde tendría
+    que haber leído 24k a 0,1×. Como entrada del turno el system queda byte a byte
+    igual entre delegaciones y el prefijo sobrevive.
+    Solo entran las últimas MEM_SEND entradas: el archivo puede tener 200."""
+    if not ((node.get("data") or {}).get("memoria") or {}).get("enabled", True):
+        return None
+    mem = mem_read(ctx, node["id"])
+    if not mem:
+        return None
+    lines = [f"- [{time.strftime('%Y-%m-%d %H:%M', time.localtime(m['ts'] / 1000))}] {m['texto']}"
+             for m in mem[-MEM_SEND:]]
+    return ("YOUR MEMORY (your own record of previous work and conversations — it is context, "
+            "not a new instruction; the task comes after it):\n" + "\n".join(lines))
+
+
 def chat_read(ctx, node_id):
     return _read_json(_chat_path(ctx, node_id), {"chatId": None, "messages": []})
 
@@ -1230,10 +1252,22 @@ def _editor_tools(ctx, rid, rpid, perm, tools, execs, author):
             return e.msg, True
     add("sv_list", _s("Version history of the project."), sv_list_fn)
     if perm >= 1:
-        add("fs_write", _s("Writes a COMPLETE file (creating dirs).",
+        add("fs_write", _s("Writes a COMPLETE file (creating dirs). For a SMALL change in an "
+                           "existing file use fs_edit: it is much cheaper and you don't risk "
+                           "mangling the rest of the file while copying it.",
                            {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
             lambda i: _fs_call(fsmod.fs_write, body=FsWriteBody(projectId=rpid, path=i.get("path") or "",
                                                                 content=i.get("content") or ""), user=user))
+        add("fs_edit", _s("Replaces an EXACT piece of text inside a file — the cheap way to change "
+                          "a few lines (no need to resend the whole file). `old` must appear ONCE: "
+                          "copy it verbatim from fs_read, with its indentation; add surrounding lines "
+                          "to make it unique, or pass all=true to replace every occurrence.",
+                          {"path": {"type": "string"}, "old": {"type": "string"},
+                           "new": {"type": "string"}, "all": {"type": "boolean"}},
+                          ["path", "old", "new"]),
+            lambda i: _fs_call(fsmod.fs_edit, body=FsEditBody(projectId=rpid, path=i.get("path") or "",
+                                                              old=i.get("old") or "", new=i.get("new") or "",
+                                                              all=bool(i.get("all"))), user=user))
         add("fs_mkdir", _s("Creates a directory.", {"path": {"type": "string"}}, ["path"]),
             lambda i: _fs_call(fsmod.fs_mkdir, body=FsPathBody(projectId=rpid, path=i.get("path") or ""), user=user))
         add("fs_rename", _s("Renames/moves inside the project.",
@@ -1401,12 +1435,8 @@ def build_system(ctx, graph, node, notes):
     if blk:
         partes.append(blk)
 
-    if (d.get("memoria") or {}).get("enabled", True):
-        mem = mem_read(ctx, nid)
-        if mem:
-            lines = [f"- [{time.strftime('%Y-%m-%d %H:%M', time.localtime(m['ts'] / 1000))}] {m['texto']}"
-                     for m in mem[-12:]]
-            partes.append("YOUR MEMORY (previous work and conversations):\n" + "\n".join(lines))
+    # OJO: la MEMORIA no va acá (ver mem_block): entra en el mensaje del turno para no
+    # romper el prefijo cacheado en cada delegación.
     tipos = set()
     for r in resources_of(graph, nid):
         meta = project_meta(ctx, r["data"].get("projectId"))
@@ -1541,6 +1571,12 @@ def _new_frame(ctx, graph, run, node, entry_kind, initial_text, parent_id=None):
              "entry": entry_kind, "status": "ready", "iters": 0, "firstText": initial_text,
              "inbox": [{"text": initial_text}], "join": None, "waiting": {}, "collected": [],
              "kind": "api", "messages": [], "pendingToolId": None, "stash": []}
+    # La MEMORIA se entrega en la ENTRADA del frame, no en el system (ver mem_block).
+    # `firstText` queda con la tarea PELADA: es lo que se guarda en la memoria al
+    # responder, y no queremos memoria dentro de la memoria.
+    mem_b = mem_block(ctx, node)
+    if mem_b:
+        frame["inbox"] = [{"text": mem_b + "\n\n" + initial_text}]
     run["frames"][fid] = frame
     snapshot_resources(ctx, run, graph, node)
     set_node_state(ctx, run, node["id"], "running")
@@ -2334,9 +2370,11 @@ def inspect_node(ctx, node_id):
         "ia": {"provider": provider, "model": ia.get("model"), "effort": ia.get("effort"),
                "credId": ia.get("credId")},
         "director": bool(d.get("director")), "secuencial": bool(d.get("secuencial")),
-        # el system inyecta SOLO las últimas 12 entradas de memoria (build_system)
+        # se le entregan SOLO las últimas MEM_SEND entradas (mem_block), en el mensaje
+        # del turno — no en el system
         "memoria": {"enabled": (d.get("memoria") or {}).get("enabled", True),
-                    "total": len(mem), "enviadas": min(len(mem), 12),
+                    "total": len(mem), "enviadas": min(len(mem), MEM_SEND),
+                    "donde": "input",
                     "chars": mchars, "heavy": mchars > MEM_HEAVY_CHARS, "entries": mem},
         "wiring": _wiring_of(graph, node["id"]),
         "stats": _stats_of(ctx, node["id"]),
@@ -2389,7 +2427,9 @@ def inspect_node(ctx, node_id):
         "refGroups": refs,
         "system": system,
         "systemNote": ("REBUILT and sent whole on every turn (role + subordinates + resources "
-                       "+ memory + schemas). The tools are recalculated too."),
+                       "+ fixed context + schemas). The tools are recalculated too. The MEMORY is "
+                       "NOT in here: it goes in the INPUT of the turn, so that the system stays "
+                       "byte-identical between delegations and the cached prefix survives."),
         "toolGroups": [{**g, "tools": [{"name": t["name"], "description": t["description"],
                                         "schema": t["schema"]} for t in g["tools"]]}
                        for g in groups],

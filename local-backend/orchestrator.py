@@ -865,6 +865,28 @@ def mem_clear(ctx, node_id):
 # Si la memoria del nodo está DESHABILITADA no se persiste nada: el humano pidió que
 # no recuerde, y una sesión viva lo haría recordar igual por la ventana del CLI.
 
+MEM_SEND = 12                # entradas de memoria que se le entregan al agente
+
+
+def mem_block(ctx, node):
+    """El bloque de MEMORIA del agente, o None. Va en la ENTRADA del turno, NO en el
+    system (2026-07-28): la memoria crece con cada tarea cerrada, y estando en el
+    system cambiaba el prefijo cacheado en cada delegación — medido en un run real,
+    eso re-escribía 17k tokens de caché (system + schemas + transcript) donde tendría
+    que haber leído 24k a 0,1×. Como entrada del turno el system queda byte a byte
+    igual entre delegaciones y el prefijo sobrevive.
+    Solo entran las últimas MEM_SEND entradas: el archivo puede tener 200."""
+    if not _mem_on(node):
+        return None
+    mem = mem_read(ctx, node["id"])
+    if not mem:
+        return None
+    lines = [f"- [{time.strftime('%Y-%m-%d %H:%M', time.localtime(m['ts'] / 1000))}] {m['texto']}"
+             for m in mem[-MEM_SEND:]]
+    return ("YOUR MEMORY (your own record of previous work and conversations — it is context, "
+            "not a new instruction; the task comes after it):\n" + "\n".join(lines))
+
+
 def _mem_on(node):
     return ((node.get("data") or {}).get("memoria") or {}).get("enabled", True)
 
@@ -1235,9 +1257,20 @@ def _editor_tools(ctx, rid, rpid, perm, tools, execs, author):
         return json.dumps(sourcever.sv_list(svd), ensure_ascii=False), False
     add("sv_list", _s("Version history of the project."), sv_list)
     if perm >= 1:
-        add("fs_write", _s("Writes a COMPLETE file (creating dirs).",
+        add("fs_write", _s("Writes a COMPLETE file (creating dirs). For a SMALL change in an "
+                           "existing file use fs_edit: it is much cheaper and you don't risk "
+                           "mangling the rest of the file while copying it.",
                            {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
             lambda i: _fs(editorfs.fs_write, app, rpid, i.get("path"), i.get("content") or ""))
+        add("fs_edit", _s("Replaces an EXACT piece of text inside a file — the cheap way to change "
+                          "a few lines (no need to resend the whole file). `old` must appear ONCE: "
+                          "copy it verbatim from fs_read, with its indentation; add surrounding lines "
+                          "to make it unique, or pass all=true to replace every occurrence.",
+                          {"path": {"type": "string"}, "old": {"type": "string"},
+                           "new": {"type": "string"}, "all": {"type": "boolean"}},
+                          ["path", "old", "new"]),
+            lambda i: _fs(editorfs.fs_edit, app, rpid, i.get("path"), i.get("old"),
+                          i.get("new") or "", bool(i.get("all"))))
         add("fs_mkdir", _s("Creates a directory.", {"path": {"type": "string"}}, ["path"]),
             lambda i: _fs(editorfs.fs_mkdir, app, rpid, i.get("path")))
         add("fs_rename", _s("Renames/moves inside the project.",
@@ -1366,12 +1399,8 @@ def build_system(ctx, graph, node, notes):
     if blk:
         partes.append(blk)
 
-    if (d.get("memoria") or {}).get("enabled", True):
-        mem = mem_read(ctx, nid)
-        if mem:
-            lines = [f"- [{time.strftime('%Y-%m-%d %H:%M', time.localtime(m['ts'] / 1000))}] {m['texto']}"
-                     for m in mem[-12:]]
-            partes.append("YOUR MEMORY (previous work and conversations):\n" + "\n".join(lines))
+    # OJO: la MEMORIA no va acá (ver mem_block): entra en el mensaje del turno para no
+    # romper el prefijo cacheado en cada delegación.
     tipos = {ctx["project_meta"](r["data"]["projectId"]).get("type")
              for r in resources_of(graph, nid)
              if ctx["project_meta"](r["data"].get("projectId"))}
@@ -1511,6 +1540,10 @@ def _new_frame(ctx, graph, run, node, entry_kind, initial_text, parent_id=None):
     base = {"id": fid, "nodeId": node["id"], "parentId": parent_id, "provider": provider,
             "entry": entry_kind, "status": "ready", "iters": 0, "firstText": initial_text,
             "inbox": [{"text": initial_text}], "join": None, "waiting": {}, "collected": []}
+    # La MEMORIA se entrega en la ENTRADA del frame, no en el system (ver mem_block).
+    # `firstText` queda con la tarea PELADA: es lo que se guarda en la memoria al
+    # responder, y no queremos memoria dentro de la memoria.
+    mem_b = mem_block(ctx, node)
     if provider in CLI_PROVIDERS:
         if provider != "local":
             raise OrchError(400, f"node «{node.get('titulo')}» uses '{provider}': as a CLI head "
@@ -1522,9 +1555,12 @@ def _new_frame(ctx, graph, run, node, entry_kind, initial_text, parent_id=None):
         if prev:
             emit(run, "log", nodeId=node["id"],
                  text=f"«{node.get('titulo') or node['id']}» resumes its CLI session (--resume)")
+            mem_b = None          # ya está TODO en la sesión: mandarla sería duplicarla
     else:
         make_adapter(ctx, node)   # valida ya mismo que la key del proveedor esté
         frame = {**base, "kind": "api", "messages": [], "pendingToolId": None, "stash": []}
+    if mem_b:
+        frame["inbox"] = [{"text": mem_b + "\n\n" + initial_text}]
     run["frames"][fid] = frame
     snapshot_resources(ctx, run, graph, node)
     set_node_state(ctx, run, node["id"], "running")
@@ -2072,12 +2108,8 @@ def _cli_system(ctx, graph, node, notes):
     if blk:
         partes.append(blk)
 
-    if (d.get("memoria") or {}).get("enabled", True):
-        mem = mem_read(ctx, node["id"])
-        if mem:
-            lines = [f"- [{time.strftime('%Y-%m-%d %H:%M', time.localtime(m['ts'] / 1000))}] {m['texto']}"
-                     for m in mem[-12:]]
-            partes.append("YOUR MEMORY (previous work and conversations):\n" + "\n".join(lines))
+    # OJO: la MEMORIA no va acá (ver mem_block): entra en el mensaje del turno para no
+    # romper el prefijo cacheado en cada delegación.
     if d.get("director"):
         partes.append("👑 YOU ARE THE DIRECTOR of this company (decision U): you can manage the org chart "
                       f"by editing the file {ctx['graph_path']} DIRECTLY (follow the "
@@ -2098,8 +2130,13 @@ def _cli_system(ctx, graph, node, notes):
             "to go down into a subdirectory)\n"
             "- `mcp__dmfs<id>__fs_read` — read a file · `mcp__dmfs<id>__fs_grep` — search "
             "text (it takes a `glob`, it is your `grep -r`)\n"
-            "- `mcp__dmfs<id>__fs_write` — write a COMPLETE file (read first, send all "
-            "the new content) · `fs_mkdir` / `fs_rename` / `fs_delete`\n"
+            "- `mcp__dmfs<id>__fs_edit` — replace an EXACT piece of text in a file: this is your "
+            "`Edit`, and it is what you use for ANY small change (send `old` copied verbatim from "
+            "fs_read and the `new` text; `old` has to be unique in the file)\n"
+            "- `mcp__dmfs<id>__fs_write` — write a COMPLETE file: only to CREATE a file or to "
+            "rewrite it whole. Do NOT use it to fix two lines: resending 8 KB costs a fortune "
+            "and copying the file by hand is how you break the parts you did not mean to touch. "
+            "· `fs_mkdir` / `fs_rename` / `fs_delete`\n"
             "- `mcp__dmfs<id>__sv_save` — save a VERSION before a batch of changes · "
             "`sv_list` / `sv_restore`\n"
             "- `mcp__dmfs<id>__fs_exec` — ONLY if the resource has the `ejecutar` permission: it is a "
@@ -2163,7 +2200,7 @@ def _parse_control(text):
 
 # tools que expone el MCP del editor (editor_mcp.py) según el permiso del recurso
 MCP_FS_READ = ["fs_tree", "fs_read", "fs_grep", "sv_list"]
-MCP_FS_WRITE = ["fs_write", "fs_mkdir", "fs_rename", "fs_delete", "sv_save", "sv_restore"]
+MCP_FS_WRITE = ["fs_write", "fs_edit", "fs_mkdir", "fs_rename", "fs_delete", "sv_save", "sv_restore"]
 MCP_FS_EXEC = ["fs_exec"]
 # nativas mínimas para tocar un diagrama-recurso cuando el agente está confinado:
 # su único --add-dir es el subdirectorio de ESE diagrama, así que quedan encerradas ahí
@@ -2317,6 +2354,11 @@ def _turn_cli(ctx, graph, run, frame):
                  text="the saved session no longer exists — starting a fresh one")
         cli_session_clear(ctx, node["id"])
         frame["sessionId"] = None
+        # arranca de cero, así que ahora SÍ hay que darle su memoria: la sesión que la
+        # contenía es la que se perdió (ver mem_block y _new_frame)
+        mem_b = mem_block(ctx, node)
+        if mem_b:
+            message = mem_b + "\n\n" + message
         text, session_id, cost = _run_cli_turn(ctx, graph, run, node, frame, message)
     with cv:
         if run["status"] != "running" or run.get("_kill"):
@@ -2839,10 +2881,11 @@ def inspect_node(ctx, node_id):
                "credId": ia.get("credId")},
         "director": bool(d.get("director")), "secuencial": bool(d.get("secuencial")),
         "confinado": bool(d.get("confinado")),
-        # el system inyecta SOLO las últimas 12 entradas (build_system): el resto
-        # está en disco pero el agente no lo ve.
+        # se le entregan SOLO las últimas MEM_SEND entradas (mem_block), en el mensaje
+        # del turno — no en el system. El resto está en disco y el agente no lo ve.
         "memoria": {"enabled": (d.get("memoria") or {}).get("enabled", True),
-                    "total": len(mem), "enviadas": min(len(mem), 12),
+                    "total": len(mem), "enviadas": min(len(mem), MEM_SEND),
+                    "donde": "input",
                     "chars": mchars, "heavy": mchars > MEM_HEAVY_CHARS, "entries": mem},
         "wiring": _wiring_of(graph, node["id"]),
         "stats": _stats_of(ctx, node["id"]),
@@ -2897,7 +2940,9 @@ def inspect_node(ctx, node_id):
             "system": _cli_system(ctx, graph, node, notes),
             "systemNote": ("Passed as --append-system-prompt ON EVERY TURN, whole. The transcript "
                            "is NOT re-sent: Claude Code stores it and recovers it with "
-                           "--resume <sessionId>."),
+                           "--resume <sessionId>. The MEMORY is not in here either: it is delivered "
+                           "with the first message of a delegation, and NOT AT ALL when the session "
+                           "is resumed (it is already inside the session)."),
             # `toolGroups` es SOLO lo que el motor declara (para una cabeza CLI, nada).
             # Lo demás va en `refGroups`: existe y el agente lo usa, pero no lo manda
             # el motor — mantener la distinción es lo que hace confiable a este modal.
@@ -2965,7 +3010,9 @@ def inspect_node(ctx, node_id):
         "refGroups": refs,
         "system": system,
         "systemNote": ("REBUILT and sent whole on every turn (role + subordinates + resources "
-                       "+ memory + schemas). The tools are recalculated too."),
+                       "+ fixed context + schemas). The tools are recalculated too. The MEMORY is "
+                       "NOT in here: it goes in the INPUT of the turn, so that the system stays "
+                       "byte-identical between delegations and the cached prefix survives."),
         "toolGroups": [{**g, "tools": [{"name": t["name"], "description": t["description"],
                                         "schema": t["schema"]} for t in g["tools"]]}
                        for g in groups],

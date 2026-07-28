@@ -49,8 +49,15 @@ TOOLS = [
     },
     {
         "name": "fs_write",
-        "description": "Writes a COMPLETE file (creating intermediate dirs). To edit: fs_read first, change it and send ALL the new content.",
+        "description": "Writes a COMPLETE file (creating intermediate dirs). Use it to CREATE files or to rewrite them whole; for a small change in an existing file use fs_edit instead (much cheaper, and you don't risk mangling the rest while copying it).",
         "inputSchema": _schema({"path": _STR, "content": _STR}, ["path", "content"]),
+    },
+    {
+        "name": "fs_edit",
+        "description": "Replaces an EXACT piece of text inside a file — your equivalent of the native Edit tool. `old` must appear ONCE: copy it verbatim from fs_read (indentation included) and add surrounding lines if it is ambiguous, or pass all=true to replace every occurrence. Returns {ok, replaced}.",
+        "inputSchema": _schema({"path": _STR, "old": _STR, "new": _STR,
+                                "all": {"type": "boolean", "description": "replace EVERY occurrence (default false)"}},
+                               ["path", "old", "new"]),
     },
     {
         "name": "fs_mkdir",
@@ -147,6 +154,10 @@ def call_tool(name, args):
         out, err = _http("GET", f"/fs/read?projectId={pid}&path={q(args.get('path') or '')}")
     elif name == "fs_write":
         out, err = _http("POST", "/fs/write", {"projectId": PROJECT, "path": args.get("path"), "content": args.get("content") or ""})
+    elif name == "fs_edit":
+        out, err = _http("POST", "/fs/edit", {"projectId": PROJECT, "path": args.get("path"),
+                                             "old": args.get("old") or "", "new": args.get("new") or "",
+                                             "all": bool(args.get("all"))})
     elif name == "fs_mkdir":
         out, err = _http("POST", "/fs/mkdir", {"projectId": PROJECT, "path": args.get("path")})
     elif name == "fs_rename":
