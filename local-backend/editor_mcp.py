@@ -54,7 +54,7 @@ TOOLS = [
     },
     {
         "name": "fs_edit",
-        "description": "Replaces an EXACT piece of text inside a file — your equivalent of the native Edit tool. `old` must appear ONCE: copy it verbatim from fs_read (indentation included) and add surrounding lines if it is ambiguous, or pass all=true to replace every occurrence. Returns {ok, replaced}.",
+        "description": "Replaces an EXACT piece of text inside a file — your equivalent of the native Edit tool. `old` must appear ONCE: copy it verbatim (indentation included) and add surrounding lines if it is ambiguous, or pass all=true to replace every occurrence. For a one-line change you do not need fs_read: the line that fs_grep returns is already a valid `old`. Returns {ok, replaced}.",
         "inputSchema": _schema({"path": _STR, "old": _STR, "new": _STR,
                                 "all": {"type": "boolean", "description": "replace EVERY occurrence (default false)"}},
                                ["path", "old", "new"]),
@@ -76,7 +76,7 @@ TOOLS = [
     },
     {
         "name": "fs_grep",
-        "description": "Searches text across the project files. Returns [{path, line, text}] (capped at 200 matches).",
+        "description": "Searches text across the project files. Returns [{path, line, text}] (capped at 200 matches; `text` keeps the indentation, so it can be used as the `old` of fs_edit). Cheaper than reading a whole file when you only need to locate something.",
         "inputSchema": _schema({"q": _STR, "glob": {"type": "string", "description": "filter such as *.py (optional)"}}, ["q"]),
     },
     {

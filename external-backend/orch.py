@@ -1260,8 +1260,10 @@ def _editor_tools(ctx, rid, rpid, perm, tools, execs, author):
                                                                 content=i.get("content") or ""), user=user))
         add("fs_edit", _s("Replaces an EXACT piece of text inside a file — the cheap way to change "
                           "a few lines (no need to resend the whole file). `old` must appear ONCE: "
-                          "copy it verbatim from fs_read, with its indentation; add surrounding lines "
-                          "to make it unique, or pass all=true to replace every occurrence.",
+                          "copy it verbatim, with its indentation; add surrounding lines "
+                          "to make it unique, or pass all=true to replace every occurrence. For a "
+                          "one-line change you do NOT need to read the file: fs_grep returns the line "
+                          "with its indentation and that is already a valid `old`.",
                           {"path": {"type": "string"}, "old": {"type": "string"},
                            "new": {"type": "string"}, "all": {"type": "boolean"}},
                           ["path", "old", "new"]),

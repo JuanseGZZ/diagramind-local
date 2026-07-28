@@ -1264,8 +1264,10 @@ def _editor_tools(ctx, rid, rpid, perm, tools, execs, author):
             lambda i: _fs(editorfs.fs_write, app, rpid, i.get("path"), i.get("content") or ""))
         add("fs_edit", _s("Replaces an EXACT piece of text inside a file — the cheap way to change "
                           "a few lines (no need to resend the whole file). `old` must appear ONCE: "
-                          "copy it verbatim from fs_read, with its indentation; add surrounding lines "
-                          "to make it unique, or pass all=true to replace every occurrence.",
+                          "copy it verbatim, with its indentation; add surrounding lines "
+                          "to make it unique, or pass all=true to replace every occurrence. For a "
+                          "one-line change you do NOT need to read the file: fs_grep returns the line "
+                          "with its indentation and that is already a valid `old`.",
                           {"path": {"type": "string"}, "old": {"type": "string"},
                            "new": {"type": "string"}, "all": {"type": "boolean"}},
                           ["path", "old", "new"]),
@@ -2142,6 +2144,11 @@ def _cli_system(ctx, graph, node, notes):
             "- `mcp__dmfs<id>__fs_exec` — ONLY if the resource has the `ejecutar` permission: it is a "
             "REAL shell with cwd in the editor folder, that's where you run `ls`, `find`, tests, "
             "builds, git, whatever you need.\n"
+            "FLOW FOR A PINPOINT CHANGE: `fs_grep` returns the matching line WITH its "
+            "indentation, and that line is already good enough as the `old` of `fs_edit` — so you "
+            "change one line without dragging the whole file into the conversation (a file you "
+            "read stays in it and gets re-sent on every turn after that). Read the file whole when "
+            "you need to UNDERSTAND it, or if an edit bounces back.\n"
             "It is the same toolset the API agents use: it is more than enough "
             "to write code. If something is missing, ask for it with the ask_user action instead of "
             "inventing a way around it.")
