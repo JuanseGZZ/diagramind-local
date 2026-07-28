@@ -180,6 +180,31 @@ def _run_summary(run):
             "turns": run.get("turns", 0), "spend": (run.get("spend") or {}).get("total", {})}
 
 
+# ===================== REANUDAR UN RUN MUERTO (fase 13) =====================
+# Espejo del motor local: un turno que revienta (límite/crédito de la API, 500 del
+# proveedor, presupuesto agotado, reinicio del conector) dejaba el run en `error` sin
+# forma de seguir, y había que relanzar la tarea desde cero pagando de nuevo todo lo
+# hecho. El estado igual está entero en run.json (frames con su transcript) + memoria
+# y credenciales en disco: `resume` revive el MISMO run (mismo id y mismos events, así
+# el historial no se corta) y `discard` lo cierra a mano. Solo el ÚLTIMO run es
+# reanudable: los archivados no guardan `frames`.
+
+def _pending_frames(run):
+    return [f for f in (run.get("frames") or {}).values() if f.get("status") != "done"]
+
+
+def _last_run(ctx):
+    """El run vivo en RAM o, si el conector se reinició, el de run.json (CON frames)."""
+    return RUNS.get(ctx["pid"]) or _read_json(_run_path(ctx), None)
+
+
+def _resumable_id(ctx):
+    run = _last_run(ctx)
+    if not run or run.get("status") != "error" or run.get("discarded"):
+        return None
+    return run["id"] if _pending_frames(run) else None
+
+
 def _archive_run(ctx, run):
     if run.get("_archived") or run["status"] not in ("done", "error", "killed"):
         return
@@ -1467,7 +1492,7 @@ def snapshot_resources(ctx, run, graph, node):
                 # cambios, HEAD ya es el estado previo y no hace falta nada)
                 git_ops.commit(rpid, f"IA ({name})", GIT_EMAIL,
                                f"(auto) run {run['id']}: snapshot pre-turno de {name}")
-            emit(run, "log", nodeId=node["id"], text=f"snapshot pre-turno de {meta.get('name')}")
+            emit(run, "log", nodeId=node["id"], text=f"pre-turn snapshot of {meta.get('name')}")
         except Exception as e:
             emit(run, "log", nodeId=node["id"], text=f"snapshot failed ({meta.get('name')}): {e}")
 
@@ -1512,7 +1537,7 @@ def _new_frame(ctx, graph, run, node, entry_kind, initial_text, parent_id=None):
     run["frames"][fid] = frame
     snapshot_resources(ctx, run, graph, node)
     set_node_state(ctx, run, node["id"], "running")
-    emit(run, "log", nodeId=node["id"], text=f"→ entra trabajo: {initial_text[:200]}")
+    emit(run, "log", nodeId=node["id"], text=f"→ work in: {initial_text[:200]}")
     return frame
 
 
@@ -1524,7 +1549,7 @@ def _finish_node(ctx, run, graph, frame, mensaje):
         mem_append(ctx, node["id"], frame["entry"],
                    f"Task: {frame['firstText'][:400]} → Result: {mensaje[:700]}", chat_id)
     set_node_state(ctx, run, node["id"], "done")
-    emit(run, "log", nodeId=node["id"], text=f"← responde: {mensaje[:200]}")
+    emit(run, "log", nodeId=node["id"], text=f"← responds: {mensaje[:200]}")
 
 
 def _do_responder(ctx, graph, run, frame, mensaje):
@@ -1542,6 +1567,14 @@ def _do_responder(ctx, graph, run, frame, mensaje):
     child = _agent(graph, frame["nodeId"])
     texto = f"Answer from «{child.get('titulo') or child['id']}»: {mensaje}"
     parent["waiting"].pop(frame["id"], None)
+    # la vuelta del token, registrada también del lado del que esperaba (sin esto el
+    # timeline mostraba "responde" en el hijo y nada en el padre)
+    parent_node = graph["nodos"].get(parent["nodeId"]) or {"id": parent["nodeId"]}
+    emit(run, "answer", nodeId=parent["nodeId"], fromId=child["id"],
+         fromName=child.get("titulo") or str(child["id"]),
+         toName=parent_node.get("titulo") or str(parent["nodeId"]), message=mensaje[:400])
+    emit(run, "log", nodeId=parent["nodeId"],
+         text=f"← answer from «{child.get('titulo') or child['id']}»: {mensaje[:160]}")
     if parent.get("join") == "cada_una":
         quedan = len(parent["waiting"])
         if quedan:
@@ -1562,7 +1595,7 @@ def _implicit_end(ctx, graph, run, frame, texto):
         frame["status"] = "waiting_children"
         set_node_state(ctx, run, frame["nodeId"], "waiting")
         _release_locks(run, frame["id"])
-        emit(run, "log", nodeId=frame["nodeId"], text="sigue esperando las respuestas pendientes")
+        emit(run, "log", nodeId=frame["nodeId"], text="still waiting for the pending answers")
         return
     _do_responder(ctx, graph, run, frame, texto)
 
@@ -1602,12 +1635,18 @@ def _do_delegar(ctx, graph, run, frame, node, inp):
     set_node_state(ctx, run, node["id"], "waiting")
     _release_locks(run, frame["id"])
     texto = f"«{node.get('titulo') or node['id']}» delegates to you: {msg}"
+    # A QUIÉN delega, antes de crear los frames: el log del que delegaba solo decía
+    # "esperando" y había que adivinar a quién llamó
+    who = ", ".join(f"«{t.get('titulo') or t['id']}»" for t in targets)
+    emit(run, "delegate", nodeId=node["id"], toIds=[t["id"] for t in targets],
+         toNames=[t.get("titulo") or str(t["id"]) for t in targets],
+         fromName=node.get("titulo") or str(node["id"]), join=join, message=msg[:400])
+    emit(run, "log", nodeId=node["id"],
+         text=(f"→ delegates to {who}" + (f" (parallel, join: {join})" if len(targets) > 1 else "")
+               + (f": {msg[:160]}" if msg else "")))
     for t in targets:
         child = _new_frame(ctx, graph, run, t, "delegado", texto, parent_id=frame["id"])
         frame["waiting"][child["id"]] = t.get("titulo") or str(t["id"])
-    if len(targets) > 1:
-        emit(run, "log", nodeId=node["id"],
-             text=f"fork: delegated in parallel to {len(targets)} agents (join: {join})")
     return None
 
 
@@ -1691,7 +1730,7 @@ def _loop(ctx):
                             f["status"] = "queued"
                             set_node_state(ctx, run, f["nodeId"], "queued")
                             emit(run, "log", nodeId=f["nodeId"],
-                                 text="en cola: espera un recurso/agente ocupado por otra rama")
+                                 text="queued: waiting for a resource/agent busy in another branch")
                     if run["_workers"] == 0:
                         blocked = {x["status"] for x in active}
                         if blocked <= {"waiting_human", "waiting_children"} and "waiting_human" in blocked:
@@ -1705,7 +1744,9 @@ def _loop(ctx):
         except Exception as e:
             run["status"], run["error"] = "error", f"error interno del motor: {e}"
         if run["status"] == "error":
-            emit(run, "status", status="error", error=run["error"])
+            # queda trabajo a medio hacer ⇒ se puede RETOMAR (fase 13)
+            run["resumable"] = bool(_pending_frames(run))
+            emit(run, "status", status="error", error=run["error"], resumable=run["resumable"])
         else:
             emit(run, "status", status=run["status"])
         _save(ctx, run)
@@ -1899,13 +1940,15 @@ def get_state(ctx):
         run = _read_json(_run_path(ctx), None)
         if run and run.get("status") in ("running", "waiting_human", "paused"):
             run["status"] = "error"
-            run["error"] = "the connector restarted during the run — launch it again"
+            # el estado quedó en disco: se puede RETOMAR (fase 13)
+            run["error"] = "the connector restarted during the run — you can resume it"
             _write_json(_run_path(ctx), run)
     if not run:
         return {"run": None}
     slim = {k: v for k, v in run.items()
             if not str(k).startswith("_") and k not in ("frames", "locks", "events")}
     slim["stackNodes"] = _active_nodes(run)
+    slim["resumable"] = _resumable_id(ctx) == run["id"]
     return {"run": slim}
 
 
@@ -1927,7 +1970,7 @@ def answer(ctx, text, node_id=None):
         else:
             raise OrchError(400, "there are several pending questions: pass a nodeId")
         frame = run["frames"][p["frameId"]]
-        emit(run, "log", nodeId=p["nodeId"], text=f"usuario responde: {text[:200]}")
+        emit(run, "log", nodeId=p["nodeId"], text=f"user answers: {text[:200]}")
         frame["inbox"].insert(0, {"text": f"Answer from the user: {text}"})
         frame["status"] = "ready"
         pendings.remove(p)
@@ -1954,17 +1997,91 @@ def pause(ctx):
     return {"ok": True}
 
 
-def resume(ctx):
-    run = RUNS.get(ctx["pid"])
-    if not run or run["status"] != "paused":
-        raise OrchError(409, "no hay un run pausado")
-    if not KEYS.get(ctx["pid"]):
-        KEYS[ctx["pid"]] = keys_read(ctx)   # las del proyecto persisten en disco
+def resume(ctx, add_turns=None):
+    """Reanuda: un run PAUSADO o uno que murió en `error` con trabajo pendiente
+    (límite de la API, sin crédito, presupuesto agotado, conector reiniciado)."""
+    live = RUNS.get(ctx["pid"])
+    if live and live["status"] == "paused":
+        if not KEYS.get(ctx["pid"]):
+            KEYS[ctx["pid"]] = keys_read(ctx)   # las del proyecto persisten en disco
+        with LOCK:
+            live["status"] = "running"
+            _save(ctx, live)
+        _spawn(ctx)
+        return {"ok": True, "runId": live["id"]}
+    if live and live["status"] in ("running", "waiting_human"):
+        raise OrchError(409, "the run is already going")
+    return _revive(ctx, add_turns)
+
+
+def _revive(ctx, add_turns=None):
+    """Vuelve a poner en marcha el último run que murió en error, desde donde quedó:
+    los frames que estaban girando (o en cola) vuelven a `ready` y el scheduler
+    arranca de nuevo. El turno que falló se REPITE (su transcript quedó intacto: la
+    respuesta del modelo nunca llegó), así que no se pierde nada de lo anterior."""
+    run = _last_run(ctx)
+    if not run or run.get("status") != "error":
+        raise OrchError(409, "there is no failed run to resume")
+    if run.get("discarded"):
+        raise OrchError(409, "that run was discarded: launch the task again")
+    pend = _pending_frames(run)
+    if not pend:
+        raise OrchError(409, "that run has nothing left to resume (nothing was pending)")
     with LOCK:
+        other = RUNS.get(ctx["pid"])
+        if other and other["id"] != run["id"] and other["status"] in ("running", "waiting_human", "paused"):
+            raise OrchError(409, "another run is in progress in this orchestrator: wait for it or stop it")
+        prev_error = run.get("error") or ""
+        # `_fseq` no se persiste (empieza con "_"): recalcularlo del set de frames o,
+        # tras un reinicio, la próxima delegación pisaría el frame f1
+        run["_fseq"] = max((int(str(fid)[1:]) for fid in (run.get("frames") or {})), default=0)
+        run["_workers"] = 0
+        run.pop("_kill", None)
+        run.pop("_pause", None)
+        run.pop("_archived", None)          # al terminar se re-archiva con el estado final
+        run["locks"] = {}                   # los tenía el frame que murió: se re-piden al girar
+        for f in pend:
+            if f.get("status") in ("running", "queued"):
+                f["status"] = "ready"
+        if run.get("turns", 0) >= run.get("maxTurns", 0):
+            extra = int(add_turns or run.get("maxTurns") or MAX_TURNS_DEFAULT)
+            run["maxTurns"] = run.get("turns", 0) + extra
+            emit(run, "log", nodeId=pend[0]["nodeId"],
+                 text=f"budget extended by {extra} turns (up to {run['maxTurns']})")
+        elif add_turns:
+            run["maxTurns"] = run.get("maxTurns", 0) + int(add_turns)
+        run["error"] = None
+        run["resumable"] = False
+        run["endedAt"] = None
         run["status"] = "running"
+        emit(run, "log", nodeId=pend[0]["nodeId"],
+             text=f"run resumed by the user after: {prev_error[:200]}")
+        emit(run, "status", status="running")
+        for f in pend:
+            set_node_state(ctx, run, f["nodeId"], "running" if f["status"] == "ready" else "waiting")
+        RUNS[ctx["pid"]] = run
+        KEYS[ctx["pid"]] = keys_read(ctx)    # tras un reinicio no estaban en RAM
         _save(ctx, run)
     _spawn(ctx)
-    return {"ok": True}
+    return {"ok": True, "runId": run["id"]}
+
+
+def discard(ctx):
+    """Cierra a mano un run muerto: deja de ofrecerse para reanudar. No borra nada
+    del historial."""
+    run = _last_run(ctx)
+    if not run:
+        raise OrchError(409, "there is no run to discard")
+    if run.get("status") in ("running", "waiting_human", "paused"):
+        raise OrchError(409, "that run is still active: stop it instead of discarding it")
+    with LOCK:
+        run["discarded"] = True
+        run["resumable"] = False
+        if RUNS.get(ctx["pid"]) is run:
+            _save(ctx, run)
+        else:
+            _write_json(_run_path(ctx), run)
+    return {"ok": True, "runId": run["id"]}
 
 
 def kill(ctx):
@@ -1994,20 +2111,27 @@ def runs_list(ctx):
     if live and not live.get("_archived"):
         idx = [x for x in idx if x.get("id") != live["id"]]
         idx.insert(0, {**_run_summary(live), "live": True})
+    resume_id = _resumable_id(ctx)
+    for r in idx:
+        r["resumable"] = r.get("id") == resume_id
     return {"runs": idx}
 
 
 def run_detail(ctx, run_id):
+    resume_id = _resumable_id(ctx)
     live = RUNS.get(ctx["pid"])
     if live and live["id"] == run_id:
         d = {k: v for k, v in live.items()
              if not str(k).startswith("_") and k not in ("frames", "locks")}
         d["live"] = live["status"] in ("running", "waiting_human", "paused")
         d["stackNodes"] = _active_nodes(live)
+        d["resumable"] = resume_id == run_id
         return {"run": d}
     data = _read_json(_runs_dir(ctx) / f"{run_id}.json", None)
     if not data:
         raise OrchError(404, "no existe ese run en el historial")
+    # el archivado no guarda frames: solo es reanudable si además es el ÚLTIMO run
+    data["resumable"] = resume_id == run_id
     return {"run": data}
 
 
@@ -2292,6 +2416,11 @@ class OrchPidBody(BaseModel):
     projectId: str
 
 
+class OrchResumeBody(BaseModel):
+    projectId: str
+    addTurns: int | None = None       # estirar el presupuesto al reanudar (fase 13)
+
+
 class OrchNodeBody(BaseModel):
     projectId: str
     nodeId: int
@@ -2358,8 +2487,15 @@ def orch_pause(body: OrchPidBody, user: dict = Depends(require_admin)):
 
 
 @router.post("/orch/resume")
-def orch_resume(body: OrchPidBody, user: dict = Depends(require_admin)):
-    return _orch(body.projectId, user, resume)
+def orch_resume(body: OrchResumeBody, user: dict = Depends(require_admin)):
+    # pausado, o muerto en error con trabajo pendiente (fase 13): `addTurns` estira el
+    # presupuesto si justamente fue eso lo que lo mató
+    return _orch(body.projectId, user, lambda ctx: resume(ctx, body.addTurns))
+
+
+@router.post("/orch/discard")
+def orch_discard(body: OrchPidBody, user: dict = Depends(require_admin)):
+    return _orch(body.projectId, user, discard)
 
 
 @router.post("/orch/kill")

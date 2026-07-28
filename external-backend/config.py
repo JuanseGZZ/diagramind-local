@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.7.0"   # orquestador: VARIAS API keys con nombre por proyecto + cabeza Google (doc 28 T)
+VERSION = "0.8.0"   # orquestador: trazabilidad de delegaciones + reanudar un run muerto (doc 28 fase 13)
 NAME = "DiagraMind Connector"
 
 

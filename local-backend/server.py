@@ -66,7 +66,7 @@ DEFAULT_PORT = 8765
 # del orquestador necesitan la URL propia para hablarle al MCP del editor.
 PORT = DEFAULT_PORT
 NAME = "diagramind-local"
-VERSION = "0.25.0"   # orquestador: VARIAS API keys con nombre por proyecto + cabeza Google (doc 28 T)
+VERSION = "0.27.0"   # orquestador: trazabilidad de delegaciones + reanudar un run muerto (doc 28 fase 13)
 
 # ===================== rutas / disco =====================
 
@@ -945,8 +945,13 @@ class Handler(BaseHTTPRequestHandler):
             b = self._read_json()
             self._orch(b.get("projectId"), lambda ctx: orchestrator.pause(ctx))
         elif path == "/orch/resume":
+            # pausado, o muerto en error con trabajo pendiente (fase 13): `addTurns`
+            # estira el presupuesto si justamente fue eso lo que lo mató
             b = self._read_json()
-            self._orch(b.get("projectId"), lambda ctx: orchestrator.resume(ctx))
+            self._orch(b.get("projectId"), lambda ctx: orchestrator.resume(ctx, b.get("addTurns")))
+        elif path == "/orch/discard":
+            b = self._read_json()
+            self._orch(b.get("projectId"), lambda ctx: orchestrator.discard(ctx))
         elif path == "/orch/kill":
             b = self._read_json()
             self._orch(b.get("projectId"), lambda ctx: orchestrator.kill(ctx))
