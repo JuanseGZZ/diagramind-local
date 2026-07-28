@@ -60,6 +60,11 @@ from util import safe_name
 MEM_HEAVY_CHARS = 8000
 MAX_TURNS_DEFAULT = 30
 MAX_TOOL_ITERS = 12          # iteraciones LLM dentro de UN turno de agente
+# Las líneas del timeline se recortan (200 chars) para que se lean de un vistazo, pero
+# el mensaje ENTERO viaja aparte en `full` y la web lo abre en un modal al clickear la
+# fila. Tope alto pero acotado: un tool_result puede traer 60.000 chars y los events se
+# persisten en run.json (y el transcript completo ya vive en los frames).
+FULL_CHARS = 4000
 HTTP_TIMEOUT = 180
 
 RUNS = {}                     # pid -> run dict vivo
@@ -1410,7 +1415,9 @@ def build_system(ctx, graph, node, notes):
 # emit / set_node_state / add_spend asumen el LOCK tomado (mutan run).
 
 def emit(run, kind, **data):
-    run["events"].append({"kind": kind, "ts": int(time.time() * 1000), **data})
+    # los None no se guardan (p.ej. `full` cuando el texto no estaba recortado)
+    run["events"].append({"kind": kind, "ts": int(time.time() * 1000),
+                          **{k: v for k, v in data.items() if v is not None}})
 
 
 def set_node_state(ctx, run, node_id, status):
@@ -1513,14 +1520,16 @@ def _new_frame(ctx, graph, run, node, entry_kind, initial_text, parent_id=None):
         prev = cli_session_get(ctx, node["id"]) if _mem_on(node) else None
         frame = {**base, "kind": "cli", "sessionId": prev}
         if prev:
-            emit(run, "log", nodeId=node["id"], text="resumes its session (--resume)")
+            emit(run, "log", nodeId=node["id"],
+                 text=f"«{node.get('titulo') or node['id']}» resumes its CLI session (--resume)")
     else:
         make_adapter(ctx, node)   # valida ya mismo que la key del proveedor esté
         frame = {**base, "kind": "api", "messages": [], "pendingToolId": None, "stash": []}
     run["frames"][fid] = frame
     snapshot_resources(ctx, run, graph, node)
     set_node_state(ctx, run, node["id"], "running")
-    emit(run, "log", nodeId=node["id"], text=f"→ work in: {initial_text[:200]}")
+    emit(run, "log", nodeId=node["id"], text=f"→ work in: {initial_text[:200]}",
+         full=initial_text[:FULL_CHARS])
     return frame
 
 
@@ -1533,7 +1542,8 @@ def _finish_node(ctx, run, graph, frame, mensaje):
         mem_append(ctx, node["id"], frame["entry"],
                    f"Task: {frame['firstText'][:400]} → Result: {mensaje[:700]}", chat_id)
     set_node_state(ctx, run, node["id"], "done")
-    emit(run, "log", nodeId=node["id"], text=f"← responds: {mensaje[:200]}")
+    emit(run, "log", nodeId=node["id"], text=f"← responds: {mensaje[:200]}",
+         full=mensaje[:FULL_CHARS])
 
 
 def _do_responder(ctx, graph, run, frame, mensaje):
@@ -1558,8 +1568,8 @@ def _do_responder(ctx, graph, run, frame, mensaje):
     parent_node = graph["nodos"].get(parent["nodeId"]) or {"id": parent["nodeId"]}
     emit(run, "answer", nodeId=parent["nodeId"], fromId=child["id"],
          fromName=child.get("titulo") or str(child["id"]),
-         toName=parent_node.get("titulo") or str(parent["nodeId"]), message=mensaje[:400])
-    emit(run, "log", nodeId=parent["nodeId"],
+         toName=parent_node.get("titulo") or str(parent["nodeId"]), message=mensaje[:FULL_CHARS])
+    emit(run, "log", nodeId=parent["nodeId"], full=mensaje[:FULL_CHARS],
          text=f"← answer from «{child.get('titulo') or child['id']}»: {mensaje[:160]}")
     if parent.get("join") == "cada_una":
         quedan = len(parent["waiting"])
@@ -1632,8 +1642,8 @@ def _do_delegar(ctx, graph, run, frame, node, inp):
     who = ", ".join(f"«{t.get('titulo') or t['id']}»" for t in targets)
     emit(run, "delegate", nodeId=node["id"], toIds=[t["id"] for t in targets],
          toNames=[t.get("titulo") or str(t["id"]) for t in targets],
-         fromName=node.get("titulo") or str(node["id"]), join=join, message=msg[:400])
-    emit(run, "log", nodeId=node["id"],
+         fromName=node.get("titulo") or str(node["id"]), join=join, message=msg[:FULL_CHARS])
+    emit(run, "log", nodeId=node["id"], full=msg[:FULL_CHARS] or None,
          text=(f"→ delegates to {who}" + (f" (parallel, join: {join})" if len(targets) > 1 else "")
                + (f": {msg[:160]}" if msg else "")))
     for t in targets:
@@ -1906,7 +1916,9 @@ def _exec_tool(ctx, graph, run, node, rexecs, tc):
     solo para emitir eventos)."""
     name, inp = tc["name"], tc["input"]
     with LOCK:
-        emit(run, "log", nodeId=node["id"], text=f"tool {name}({json.dumps(inp, ensure_ascii=False)[:160]})")
+        args = json.dumps(inp, ensure_ascii=False)
+        emit(run, "log", nodeId=node["id"], text=f"tool {name}({args[:160]})",
+             full=(f"{name}\n\n{args[:FULL_CHARS]}" if len(args) > 160 else None))
     try:
         if _ctl(name) == "clear_memory":
             who = str(_arg(inp, "agent", "agente") or "").strip()
@@ -2411,7 +2423,8 @@ def answer(ctx, text, node_id=None):
         else:
             raise OrchError(400, "there are several pending questions: pass a nodeId")
         frame = run["frames"][p["frameId"]]
-        emit(run, "log", nodeId=p["nodeId"], text=f"user answers: {text[:200]}")
+        emit(run, "log", nodeId=p["nodeId"], text=f"user answers: {text[:200]}",
+              full=text[:FULL_CHARS])
         # la respuesta del humano va PRIMERA (resuelve el tool_result de la pregunta)
         frame["inbox"].insert(0, {"text": f"Answer from the user: {text}"})
         frame["status"] = "ready"
