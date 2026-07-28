@@ -561,7 +561,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         ctx = orch_ctx(pid)
         if not ctx:
-            self._json(409, {"error": "el orquestador no está sincronizado"})
+            self._json(409, {"error": "el orquestador no está sincronizado", "code": "not_synced"})
             return
         try:
             self._json(200, orchestrator.hook_fire(ctx, hook_id, token, payload,
@@ -573,7 +573,8 @@ class Handler(BaseHTTPRequestHandler):
         """Resuelve el ctx del orquestador y corre `fn(ctx)` traduciendo OrchError."""
         ctx = orch_ctx(pid)
         if not ctx:
-            self._json(409, {"error": "el orquestador no está sincronizado (falta en el mirror)"})
+            self._json(409, {"error": "el orquestador no está sincronizado (falta en el mirror)",
+                             "code": "not_synced"})
             return
         try:
             self._json(200, fn(ctx))
@@ -586,7 +587,7 @@ class Handler(BaseHTTPRequestHandler):
         """SSE de eventos del run del orquestador (para pintar el canvas en vivo)."""
         ctx = orch_ctx(pid)
         if not ctx:
-            self._json(409, {"error": "el orquestador no está sincronizado"})
+            self._json(409, {"error": "el orquestador no está sincronizado", "code": "not_synced"})
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
