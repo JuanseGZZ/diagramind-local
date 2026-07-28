@@ -117,7 +117,7 @@ def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, fo
     bin_path = adapter.find()
     if not bin_path:
         set_status(run, "error",
-                   f"No se encontró el binario `{adapter.bin_names[0]}` ({adapter.label}) en esta máquina.")
+                   f"The `{adapter.bin_names[0]}` binary ({adapter.label}) was not found on this machine.")
         return
     try:
         adapter.install_instructions(work_dir)
@@ -141,7 +141,7 @@ def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, fo
             encoding="utf-8", errors="replace", env=env,
         )
     except Exception as e:
-        set_status(run, "error", f"No se pudo lanzar {adapter.label}: {e}")
+        set_status(run, "error", f"Could not launch {adapter.label}: {e}")
         return
 
     run["proc"] = proc
@@ -166,6 +166,6 @@ def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, fo
     if run["status"] == "cancelled":
         return
     if proc.returncode and proc.returncode != 0 and run["status"] != "done":
-        set_status(run, "error", stderr or f"{adapter.label} salió con código {proc.returncode}")
+        set_status(run, "error", stderr or f"{adapter.label} exited with code {proc.returncode}")
     elif run["status"] not in ("done", "error"):
         set_status(run, "done")

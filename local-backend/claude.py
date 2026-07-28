@@ -106,7 +106,7 @@ def handle_event(run, obj):
         if obj.get("session_id"):
             run["claude_session_id"] = obj["session_id"]
         if obj.get("is_error"):
-            set_status(run, "error", obj.get("result") or "Claude devolvió un error.")
+            set_status(run, "error", obj.get("result") or "Claude returned an error.")
         else:
             txt = obj.get("result")
             # algunos turnos sólo traen el texto en el result final

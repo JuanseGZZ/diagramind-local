@@ -251,7 +251,7 @@ def cred_write(ctx, cred):
     cred = cred or {}
     prov = cred.get("provider")
     if prov not in CRED_PROVIDERS:
-        raise OrchError(400, f"proveedor inválido: {prov!r}")
+        raise OrchError(400, f"invalid provider: {prov!r}")
     key = (cred.get("key") or "").strip()
     url = (cred.get("url") or "").strip()
     nombre = (cred.get("nombre") or "").strip()
@@ -712,7 +712,7 @@ def validate_graph(ctx, obj):
         if nid in seen:
             return f"id de nodo repetido: {nid}"
         if n.get("type") not in NODE_TYPES:
-            return f"tipo de nodo inválido: {n.get('type')}"
+            return f"invalid node type: {n.get('type')}"
         seen[nid] = n
     for f in flechas:
         try:
@@ -723,7 +723,7 @@ def validate_graph(ctx, obj):
             return f"flecha con punta inexistente ({a}→{b})"
         combo = (f.get("kind"), seen[a].get("type"), seen[b].get("type"))
         if combo not in ARROW_OK:
-            return f"flecha inválida: {combo[0]} {combo[1]}→{combo[2]}"
+            return f"invalid arrow: {combo[0]} {combo[1]}→{combo[2]}"
     for n in nodos:
         if n.get("type") == "agResource":
             rpid = (n.get("data") or {}).get("projectId")
@@ -737,7 +737,7 @@ def validate_graph(ctx, obj):
 def load_graph(ctx):
     tree = _read_json(ctx["graph_path"], None)
     if not tree or tree.get("type") != "orchestrator":
-        raise OrchError(400, "el proyecto no es un orquestador o no está sincronizado")
+        raise OrchError(400, "the project is not an orchestrator, or it is not synced")
     nodos = {int(n["id"]): n for n in tree.get("nodos", [])}
     flechas = tree.get("flechas", [])
     return {"nodos": nodos, "flechas": flechas}
@@ -897,7 +897,7 @@ def _http_json(url, headers, body):
         except Exception:
             detail = {}
         msg = detail.get("error", {}).get("message") if isinstance(detail.get("error"), dict) else None
-        raise OrchError(502, f"la API respondió {e.code}: {msg or e.reason}")
+        raise OrchError(502, f"the API answered {e.code}: {msg or e.reason}")
     except Exception as e:
         raise OrchError(502, f"no pude hablar con la API: {e}")
 
@@ -1074,13 +1074,13 @@ def pick_cred(keys, node, provider, cred_id):
         c = next((x for x in creds_of(keys) if x.get("id") == cred_id), None)
         if c:
             return c
-        raise OrchError(400, f"{quien} tiene elegida una credencial que ya no existe en este "
-                             "orquestador — elegí otra en el nodo (o cargala con el botón Keys)")
+        raise OrchError(400, f"{quien} has a credential selected that no longer exists in this "
+                             "orchestrator — pick another one in the node (or add it with the Keys button)")
     disp = creds_of(keys, provider)
     if not disp:
-        raise OrchError(400, f"{quien} usa {PROV_LABEL.get(provider, provider)} y no hay ninguna "
-                             "credencial de ese proveedor cargada — agregala con el botón Keys y "
-                             "elegila en el nodo")
+        raise OrchError(400, f"{quien} uses {PROV_LABEL.get(provider, provider)} and there is no "
+                             "credential of that provider loaded — add it with the Keys button and "
+                             "select it in the node")
     return disp[0]
 
 
@@ -1098,10 +1098,10 @@ def make_adapter(ctx, node):
         return OpenAIChat(key, ia.get("model") or "gpt-4o")
     if provider == "other":
         if not cred.get("url"):
-            raise OrchError(400, f"la credencial «{cred.get('nombre')}» es de 'Otra API' y no tiene URL")
+            raise OrchError(400, f"credential «{cred.get('nombre')}» is an 'Other API' one and has no URL")
         return OpenAIChat(key, ia.get("model") or "gpt-4o", None, base=cred["url"])
-    raise OrchError(400, f"el nodo «{node.get('titulo')}» usa el proveedor '{provider}', que el motor "
-                         "todavía no soporta (APIs: Anthropic, Google y OpenAI-compatible; CLI: Claude Code)")
+    raise OrchError(400, f"node «{node.get('titulo')}» uses provider '{provider}', which the engine "
+                         "does not support yet (APIs: Anthropic, Google and OpenAI-compatible; CLI: Claude Code)")
 
 
 # ===================== tools =====================
@@ -1261,7 +1261,7 @@ def org_tools(ctx, graph, run, node):
         with LOCK:                               # refresh en vivo del grafo del run
             graph["nodos"] = {int(n["id"]): n for n in obj.get("nodos", [])}
             graph["flechas"] = obj.get("flechas", [])
-            emit(run, "log", nodeId=node["id"], text="👑 editó el organigrama (org_edit)")
+            emit(run, "log", nodeId=node["id"], text="👑 edited the org chart (org_edit)")
         return "OK: org chart updated. NO run was triggered.", False
     tools.append(dict(name="org_edit", **_s(
         "Replaces the ENTIRE org chart of your company with a valid orchestrator-type JSON "
@@ -1428,9 +1428,9 @@ def snapshot_resources(ctx, run, graph, node):
                     d = os.path.join(orch_dir(ctx["app_dir"], ctx["pid"]), "snapshots")
                     os.makedirs(d, exist_ok=True)
                     shutil.copyfile(src, os.path.join(d, f"{run['id']}-{node['id']}-{rpid}.json"))
-            emit(run, "log", nodeId=node["id"], text=f"snapshot pre-turno de {meta.get('name')}")
+            emit(run, "log", nodeId=node["id"], text=f"pre-turn snapshot of {meta.get('name')}")
         except Exception as e:
-            emit(run, "log", nodeId=node["id"], text=f"snapshot falló ({meta.get('name')}): {e}")
+            emit(run, "log", nodeId=node["id"], text=f"snapshot failed ({meta.get('name')}): {e}")
 
 
 # ===================== locks por recurso/agente (decisión E) =====================
@@ -1475,21 +1475,21 @@ def _new_frame(ctx, graph, run, node, entry_kind, initial_text, parent_id=None):
             "inbox": [{"text": initial_text}], "join": None, "waiting": {}, "collected": []}
     if provider in CLI_PROVIDERS:
         if provider != "local":
-            raise OrchError(400, f"el nodo «{node.get('titulo')}» usa '{provider}': como cabeza CLI "
-                                 "por ahora solo está soportado Claude Code (fase 4 v1)")
+            raise OrchError(400, f"node «{node.get('titulo')}» uses '{provider}': as a CLI head "
+                                 "only Claude Code is supported for now (phase 4 v1)")
         # retoma la sesión del AGENTE (no del frame): si ya laburó antes y no le
         # limpiaron la memoria, sigue donde iba en vez de arrancar en frío
         prev = cli_session_get(ctx, node["id"]) if _mem_on(node) else None
         frame = {**base, "kind": "cli", "sessionId": prev}
         if prev:
-            emit(run, "log", nodeId=node["id"], text="retoma su sesión (--resume)")
+            emit(run, "log", nodeId=node["id"], text="resumes its session (--resume)")
     else:
         make_adapter(ctx, node)   # valida ya mismo que la key del proveedor esté
         frame = {**base, "kind": "api", "messages": [], "pendingToolId": None, "stash": []}
     run["frames"][fid] = frame
     snapshot_resources(ctx, run, graph, node)
     set_node_state(ctx, run, node["id"], "running")
-    emit(run, "log", nodeId=node["id"], text=f"→ entra trabajo: {initial_text[:200]}")
+    emit(run, "log", nodeId=node["id"], text=f"→ work in: {initial_text[:200]}")
     return frame
 
 
@@ -1502,7 +1502,7 @@ def _finish_node(ctx, run, graph, frame, mensaje):
         mem_append(ctx, node["id"], frame["entry"],
                    f"Task: {frame['firstText'][:400]} → Result: {mensaje[:700]}", chat_id)
     set_node_state(ctx, run, node["id"], "done")
-    emit(run, "log", nodeId=node["id"], text=f"← responde: {mensaje[:200]}")
+    emit(run, "log", nodeId=node["id"], text=f"← responds: {mensaje[:200]}")
 
 
 def _do_responder(ctx, graph, run, frame, mensaje):
@@ -1543,7 +1543,7 @@ def _implicit_end(ctx, graph, run, frame, texto):
         frame["status"] = "waiting_children"
         set_node_state(ctx, run, frame["nodeId"], "waiting")
         _release_locks(run, frame["id"])
-        emit(run, "log", nodeId=frame["nodeId"], text="sigue esperando las respuestas pendientes")
+        emit(run, "log", nodeId=frame["nodeId"], text="still waiting for the pending answers")
         return
     _do_responder(ctx, graph, run, frame, texto)
 
@@ -1590,7 +1590,7 @@ def _do_delegar(ctx, graph, run, frame, node, inp):
         frame["waiting"][child["id"]] = t.get("titulo") or str(t["id"])
     if len(targets) > 1:
         emit(run, "log", nodeId=node["id"],
-             text=f"fork: delegó en paralelo a {len(targets)} agentes (join: {join})")
+             text=f"fork: delegated in parallel to {len(targets)} agents (join: {join})")
     return None
 
 
@@ -1601,8 +1601,8 @@ def start_run(ctx, entry_kind, root_node_id, initial_text, api_keys, max_turns=N
     with LOCK:
         prev = RUNS.get(ctx["pid"])
         if prev and prev["status"] in ("running", "waiting_human", "paused"):
-            raise OrchError(409, "ya hay un run en curso en este orquestador: "
-                                 "esperá, respondé lo pendiente o matalo")
+            raise OrchError(409, "there is already a run in progress in this orchestrator: "
+                                 "wait for it, answer what is pending, or stop it")
         graph = load_graph(ctx)
         root = _agent(graph, root_node_id)
         # las credenciales son SIEMPRE las del proyecto (decisión T); `api_keys` del
@@ -1663,8 +1663,8 @@ def _loop(ctx):
                         break
                 elif run["turns"] >= run["maxTurns"]:
                     if run["_workers"] == 0:
-                        raise OrchError(400, f"presupuesto agotado ({run['maxTurns']} turnos). "
-                                             "Subí maxTurns o dividí la tarea")
+                        raise OrchError(400, f"budget exhausted ({run['maxTurns']} turns). "
+                                             "Raise maxTurns or split the task")
                 else:
                     for f in sorted((x for x in run["frames"].values() if x["status"] in ("ready", "queued")),
                                     key=lambda x: int(x["id"][1:])):
@@ -1678,14 +1678,14 @@ def _loop(ctx):
                             f["status"] = "queued"
                             set_node_state(ctx, run, f["nodeId"], "queued")
                             emit(run, "log", nodeId=f["nodeId"],
-                                 text="en cola: espera un recurso/agente ocupado por otra rama")
+                                 text="queued: waiting for a resource/agent busy in another branch")
                     if run["_workers"] == 0:
                         blocked = {x["status"] for x in active}
                         if blocked <= {"waiting_human", "waiting_children"} and "waiting_human" in blocked:
                             run["status"] = "waiting_human"
                             break
                         if blocked == {"waiting_children"}:
-                            raise OrchError(500, "el run quedó trabado (agentes esperando sin hijos activos)")
+                            raise OrchError(500, "the run got stuck (agents waiting with no active children)")
                 cv.wait(timeout=0.25)
         except OrchError as e:
             run["status"], run["error"] = "error", e.msg
@@ -2179,8 +2179,8 @@ def _run_cli_turn(ctx, graph, run, node, frame, message):
     """Lanza `claude -p` para un turno del agente y devuelve (texto, session_id, costo)."""
     cli_bin = find_claude()
     if not cli_bin:
-        raise OrchError(400, f"el nodo «{node.get('titulo')}» usa Claude Code y el binario `claude` "
-                             "no está en esta máquina")
+        raise OrchError(400, f"node «{node.get('titulo')}» uses Claude Code and the `claude` binary "
+                             "is not on this machine")
     cmd, cwd, cfg = _cli_cmd(ctx, graph, node, frame, message, cli_bin)
     try:
         proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -2196,7 +2196,7 @@ def _run_cli_turn(ctx, graph, run, node, frame, message):
         for line in proc.stdout:
             if time.time() > deadline:
                 proc.terminate()
-                raise OrchError(400, f"turno CLI de «{node.get('titulo')}» superó el tope de {CLI_TIMEOUT // 60} min")
+                raise OrchError(400, f"CLI turn of «{node.get('titulo')}» went over the {CLI_TIMEOUT // 60} min cap")
             line = line.strip()
             if not line:
                 continue
@@ -2219,7 +2219,7 @@ def _run_cli_turn(ctx, graph, run, node, frame, message):
                 cost = obj.get("total_cost_usd") or 0.0
                 if obj.get("is_error"):
                     proc.wait()
-                    raise OrchError(502, f"Claude Code devolvió un error: {result_text or '?'}")
+                    raise OrchError(502, f"Claude Code returned an error: {result_text or '?'}")
         proc.wait()
     finally:
         rt["procs"].pop(frame["id"], None)
@@ -2228,7 +2228,7 @@ def _run_cli_turn(ctx, graph, run, node, frame, message):
         raise OrchError(400, "turno CLI cancelado")
     if proc.returncode not in (0, None) and result_text is None:
         err = (proc.stderr.read() or "").strip()[:400]
-        raise OrchError(502, f"Claude Code salió con código {proc.returncode}: {err}")
+        raise OrchError(502, f"Claude Code exited with code {proc.returncode}: {err}")
     return (result_text or "\n\n".join(texts) or ""), session_id, cost
 
 
@@ -2250,7 +2250,7 @@ def _turn_cli(ctx, graph, run, frame):
             raise
         with cv:
             emit(run, "log", nodeId=node["id"],
-                 text="la sesión guardada ya no existe — arranco una nueva")
+                 text="the saved session no longer exists — starting a fresh one")
         cli_session_clear(ctx, node["id"])
         frame["sessionId"] = None
         text, session_id, cost = _run_cli_turn(ctx, graph, run, node, frame, message)
@@ -2274,12 +2274,12 @@ def _turn_cli(ctx, graph, run, frame):
             who = str(_arg(lm, "agent", "agente") or "").strip()
             if not who:
                 mem_clear(ctx, node["id"])
-                emit(run, "log", nodeId=node["id"], text="limpió su memoria")
+                emit(run, "log", nodeId=node["id"], text="cleared its memory")
             else:
                 target = _resolve_target(graph, node["id"], who)
                 if target:
                     mem_clear(ctx, target["id"])
-                    emit(run, "log", nodeId=node["id"], text=f"limpió la memoria de «{target.get('titulo')}»")
+                    emit(run, "log", nodeId=node["id"], text=f"cleared the memory of «{target.get('titulo')}»")
 
         if accion is None:
             _implicit_end(ctx, graph, run, frame, visible or "(no answer)")
@@ -2327,7 +2327,7 @@ def get_state(ctx):
         run = _read_json(_run_path(ctx), None)
         if run and run.get("status") in ("running", "waiting_human", "paused"):
             run["status"] = "error"
-            run["error"] = "el backend se reinició durante el run — relanzalo"
+            run["error"] = "the backend restarted during the run — launch it again"
             _write_json(_run_path(ctx), run)
     if not run:
         return {"run": None}
@@ -2341,7 +2341,7 @@ def answer(ctx, text, node_id=None):
     """Respuesta del humano a UNA pregunta pendiente (por nodeId si hay varias)."""
     run = RUNS.get(ctx["pid"])
     if not run or run["status"] not in ("running", "waiting_human"):
-        raise OrchError(409, "no hay ninguna pregunta pendiente (¿se reinició el backend?)")
+        raise OrchError(409, "there is no pending question (did the backend restart?)")
     with LOCK:
         pendings = run.get("pendings") or []
         if not pendings:
@@ -2354,9 +2354,9 @@ def answer(ctx, text, node_id=None):
         elif len(pendings) == 1:
             p = pendings[0]
         else:
-            raise OrchError(400, "hay varias preguntas pendientes: indicá nodeId")
+            raise OrchError(400, "there are several pending questions: pass a nodeId")
         frame = run["frames"][p["frameId"]]
-        emit(run, "log", nodeId=p["nodeId"], text=f"usuario responde: {text[:200]}")
+        emit(run, "log", nodeId=p["nodeId"], text=f"user answers: {text[:200]}")
         # la respuesta del humano va PRIMERA (resuelve el tool_result de la pregunta)
         frame["inbox"].insert(0, {"text": f"Answer from the user: {text}"})
         frame["status"] = "ready"
@@ -2476,17 +2476,17 @@ def events_since(ctx, since):
 # se lista como REFERENCIA para que el usuario vea con qué trabaja un nodo CLI.
 # Lo que sí controlamos son los flags: `--disallowedTools` y `--permission-mode`.
 CLI_NATIVE_TOOLS = [
-    ("Read", "Lee un archivo del disco."),
-    ("Write", "Escribe un archivo completo."),
-    ("Edit", "Reemplaza texto exacto dentro de un archivo."),
-    ("Bash", "Ejecuta comandos de shell."),
-    ("Glob", "Busca archivos por patrón."),
-    ("Grep", "Busca texto dentro de los archivos."),
-    ("Task", "Lanza subagentes propios del CLI."),
-    ("TodoWrite", "Lista de tareas interna del turno."),
-    ("NotebookEdit", "Edita notebooks Jupyter."),
-    ("WebFetch", "Trae una URL."),
-    ("WebSearch", "Busca en la web."),
+    ("Read", "Reads a file from disk."),
+    ("Write", "Writes a whole file."),
+    ("Edit", "Replaces exact text inside a file."),
+    ("Bash", "Runs shell commands."),
+    ("Glob", "Finds files by pattern."),
+    ("Grep", "Searches text inside the files."),
+    ("Task", "Launches the CLI's own subagents."),
+    ("TodoWrite", "The turn's internal task list."),
+    ("NotebookEdit", "Edits Jupyter notebooks."),
+    ("WebFetch", "Fetches a URL."),
+    ("WebSearch", "Searches the web."),
 ]
 CLI_DISALLOWED = ["WebFetch", "WebSearch"]
 

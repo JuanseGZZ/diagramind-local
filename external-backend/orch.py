@@ -299,7 +299,7 @@ def cred_write(ctx, cred):
     cred = cred or {}
     prov = cred.get("provider")
     if prov not in CRED_PROVIDERS:
-        raise OrchError(400, f"proveedor inválido: {prov!r}")
+        raise OrchError(400, f"invalid provider: {prov!r}")
     key = (cred.get("key") or "").strip()
     url = (cred.get("url") or "").strip()
     nombre = (cred.get("nombre") or "").strip()
@@ -757,7 +757,7 @@ def validate_graph(ctx, obj):
         if nid in seen:
             return f"id de nodo repetido: {nid}"
         if n.get("type") not in NODE_TYPES:
-            return f"tipo de nodo inválido: {n.get('type')}"
+            return f"invalid node type: {n.get('type')}"
         seen[nid] = n
     for f in flechas:
         try:
@@ -768,7 +768,7 @@ def validate_graph(ctx, obj):
             return f"flecha con punta inexistente ({a}→{b})"
         combo = (f.get("kind"), seen[a].get("type"), seen[b].get("type"))
         if combo not in ARROW_OK:
-            return f"flecha inválida: {combo[0]} {combo[1]}→{combo[2]}"
+            return f"invalid arrow: {combo[0]} {combo[1]}→{combo[2]}"
     for n in nodos:
         if n.get("type") == "agResource":
             rpid = (n.get("data") or {}).get("projectId")
@@ -788,7 +788,7 @@ def load_graph(ctx):
         except Exception:
             tree = None
     if not tree or tree.get("type") != "orchestrator":
-        raise OrchError(400, "el proyecto no es un orquestador o no está sincronizado")
+        raise OrchError(400, "the project is not an orchestrator, or it is not synced")
     nodos = {int(n["id"]): n for n in tree.get("nodos", [])}
     flechas = tree.get("flechas", [])
     return {"nodos": nodos, "flechas": flechas}
@@ -897,7 +897,7 @@ def _http_json(url, headers, body):
         except Exception:
             detail = {}
         msg = detail.get("error", {}).get("message") if isinstance(detail.get("error"), dict) else None
-        raise OrchError(502, f"la API respondió {e.code}: {msg or e.reason}")
+        raise OrchError(502, f"the API answered {e.code}: {msg or e.reason}")
     except Exception as e:
         raise OrchError(502, f"no pude hablar con la API: {e}")
 
@@ -1068,13 +1068,13 @@ def pick_cred(keys, node, provider, cred_id):
         c = next((x for x in creds_of(keys) if x.get("id") == cred_id), None)
         if c:
             return c
-        raise OrchError(400, f"{quien} tiene elegida una credencial que ya no existe en este "
-                             "orquestador — elegí otra en el nodo (o cargala con el botón Keys)")
+        raise OrchError(400, f"{quien} has a credential selected that no longer exists in this "
+                             "orchestrator — pick another one in the node (or add it with the Keys button)")
     disp = creds_of(keys, provider)
     if not disp:
-        raise OrchError(400, f"{quien} usa {PROV_LABEL.get(provider, provider)} y no hay ninguna "
-                             "credencial de ese proveedor cargada — agregala con el botón Keys y "
-                             "elegila en el nodo")
+        raise OrchError(400, f"{quien} uses {PROV_LABEL.get(provider, provider)} and there is no "
+                             "credential of that provider loaded — add it with the Keys button and "
+                             "select it in the node")
     return disp[0]
 
 
@@ -1083,8 +1083,8 @@ def make_adapter(ctx, node):
     provider = ia.get("provider") or "anthropic"
     keys = KEYS.get(ctx["pid"]) or keys_read(ctx)
     if provider in CLI_PROVIDERS:
-        raise OrchError(400, f"el nodo «{node.get('titulo')}» usa un CLI local ('{provider}'): en "
-                             "conectores EXTERNOS las cabezas son solo APIs (decisión M)")
+        raise OrchError(400, f"node «{node.get('titulo')}» uses a local CLI ('{provider}'): on "
+                             "EXTERNAL connectors the heads are APIs only (decision M)")
     cred = pick_cred(keys, node, provider, ia.get("credId"))
     provider = cred.get("provider") or provider
     key = cred.get("key")
@@ -1272,7 +1272,7 @@ def org_tools(ctx, graph, run, node):
         with LOCK:                               # refresh en vivo del grafo del run
             graph["nodos"] = {int(n["id"]): n for n in obj.get("nodos", [])}
             graph["flechas"] = obj.get("flechas", [])
-            emit(run, "log", nodeId=node["id"], text="👑 editó el organigrama (org_edit)")
+            emit(run, "log", nodeId=node["id"], text="👑 edited the org chart (org_edit)")
         return "OK: org chart updated. NO run was triggered.", False
     tools.append(dict(name="org_edit", **_s(
         "Replaces the ENTIRE org chart of your company with a valid orchestrator-type JSON "
@@ -1469,7 +1469,7 @@ def snapshot_resources(ctx, run, graph, node):
                                f"(auto) run {run['id']}: snapshot pre-turno de {name}")
             emit(run, "log", nodeId=node["id"], text=f"snapshot pre-turno de {meta.get('name')}")
         except Exception as e:
-            emit(run, "log", nodeId=node["id"], text=f"snapshot falló ({meta.get('name')}): {e}")
+            emit(run, "log", nodeId=node["id"], text=f"snapshot failed ({meta.get('name')}): {e}")
 
 
 # ===================== locks por recurso/agente (decisión E) =====================
@@ -1607,7 +1607,7 @@ def _do_delegar(ctx, graph, run, frame, node, inp):
         frame["waiting"][child["id"]] = t.get("titulo") or str(t["id"])
     if len(targets) > 1:
         emit(run, "log", nodeId=node["id"],
-             text=f"fork: delegó en paralelo a {len(targets)} agentes (join: {join})")
+             text=f"fork: delegated in parallel to {len(targets)} agents (join: {join})")
     return None
 
 
@@ -1617,8 +1617,8 @@ def start_run(ctx, entry_kind, root_node_id, initial_text, api_keys, max_turns=N
     with LOCK:
         prev = RUNS.get(ctx["pid"])
         if prev and prev["status"] in ("running", "waiting_human", "paused"):
-            raise OrchError(409, "ya hay un run en curso en este orquestador: "
-                                 "esperá, respondé lo pendiente o matalo")
+            raise OrchError(409, "there is already a run in progress in this orchestrator: "
+                                 "wait for it, answer what is pending, or stop it")
         graph = load_graph(ctx)
         root = _agent(graph, root_node_id)
         # las credenciales son SIEMPRE las del proyecto (decisión T); `api_keys` del
@@ -1676,8 +1676,8 @@ def _loop(ctx):
                         break
                 elif run["turns"] >= run["maxTurns"]:
                     if run["_workers"] == 0:
-                        raise OrchError(400, f"presupuesto agotado ({run['maxTurns']} turnos). "
-                                             "Subí maxTurns o dividí la tarea")
+                        raise OrchError(400, f"budget exhausted ({run['maxTurns']} turns). "
+                                             "Raise maxTurns or split the task")
                 else:
                     for f in sorted((x for x in run["frames"].values() if x["status"] in ("ready", "queued")),
                                     key=lambda x: int(x["id"][1:])):
@@ -1698,7 +1698,7 @@ def _loop(ctx):
                             run["status"] = "waiting_human"
                             break
                         if blocked == {"waiting_children"}:
-                            raise OrchError(500, "el run quedó trabado (agentes esperando sin hijos activos)")
+                            raise OrchError(500, "the run got stuck (agents waiting with no active children)")
                 cv.wait(timeout=0.25)
         except OrchError as e:
             run["status"], run["error"] = "error", e.msg
@@ -1899,7 +1899,7 @@ def get_state(ctx):
         run = _read_json(_run_path(ctx), None)
         if run and run.get("status") in ("running", "waiting_human", "paused"):
             run["status"] = "error"
-            run["error"] = "el conector se reinició durante el run — relanzalo"
+            run["error"] = "the connector restarted during the run — launch it again"
             _write_json(_run_path(ctx), run)
     if not run:
         return {"run": None}
@@ -1912,7 +1912,7 @@ def get_state(ctx):
 def answer(ctx, text, node_id=None):
     run = RUNS.get(ctx["pid"])
     if not run or run["status"] not in ("running", "waiting_human"):
-        raise OrchError(409, "no hay ninguna pregunta pendiente (¿se reinició el conector?)")
+        raise OrchError(409, "there is no pending question (did the connector restart?)")
     with LOCK:
         pendings = run.get("pendings") or []
         if not pendings:
@@ -1925,7 +1925,7 @@ def answer(ctx, text, node_id=None):
         elif len(pendings) == 1:
             p = pendings[0]
         else:
-            raise OrchError(400, "hay varias preguntas pendientes: indicá nodeId")
+            raise OrchError(400, "there are several pending questions: pass a nodeId")
         frame = run["frames"][p["frameId"]]
         emit(run, "log", nodeId=p["nodeId"], text=f"usuario responde: {text[:200]}")
         frame["inbox"].insert(0, {"text": f"Answer from the user: {text}"})
@@ -2321,7 +2321,7 @@ def orch_run(body: OrchRunBody, user: dict = Depends(require_admin)):
         edge = next((f for f in graph["flechas"]
                      if f.get("kind") == "task" and int(f.get("fromId", -1)) == int(body.taskNodeId)), None)
         if not edge:
-            raise OrchError(400, "la tarea no está conectada a un agente (flecha task)")
+            raise OrchError(400, "the task is not connected to an agent (task arrow)")
         texto = f"TAREA «{task.get('titulo') or 'tarea'}»: {(task.get('data') or {}).get('enunciado') or ''}"
         run = start_run(ctx, "task", int(edge["toId"]), texto, body.apiKeys or {}, body.maxTurns)
         return {"runId": run["id"]}

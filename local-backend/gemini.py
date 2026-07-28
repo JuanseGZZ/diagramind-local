@@ -54,13 +54,13 @@ class GeminiAdapter:
     def finalize(self, run):
         # cuota agotada → mensaje limpio + cerramos OK (sin volcar el stack trace)
         if run.get("_quota"):
-            emit(run, "assistant", text="⚠ Gemini CLI se quedó sin cuota (límite del free "
-                 "tier de Google, se resetea por día). Cambiá de backend (ej. Local · Claude "
-                 "Code) para seguir, o usá una API key de Gemini con plan pago.")
+            emit(run, "assistant", text="⚠ Gemini CLI ran out of quota (Google free tier "
+                 "limit, it resets daily). Switch backend (e.g. Local · Claude Code) to keep "
+                 "going, or use a Gemini API key on a paid plan.")
             set_status(run, "done")
             return
         txt = "\n".join(run.get("_buf", [])).strip()
         if txt:
             emit(run, "assistant", text=txt)
         elif not any(e["kind"] == "assistant" for e in run["events"]):
-            emit(run, "assistant", text="(Gemini terminó.)")
+            emit(run, "assistant", text="(Gemini finished.)")

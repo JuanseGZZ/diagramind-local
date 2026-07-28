@@ -85,9 +85,9 @@ def docs_put(project_dir, h, data):
     if not valid_hash(h):
         return 400, {"error": "hash inválido"}
     if not isinstance(data, (bytes, bytearray)) or not data:
-        return 400, {"error": "cuerpo vacío"}
+        return 400, {"error": "empty body"}
     if len(data) > MAX_BLOB:
-        return 413, {"error": f"blob demasiado grande (máx {MAX_BLOB // (1024 * 1024)} MB)"}
+        return 413, {"error": f"blob too large (max {MAX_BLOB // (1024 * 1024)} MB)"}
     real = sha256_bytes(data)
     if real != h.lower():
         # la verificación del doc 30 decisión D: el contenido no es lo que dice ser

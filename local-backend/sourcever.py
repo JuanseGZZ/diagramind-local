@@ -70,7 +70,7 @@ def _walk(target):
                 continue
             out[os.path.relpath(fp, base)] = fp
             if len(out) > MAX_FILES:
-                raise SvError(400, f"el proyecto tiene más de {MAX_FILES} archivos versionables")
+                raise SvError(400, f"the project has more than {MAX_FILES} versionable files")
     return out
 
 
@@ -114,7 +114,7 @@ def _get(sv_dir, vid):
     for m in _read_index(sv_dir):
         if m["id"] == vid:
             return m
-    raise SvError(404, f"no existe la versión {vid}")
+    raise SvError(404, f"version {vid} does not exist")
 
 
 # ---------------- API ----------------
@@ -181,7 +181,7 @@ def sv_diff(sv_dir, target, vid, path):
         raise SvError(404, "el archivo no existe ni en el snapshot ni en el target")
     lines = difflib.unified_diff(
         (old or "").splitlines(keepends=True), (new or "").splitlines(keepends=True),
-        fromfile=f"{vid or '(sin versión)'}/{path}", tofile=f"actual/{path}",
+        fromfile=f"{vid or '(no version)'}/{path}", tofile=f"current/{path}",
     )
     return {"diff": "".join(lines) or "(sin cambios)"}
 

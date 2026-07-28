@@ -50,4 +50,4 @@ class CodexAdapter:
         if txt:
             emit(run, "assistant", text=txt)
         elif not any(e["kind"] == "assistant" for e in run["events"]):
-            emit(run, "assistant", text="(Codex terminó.)")
+            emit(run, "assistant", text="(Codex finished.)")

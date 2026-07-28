@@ -40,9 +40,9 @@ def _git(args, cwd, token=None):
         r = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
                            text=True, timeout=GIT_TIMEOUT, check=False)
     except FileNotFoundError:
-        raise GitError(400, "git no está instalado en la máquina del conector")
+        raise GitError(400, "git is not installed on the connector machine")
     except subprocess.TimeoutExpired:
-        raise GitError(400, "git tardó demasiado (timeout)")
+        raise GitError(400, "git took too long (timeout)")
     return r.returncode, _redact((r.stdout or "") + (r.stderr or ""), token)
 
 
@@ -66,7 +66,7 @@ def ensure_repo(target):
     if not os.path.isdir(os.path.join(target, ".git")):
         code, out = _git(["-c", "init.defaultBranch=main", "init"], target)
         if code != 0:
-            raise GitError(400, f"git init falló: {out.strip()}")
+            raise GitError(400, f"git init failed: {out.strip()}")
 
 
 def gh_status(conn, target):
@@ -82,13 +82,13 @@ def gh_status(conn, target):
 def gh_push(conn, target, message, author_name, by_ai=False):
     """add -A + commit (si hay cambios) + push a la rama del remoto."""
     if not conn or not conn.get("remoteUrl"):
-        raise GitError(400, "GitHub no está conectado en este proyecto")
+        raise GitError(400, "GitHub is not connected on this project")
     ensure_repo(target)
     token = conn.get("token") or ""
     branch = conn.get("branch") or "main"
     msg = (message or "").strip() or "Guardado desde DiagraMinder"
     if by_ai:
-        msg += "\n\n[commit hecho por la IA vía DiagraMinder]"
+        msg += "\n\n[commit made by the AI via DiagraMinder]"
     _git(["add", "-A"], target)
     committed = False
     code, _ = _git(["diff", "--cached", "--quiet"], target)
@@ -97,11 +97,11 @@ def gh_push(conn, target, message, author_name, by_ai=False):
         code, out = _git([*_ident(author_name), "commit", "-m", msg,
                           f"--author={author_name or 'DiagraMinder'} <{email}>"], target, token)
         if code != 0:
-            raise GitError(400, f"commit falló: {out.strip()}")
+            raise GitError(400, f"commit failed: {out.strip()}")
         committed = True
     code, out = _git(["push", _auth_url(conn["remoteUrl"], token), f"HEAD:{branch}"], target, token)
     if code != 0:
-        raise GitError(400, f"push falló: {out.strip()}")
+        raise GitError(400, f"push failed: {out.strip()}")
     return {"ok": True, "committed": committed, "branch": branch}
 
 
@@ -111,7 +111,7 @@ def gh_pull(conn, target, ref, sv_dir, author_name):
     (checkout <ref> -- . — la historia no se toca; un push posterior lo commitea).
     SIEMPRE guarda antes un snapshot de seguridad en las source versions."""
     if not conn or not conn.get("remoteUrl"):
-        raise GitError(400, "GitHub no está conectado en este proyecto")
+        raise GitError(400, "GitHub is not connected on this project")
     ensure_repo(target)
     token = conn.get("token") or ""
     branch = conn.get("branch") or "main"
@@ -119,15 +119,15 @@ def gh_pull(conn, target, ref, sv_dir, author_name):
                             f"(auto) antes de pull {ref or branch}")
     code, out = _git(["fetch", _auth_url(conn["remoteUrl"], token), branch], target, token)
     if code != 0:
-        raise GitError(400, f"fetch falló: {out.strip()}")
+        raise GitError(400, f"fetch failed: {out.strip()}")
     if ref:
         code, out = _git(["checkout", ref, "--", "."], target, token)
         if code != 0:
-            raise GitError(400, f"no pude traer la versión {ref}: {out.strip()}")
+            raise GitError(400, f"could not fetch version {ref}: {out.strip()}")
         return {"ok": True, "ref": ref, "pre": pre}
     code, out = _git(["reset", "--hard", "FETCH_HEAD"], target, token)
     if code != 0:
-        raise GitError(400, f"pull falló: {out.strip()}")
+        raise GitError(400, f"pull failed: {out.strip()}")
     return {"ok": True, "ref": branch, "pre": pre}
 
 

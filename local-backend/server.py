@@ -309,7 +309,7 @@ def sv_context(pid):
             if p.get("id") == pid:
                 svd = os.path.join(tree_dir(folder, p.get("name") or pid), "source-versions")
                 return None, svd, target
-    return (409, {"error": "el proyecto no está sincronizado (falta en el index de su carpeta)"}), None, None
+    return (409, {"error": "the project is not synced (missing from its folder index)", "code": "not_synced"}), None, None
 
 
 def docs_context(pid):
@@ -328,7 +328,7 @@ def docs_context(pid):
         for p in read_folder_index(folder).get("projects", []):
             if p.get("id") == pid:
                 return None, tree_dir(folder, p.get("name") or pid)
-    return (409, {"error": "el proyecto no está sincronizado (falta en el index de su carpeta)"}), None
+    return (409, {"error": "the project is not synced (missing from its folder index)", "code": "not_synced"}), None
 
 
 def resolve_tree_id(folder, dirname):
@@ -561,7 +561,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         ctx = orch_ctx(pid)
         if not ctx:
-            self._json(409, {"error": "el orquestador no está sincronizado", "code": "not_synced"})
+            self._json(409, {"error": "the orchestrator is not synced", "code": "not_synced"})
             return
         try:
             self._json(200, orchestrator.hook_fire(ctx, hook_id, token, payload,
@@ -573,7 +573,7 @@ class Handler(BaseHTTPRequestHandler):
         """Resuelve el ctx del orquestador y corre `fn(ctx)` traduciendo OrchError."""
         ctx = orch_ctx(pid)
         if not ctx:
-            self._json(409, {"error": "el orquestador no está sincronizado (falta en el mirror)",
+            self._json(409, {"error": "the orchestrator is not synced (missing from the mirror)",
                              "code": "not_synced"})
             return
         try:
@@ -587,7 +587,7 @@ class Handler(BaseHTTPRequestHandler):
         """SSE de eventos del run del orquestador (para pintar el canvas en vivo)."""
         ctx = orch_ctx(pid)
         if not ctx:
-            self._json(409, {"error": "el orquestador no está sincronizado", "code": "not_synced"})
+            self._json(409, {"error": "the orchestrator is not synced", "code": "not_synced"})
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -1138,7 +1138,7 @@ class Handler(BaseHTTPRequestHandler):
     def _folders_read(self, path):
         """Lee los árboles (<path>/<id>/tree.json) de una carpeta del sistema."""
         if not path or not os.path.isdir(path):
-            self._json(400, {"error": "ruta inválida"})
+            self._json(400, {"error": "invalid path"})
             return
         projects = []
         for name in sorted(os.listdir(path)):
@@ -1262,7 +1262,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": "faltan projectId o message"})
             return
         if not os.path.exists(os.path.join(tree_dir(folder, name), "tree.json")):
-            self._json(409, {"error": "el proyecto no está sincronizado (falta tree.json)"})
+            self._json(409, {"error": "the project is not synced (tree.json missing)", "code": "not_synced"})
             return
 
         # proyectos tipo `editor` (doc 27): con target LOCAL el CLI recibe la carpeta
@@ -1281,7 +1281,7 @@ class Handler(BaseHTTPRequestHandler):
             if not editor_target and isinstance(relay, dict) and relay.get("url") and relay.get("token"):
                 editor_relay = {"url": relay["url"], "token": relay["token"], "projectId": pid}
             if not editor_target and not editor_relay:
-                self._json(409, {"error": "el proyecto editor no tiene carpeta asignada (elegí la ubicación en la web)"})
+                self._json(409, {"error": "the editor project has no folder assigned (pick its location in the web app)"})
                 return
 
         # cwd = la CARPETA del proyecto (estable por chat dentro de la carpeta). Así
