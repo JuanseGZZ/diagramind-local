@@ -2185,6 +2185,41 @@ def run_detail(ctx, run_id):
     return {"run": data}
 
 
+def run_delete(ctx, run_id):
+    """Borra UN run del historial: su `runs/<id>.json` + su fila del índice. Espejo
+    del local. Un run activo no se borra (primero se frena); si es el ÚLTIMO —el que
+    vive aparte en run.json con sus frames, el reanudable— se va también ese archivo
+    y sale de RAM, o la web seguiría ofreciendo Retomar un run ya borrado."""
+    run_id = (run_id or "").strip()
+    if not run_id:
+        raise OrchError(400, "falta el runId")
+    live = RUNS.get(ctx["pid"])
+    if live and live["id"] == run_id and live["status"] in ("running", "waiting_human", "paused"):
+        raise OrchError(409, "that run is still active: stop it before deleting it")
+    idx = _read_json(_runs_index_path(ctx), [])
+    left = [x for x in idx if x.get("id") != run_id]
+    found = len(left) != len(idx)
+    if found:
+        _write_json(_runs_index_path(ctx), left)
+    try:
+        os.remove(_runs_dir(ctx) / f"{run_id}.json")
+        found = True
+    except OSError:
+        pass
+    last = _last_run(ctx)
+    if last and last.get("id") == run_id:
+        with LOCK:
+            RUNS.pop(ctx["pid"], None)
+            try:
+                os.remove(_run_path(ctx))
+            except OSError:
+                pass
+        found = True
+    if not found:
+        raise OrchError(404, "no existe ese run en el historial")
+    return {"ok": True, "runId": run_id}
+
+
 def events_since(ctx, since):
     run = RUNS.get(ctx["pid"])
     if not run:
@@ -2480,6 +2515,11 @@ class OrchNodeBody(BaseModel):
     nodeId: int
 
 
+class OrchRunIdBody(BaseModel):
+    projectId: str
+    runId: str
+
+
 class OrchKeysBody(BaseModel):
     projectId: str
     keys: dict | None = None          # credenciales de nodos MCP (`mcp:<idNodo>`)
@@ -2661,6 +2701,12 @@ def orch_runs(projectId: str = Query(...), user: dict = Depends(require_admin)):
 def orch_rundetail(projectId: str = Query(...), runId: str = Query(...),
                    user: dict = Depends(require_admin)):
     return _orch(projectId, user, lambda ctx: run_detail(ctx, runId))
+
+
+@router.post("/orch/rundelete")
+def orch_rundelete(body: OrchRunIdBody, user: dict = Depends(require_admin)):
+    # borrar UNA fila del historial de runs (la cruz del modal Runs)
+    return _orch(body.projectId, user, lambda ctx: run_delete(ctx, body.runId))
 
 
 @router.get("/orch/inspect")

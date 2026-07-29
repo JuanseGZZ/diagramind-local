@@ -2650,6 +2650,46 @@ def run_detail(ctx, run_id):
     return {"run": data}
 
 
+def run_delete(ctx, run_id):
+    """Borra UN run del historial (la cruz de la lista): su `runs/<id>.json` + su
+    fila del índice. Un run archivado pesa (guarda TODOS sus events y logs), así que
+    limpiar los que ya no sirven es la forma de que el historial no crezca sin fin.
+
+    Un run ACTIVO no se borra: primero se frena (si no, el motor lo seguiría
+    escribiendo). El ÚLTIMO run además vive aparte en `run.json` (es el único con
+    `frames`, el reanudable): si se borra ese, se va también el archivo y sale de
+    RAM — dejarlo ahí resucitaría la barra y el botón Retomar de un run que el
+    usuario acaba de borrar."""
+    run_id = (run_id or "").strip()
+    if not run_id:
+        raise OrchError(400, "falta el runId")
+    live = RUNS.get(ctx["pid"])
+    if live and live["id"] == run_id and live["status"] in ("running", "waiting_human", "paused"):
+        raise OrchError(409, "that run is still active: stop it before deleting it")
+    idx = _read_json(_runs_index_path(ctx), [])
+    left = [x for x in idx if x.get("id") != run_id]
+    found = len(left) != len(idx)
+    if found:
+        _write_json(_runs_index_path(ctx), left)
+    try:
+        os.remove(os.path.join(_runs_dir(ctx), f"{run_id}.json"))
+        found = True
+    except OSError:
+        pass
+    last = _last_run(ctx)
+    if last and last.get("id") == run_id:
+        with LOCK:
+            RUNS.pop(ctx["pid"], None)
+            try:
+                os.remove(_run_path(ctx))
+            except OSError:
+                pass
+        found = True
+    if not found:
+        raise OrchError(404, "no existe ese run en el historial")
+    return {"ok": True, "runId": run_id}
+
+
 def events_since(ctx, since):
     run = RUNS.get(ctx["pid"])
     if not run:

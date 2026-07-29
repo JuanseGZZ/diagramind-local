@@ -66,7 +66,7 @@ DEFAULT_PORT = 8765
 # del orquestador necesitan la URL propia para hablarle al MCP del editor.
 PORT = DEFAULT_PORT
 NAME = "diagramind-local"
-VERSION = "0.28.0"   # orquestador: fs_edit + memoria fuera del system (doc 28 fase 14)
+VERSION = "0.29.0"   # orquestador: borrar un run del historial (doc 28 fase 15)
 
 # ===================== rutas / disco =====================
 
@@ -958,6 +958,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/orch/discard":
             b = self._read_json()
             self._orch(b.get("projectId"), lambda ctx: orchestrator.discard(ctx))
+        elif path == "/orch/rundelete":
+            # borrar UNA fila del historial de runs (la cruz del modal Runs)
+            b = self._read_json()
+            self._orch(b.get("projectId"),
+                       lambda ctx: orchestrator.run_delete(ctx, b.get("runId")))
         elif path == "/orch/kill":
             b = self._read_json()
             self._orch(b.get("projectId"), lambda ctx: orchestrator.kill(ctx))

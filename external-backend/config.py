@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.9.0"   # orquestador: fs_edit + memoria fuera del system (doc 28 fase 14)
+VERSION = "0.10.0"   # orquestador: borrar un run del historial (doc 28 fase 15)
 NAME = "DiagraMind Connector"
 
 
