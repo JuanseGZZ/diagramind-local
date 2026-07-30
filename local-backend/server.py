@@ -66,7 +66,7 @@ DEFAULT_PORT = 8765
 # del orquestador necesitan la URL propia para hablarle al MCP del editor.
 PORT = DEFAULT_PORT
 NAME = "diagramind-local"
-VERSION = "0.29.0"   # orquestador: borrar un run del historial (doc 28 fase 15)
+VERSION = "0.30.1"   # orquestador: shell pre-aprobado con `ejecutar` + organigrama que revierte (doc 28 fase 17)
 
 # ===================== rutas / disco =====================
 

@@ -735,18 +735,18 @@ def validate_graph(ctx, obj):
     """Valida un organigrama entero (para org_edit del director, decisión U).
     Devuelve None si es válido, o el texto del error."""
     if not isinstance(obj, dict) or obj.get("type") != "orchestrator":
-        return "el JSON debe ser un objeto con type='orchestrator'"
+        return "the JSON has to be an object with type='orchestrator'"
     nodos, flechas = obj.get("nodos"), obj.get("flechas")
     if not isinstance(nodos, list) or not isinstance(flechas, list):
-        return "faltan las listas nodos/flechas"
+        return "the nodos/flechas lists are missing"
     seen = {}
     for n in nodos:
         try:
             nid = int(n.get("id"))
         except (TypeError, ValueError):
-            return "cada nodo necesita un id entero"
+            return "every node needs an integer id"
         if nid in seen:
-            return f"id de nodo repetido: {nid}"
+            return f"duplicated node id: {nid}"
         if n.get("type") not in NODE_TYPES:
             return f"invalid node type: {n.get('type')}"
         seen[nid] = n
@@ -754,9 +754,9 @@ def validate_graph(ctx, obj):
         try:
             a, b = int(f.get("fromId")), int(f.get("toId"))
         except (TypeError, ValueError):
-            return "cada flecha necesita fromId/toId enteros"
+            return "every arrow needs integer fromId/toId"
         if a not in seen or b not in seen:
-            return f"flecha con punta inexistente ({a}→{b})"
+            return f"arrow with a non-existent end ({a}→{b})"
         combo = (f.get("kind"), seen[a].get("type"), seen[b].get("type"))
         if combo not in ARROW_OK:
             return f"invalid arrow: {combo[0]} {combo[1]}→{combo[2]}"
@@ -764,9 +764,9 @@ def validate_graph(ctx, obj):
         if n.get("type") == "agResource":
             rpid = (n.get("data") or {}).get("projectId")
             if rpid == ctx["pid"]:
-                return "un recurso no puede ser el propio orquestador"
+                return "a resource cannot be the orchestrator itself"
             if rpid and not ctx["project_meta"](rpid):
-                return f"el recurso «{n.get('titulo')}» apunta a un proyecto que no es de esta carpeta"
+                return f"resource «{n.get('titulo')}» points to a project that is not in this folder"
     return None
 
 
@@ -1478,6 +1478,25 @@ def add_spend(run, node_id, usage):
 
 def snapshot_resources(ctx, run, graph, node):
     name = node.get("titulo") or f"nodo {node['id']}"
+    d0 = node.get("data") or {}
+    if d0.get("director") and (d0.get("ia") or {}).get("provider") in CLI_PROVIDERS:
+        # un director API edita con `org_edit`, que valida y snapshotea antes de escribir;
+        # uno CLI escribe el tree.json a mano con sus tools de archivo, así que la red de
+        # deshacer (decisión I) la tiene que poner el motor.
+        try:
+            src = ctx.get("graph_path")
+            if src and os.path.isfile(src):
+                dd = os.path.join(orch_dir(ctx["app_dir"], ctx["pid"]), "snapshots")
+                os.makedirs(dd, exist_ok=True)
+                shutil.copyfile(src, os.path.join(dd, f"{run['id']}-{node['id']}-org.json"))
+                # punto de retorno para _reload_org_if_director: si el director deja el
+                # archivo inválido se restaura ESTO (lo último que se sabe que carga bien)
+                cur = _read_json(src, None)
+                if isinstance(cur, dict) and cur.get("type") == "orchestrator":
+                    run["_orgGood"] = cur
+                emit(run, "log", nodeId=node["id"], text="pre-turn snapshot of the org chart")
+        except Exception as e:
+            emit(run, "log", nodeId=node["id"], text=f"snapshot failed (org chart): {e}")
     for r in resources_of(graph, node["id"]):
         if PERM_LEVEL.get((r["data"] or {}).get("permiso") or "editar", 1) < 1:
             continue
@@ -2021,6 +2040,23 @@ def _cli_workspace(ctx, node_id):
     return d
 
 
+def _cli_org_dir(ctx, node):
+    """El directorio del PROPIO organigrama, montado SOLO para un director con cabeza
+    CLI (decisión U).
+
+    Un director API edita el grafo con la tool `org_edit`; uno CLI lo edita como
+    archivo (`ctx["graph_path"]`), y desde la decisión X el mirror ya NO se monta, así
+    que ese archivo quedaba FUERA de sus `--add-dir`. Claude Code corre acá en modo
+    headless (`-p`): un path fuera del workspace no abre diálogo, se DENIEGA — y el
+    agente terminaba gastando turnos pidiéndole al humano que le "apruebe el permiso",
+    un permiso que nadie puede aprobar. Se monta su propio subdirectorio del mirror
+    (solo ese: los demás proyectos siguen inalcanzables)."""
+    if not (node.get("data") or {}).get("director"):
+        return None
+    p = ctx.get("graph_path")
+    return os.path.dirname(p) if p else None
+
+
 def _cli_resource_notes(ctx, graph, node):
     """Cómo llega un agente CLI a sus recursos (decisión X). Devuelve
     (notas, add_dirs, mcp, exec_ok):
@@ -2074,6 +2110,11 @@ def _cli_resource_notes(ctx, graph, node):
             notes.append(f"- «{meta.get('name')}» ({meta.get('type')}, permission {perm}): the diagram "
                          f"{rel} — edit it respecting the EXACT schema of its type "
                          f"(skill diagramind-{str(meta.get('type')).lower()})")
+    # el organigrama propio de un DIRECTOR va acá y no en `notes`: no es un recurso
+    # cableado (el bloque 👑 del system lo explica), pero SÍ tiene que estar montado.
+    org = _cli_org_dir(ctx, node)
+    if org and org not in add_dirs:
+        add_dirs.append(org)
     return notes, add_dirs, mcp, exec_ok
 
 
@@ -2087,8 +2128,9 @@ def _has_editor(ctx, graph, node_id):
     return False
 
 
-def _cli_system(ctx, graph, node, notes):
-    """System prompt de una cabeza CLI. Va al MODELO → en inglés (doc 20 §L)."""
+def _cli_system(ctx, graph, node, notes, exec_ok=False):
+    """System prompt de una cabeza CLI. Va al MODELO → en inglés (doc 20 §L).
+    `exec_ok` = algún recurso suyo tiene permiso `ejecutar` ⇒ tiene shell."""
     d = node.get("data") or {}
     any_editor = _has_editor(ctx, graph, node["id"])
     partes = [
@@ -2114,11 +2156,14 @@ def _cli_system(ctx, graph, node, notes):
     # romper el prefijo cacheado en cada delegación.
     if d.get("director"):
         partes.append("👑 YOU ARE THE DIRECTOR of this company (decision U): you can manage the org chart "
-                      f"by editing the file {ctx['graph_path']} DIRECTLY (follow the "
+                      f"by editing the file {ctx['graph_path']} DIRECTLY. That folder IS mounted for you "
+                      "(it is one of your --add-dir), so read it and write it with your own file tools "
+                      "and do NOT ask anybody to approve any permission. Follow the "
                       "diagramind-orchestrator skill and respect its EXACT schema — the whole org, unique ids, "
-                      "counters). You can create/edit/delete agents, resources and arrows, including "
+                      "counters. You can create/edit/delete agents, resources and arrows, including "
                       "yourself. RULES: editing the graph NEVER triggers runs; make ONLY the changes "
-                      "you were asked for and keep the rest.")
+                      "you were asked for and keep the rest; the file has to stay VALID JSON (write it "
+                      "whole in one shot, never leave it half-written).")
     if d.get("confinado"):
         # Decirle QUÉ tiene, no solo qué le falta: si no, gasta turnos buscando Read/Bash
         # y "descubriendo" que no están. Los nombres son los del server de cada recurso.
@@ -2153,9 +2198,24 @@ def _cli_system(ctx, graph, node, notes):
             "to write code. If something is missing, ask for it with the ask_user action instead of "
             "inventing a way around it.")
     reglas = ["Work ONLY on what you were asked for.",
-              "Touch ONLY your resources (not other projects of the folder).",
+              ("Touch ONLY your resources and your own org chart (not other projects of the folder)."
+               if d.get("director") else
+               "Touch ONLY your resources (not other projects of the folder)."),
+              # el caso de las capturas del usuario: el agente pedía "aprobame el permiso"
+              # y el humano no tenía NADA que clickear — el CLI corre headless.
+              "You run HEADLESS: if a tool comes back saying you do not have permission, there is no "
+              "dialog for anyone to approve, and retrying the same thing another way will not help. "
+              "It means one of two things: a PATH outside what you were given, or a COMMAND you are "
+              "not allowed to run. NEVER ask the human to approve permissions — say WHAT you need "
+              "(which resource, or the `ejecutar` permission) with the ask_user action.",
               "Answer concretely, in the same language the user/your caller writes to you in."]
-    if not notes:
+    if not notes and d.get("director"):
+        partes.append(
+            "APART FROM YOUR OWN ORG CHART (see the 👑 block) YOU HAVE NO RESOURCES ASSIGNED: no other "
+            "folder or file is reachable for you. If the task needs code or files, do NOT improvise a "
+            "path — use `CONTROL: {\"action\":\"ask_user\",\"question\":\"...\"}` (or wire yourself a "
+            "resource, which you are allowed to do) instead.")
+    elif not notes:
         # sin recursos cableados no tiene DÓNDE trabajar: que pregunte en vez de
         # inventar una ruta (antes tenía el mirror entero montado y "algo" hacía).
         partes.append(
@@ -2175,6 +2235,20 @@ def _cli_system(ctx, graph, node, notes):
         reglas.insert(1, "All file work happens INSIDE your editor resources: they are "
                          "the only place where you can write and where the user can review and "
                          "undo what you did. Do not create files anywhere else.")
+    # El SHELL (Bash en POSIX, PowerShell en Windows) va atado al permiso `ejecutar`, y
+    # hay que decirle cuál de los dos mundos le toca: sin esto, un tester sin `ejecutar`
+    # se pasaba el turno probando variantes del comando y terminaba pidiendo permisos.
+    if not d.get("confinado"):
+        partes.append(
+            "YOU HAVE A REAL SHELL (Bash / PowerShell), pre-approved: run tests, builds, servers, "
+            "git, curl — whatever the job needs. Long-running processes (a server) have to go to the "
+            "BACKGROUND, or the turn hangs until the timeout."
+            if exec_ok else
+            "YOU HAVE NO SHELL: Bash/PowerShell are DISABLED for you because none of your resources "
+            "has the `ejecutar` permission. You cannot run tests, builds, servers or curl, and there "
+            "is no way around it (no dialog, nobody to approve it). Don't waste turns trying variants: "
+            "if the task needs to RUN something, use `CONTROL: {\"action\":\"ask_user\","
+            "\"question\":\"...\"}` and ask for the resource's permission to be raised to `ejecutar`.")
     partes.append("RULES: " + " ".join(f"{i}) {r}" for i, r in enumerate(reglas, 1)))
     partes.append(CLI_PROTOCOL)
     return "\n\n".join(partes)
@@ -2212,6 +2286,10 @@ MCP_FS_EXEC = ["fs_exec"]
 # nativas mínimas para tocar un diagrama-recurso cuando el agente está confinado:
 # su único --add-dir es el subdirectorio de ESE diagrama, así que quedan encerradas ahí
 CLI_DIAGRAM_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep"]
+# el shell de Claude Code son DOS tools según el sistema: `Bash` (POSIX) y `PowerShell`
+# (Windows). Nombrar solo Bash dejaba el shell abierto en Windows — y al revés, la
+# pre-aprobación del permiso `ejecutar` tiene que cubrir las dos.
+CLI_SHELL_TOOLS = ["Bash", "PowerShell"]
 
 
 def _rm(path):
@@ -2222,13 +2300,41 @@ def _rm(path):
             pass
 
 
+# frases con las que Claude Code contesta un tool_use rechazado por permisos (headless:
+# la denegación es automática, no hay diálogo). Se buscan en minúsculas.
+CLI_DENIED_PATH = ("requested permissions", "haven't granted", "have not granted",
+                   "has not been granted", "permission denied", "not allowed to use",
+                   "permission to use")
+# un COMANDO denegado es otra cosa que un path denegado: `acceptEdits` auto-aprueba las
+# ediciones de archivo pero NO los comandos, y para los compuestos el CLI parte la línea
+# y marca la parte que necesita aprobación ("the following part requires approval: …")
+CLI_DENIED_CMD = ("requires approval", "contains multiple operations")
+
+
+def _denied_text(block):
+    """Si el bloque es un `tool_result` rechazado por permisos, devuelve
+    `(motivo, texto)` con motivo `"cmd"` (un comando sin aprobar) o `"path"`."""
+    if (block or {}).get("type") != "tool_result":
+        return None
+    c = block.get("content")
+    if isinstance(c, list):
+        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
+    txt = (c if isinstance(c, str) else "").strip()
+    low = txt.lower()
+    if any(h in low for h in CLI_DENIED_CMD):
+        return "cmd", txt
+    if any(h in low for h in CLI_DENIED_PATH):
+        return "path", txt
+    return None
+
+
 def _cli_cmd(ctx, graph, node, frame, message, cli_bin):
     """(cmd, cwd, mcp_cfg_path) del turno CLI. Acá vive la decisión X: qué alcanza a
     tocar el agente. El cwd ya NO es la carpeta del mirror (ver `_cli_workspace`)."""
     d = node.get("data") or {}
     confinado = bool(d.get("confinado"))
     notes, add_dirs, mcp, exec_ok = _cli_resource_notes(ctx, graph, node)
-    system = _cli_system(ctx, graph, node, notes)
+    system = _cli_system(ctx, graph, node, notes, exec_ok)
     ia = d.get("ia") or {}
     kw = EFFORT_THINK.get(ia.get("effort") or "", "")
     msg = message + (f"\n\n{kw}" if kw else "")
@@ -2246,7 +2352,8 @@ def _cli_cmd(ctx, graph, node, frame, message, cli_bin):
     cfg = None
     if confinado:
         # whitelist: SOLO las tools del MCP (una por editor, según permiso) y, si tiene
-        # diagramas cableados, las nativas de archivo — que solo alcanzan sus add_dirs.
+        # diagramas cableados —o es un director, que alcanza su organigrama—, las nativas
+        # de archivo, que solo llegan a sus add_dirs.
         servers, allowed = {}, []
         for name, info in mcp.items():
             servers[name] = {
@@ -2272,12 +2379,23 @@ def _cli_cmd(ctx, graph, node, frame, message, cli_bin):
         # sin tools permitidas el agente no puede hacer NADA con archivos: igual puede
         # razonar y responder, que es lo correcto para un nodo sin recursos cableados.
         cmd += ["--allowedTools", ",".join(allowed)]
+        # `--allowedTools` es una lista de PRE-APROBACIÓN, no la lista de tools que
+        # existen (eso es `--tools`): sin reglas de negación el confinado igual tiene el
+        # shell nativo a mano. Se lo negamos explícitamente — su shell es `fs_exec`.
+        cmd += ["--disallowedTools"] + CLI_DISALLOWED + CLI_SHELL_TOOLS
     else:
         # blacklist: conserva su toolbelt nativo, acotado por los --add-dir de arriba.
-        # Bash es la vía de escape de los --add-dir, así que se la damos SOLO si algún
-        # recurso suyo tiene permiso `ejecutar`.
-        off = ["WebFetch", "WebSearch"] + ([] if exec_ok else ["Bash"])
+        # El shell es la vía de escape de los --add-dir, así que se lo damos SOLO si algún
+        # recurso suyo tiene permiso `ejecutar` — y son DOS tools (Bash y PowerShell:
+        # nombrar solo Bash dejaba el shell abierto en Windows).
+        off = list(CLI_DISALLOWED) + ([] if exec_ok else list(CLI_SHELL_TOOLS))
         cmd += ["--disallowedTools"] + off
+        if exec_ok:
+            # tener la tool no alcanza: `acceptEdits` auto-aprueba las EDICIONES, no los
+            # comandos, así que headless cada comando que no sea de solo-lectura se
+            # auto-DENIEGA (un tester no podía ni levantar su server). El permiso
+            # `ejecutar` es justamente "puede correr comandos" ⇒ se pre-aprueban.
+            cmd += ["--allowedTools", ",".join(CLI_SHELL_TOOLS)]
     if frame.get("sessionId"):
         cmd += ["--resume", str(frame["sessionId"])]
     return cmd, cwd, cfg
@@ -2321,6 +2439,22 @@ def _run_cli_turn(ctx, graph, run, node, frame, message):
                     elif b.get("type") == "tool_use":
                         with LOCK:
                             emit(run, "log", nodeId=node["id"], text=f"cli tool {b.get('name', '?')}")
+            elif obj.get("type") == "user":
+                # una tool DENEGADA por permisos no se ve en ningún lado: el CLI corre
+                # headless, así que no hay diálogo, el modelo recibe el rechazo y suele
+                # terminar preguntándole al humano que le "apruebe el permiso" (turnos
+                # pagados a cambio de nada). Se registra en el timeline con el porqué.
+                for b in (obj.get("message", {}).get("content") or []):
+                    hit = _denied_text(b)
+                    if hit:
+                        why, txt = hit
+                        head = ("cli COMMAND denied (headless: no dialog to approve; a command needs a "
+                                "resource with the «ejecutar» permission)" if why == "cmd" else
+                                "cli permission DENIED (headless: nobody can approve it — the path is "
+                                "outside its --add-dir)")
+                        with LOCK:
+                            emit(run, "log", nodeId=node["id"], text=f"{head}: {txt[:200]}",
+                                 full=txt[:FULL_CHARS] if len(txt) > 200 else None)
             elif obj.get("type") == "result":
                 session_id = obj.get("session_id") or session_id
                 result_text = obj.get("result")
@@ -2340,12 +2474,86 @@ def _run_cli_turn(ctx, graph, run, node, frame, message):
     return (result_text or "\n\n".join(texts) or ""), session_id, cost
 
 
+def _org_warn(run, node_id, text):
+    """Deja una advertencia para el PRÓXIMO turno de ese agente (se le prepende a su
+    entrada). Sin esto el agente no se entera de que su edición fue rechazada: sigue
+    creyendo que el cambio está hecho, y como el archivo sí tiene su versión, discute
+    con el motor —y con sus subordinados— durante turnos (caso real del 2026-07-29)."""
+    run.setdefault("_orgWarn", {})[str(node_id)] = text
+
+
+def _reload_org_if_director(ctx, graph, run, node):
+    """Un director CLI edita el organigrama como ARCHIVO, así que el motor no se enteró:
+    `org_edit` (camino API) valida ANTES de escribir y refresca el grafo del run en vivo,
+    y acá los dos pasos hay que darlos DESPUÉS del turno. Si lo que quedó en disco no es
+    un organigrama válido se **revierte** al último bueno y se le avisa al agente: dejarlo
+    roto era lo peor de los dos mundos —el motor con el grafo viejo y el archivo con el
+    nuevo, o sea el agente leyendo un cableado que el run no tiene.
+
+    Se llama SIN el lock (lee y valida afuera, como `org_edit`) y lo toma solo para mutar."""
+    d = node.get("data") or {}
+    if not (d.get("director") and (d.get("ia") or {}).get("provider") in CLI_PROVIDERS):
+        return
+    path = ctx["graph_path"]
+
+    def revert(why):
+        good = run.get("_orgGood")
+        restored = False
+        if good:
+            try:
+                _write_json(path, good)
+                restored = True
+            except Exception:
+                pass
+        with LOCK:
+            emit(run, "log", nodeId=node["id"],
+                 text=(f"the org chart was edited but it is INVALID ({why}) — "
+                       + ("REVERTED to the last valid version; " if restored else "")
+                       + "the run keeps the graph it had"))
+        _org_warn(run, node["id"],
+                  f"Your edit of the org chart was REJECTED: {why}. "
+                  + ("The file was restored to the last valid version, so your change is NOT "
+                     "applied. " if restored else "")
+                  + "Read the file again before touching it, keep EVERY field of the schema "
+                    "(arrows need integer fromId/toId, ids unique) and write it whole.")
+        if restored:
+            ctx["notify_edit"](ctx["pid"])
+
+    obj = _read_json(path, None)
+    if not isinstance(obj, dict) or obj.get("type") != "orchestrator":
+        revert("it is unreadable or it is not an orchestrator (broken JSON?)")
+        return
+    try:
+        nodos = {int(n["id"]): n for n in obj.get("nodos", [])}
+    except (TypeError, ValueError, KeyError, AttributeError):
+        revert("every node needs an integer id")
+        return
+    flechas = obj.get("flechas", [])
+    if nodos == graph["nodos"] and flechas == graph["flechas"]:
+        run.setdefault("_orgGood", obj)          # no lo tocó: queda como el bueno conocido
+        return
+    err = validate_graph(ctx, obj)
+    if err:
+        revert(err)
+        return
+    with LOCK:
+        graph["nodos"], graph["flechas"] = nodos, flechas
+        run["_orgGood"] = obj                    # nuevo punto de retorno
+        emit(run, "log", nodeId=node["id"], text="👑 edited the org chart (file) — graph reloaded")
+    ctx["notify_edit"](ctx["pid"])
+
+
 def _turn_cli(ctx, graph, run, frame):
     node = _agent(graph, frame["nodeId"])
     cv = _rt(ctx["pid"])["cv"]
     with cv:
         items, frame["inbox"] = frame["inbox"], []
         message = "\n\n".join(("⚠ " if it.get("is_error") else "") + it["text"] for it in items) or "(carry on)"
+        # si su edición del organigrama fue rechazada, se entera ACÁ (arriba de todo): es
+        # lo primero que tiene que saber antes de seguir dando por hecho el cambio
+        warn = (run.get("_orgWarn") or {}).pop(str(node["id"]), None)
+        if warn:
+            message = f"⚠ {warn}\n\n{message}"
         frame["iters"] += 1
         set_node_state(ctx, run, node["id"], "running")
     try:
@@ -2367,6 +2575,9 @@ def _turn_cli(ctx, graph, run, frame):
         if mem_b:
             message = mem_b + "\n\n" + message
         text, session_id, cost = _run_cli_turn(ctx, graph, run, node, frame, message)
+    # un director CLI pudo haber editado el organigrama como archivo: se recarga acá
+    # (afuera del lock, como org_edit) para que los frames siguientes vean el cambio
+    _reload_org_if_director(ctx, graph, run, node)
     with cv:
         if run["status"] != "running" or run.get("_kill"):
             return
@@ -2963,8 +3174,10 @@ def inspect_node(ctx, node_id):
                                         "description": f"{t} sobre ese proyecto editor."}
                                        for t in tools]})
             if add_dirs:
+                why = ("Enabled because it has diagrams wired" if not d.get("director") else
+                       "Enabled because it is a director (its own org chart) and/or has diagrams wired")
                 refs.append({"origin": "cli", "label": "Native file tools (its diagrams only)",
-                             "note": ("Enabled because it has diagrams wired; its only --add-dir are those "
+                             "note": (f"{why}; its only --add-dir are those "
                                       "subdirectories, so they reach nothing else."),
                              "tools": [{"name": n, "schema": {}, "description": "",
                                         "disabled": False} for n in CLI_DIAGRAM_TOOLS]})
@@ -2974,7 +3187,7 @@ def inspect_node(ctx, node_id):
                                   "version — this is a reference. What the engine does fix are the "
                                   "flags: --permission-mode acceptEdits and --disallowedTools."),
                          "tools": [{"name": n, "description": de, "schema": {},
-                                    "disabled": n in CLI_DISALLOWED or (n == "Bash" and not exec_ok)}
+                                    "disabled": n in CLI_DISALLOWED or (n in CLI_SHELL_TOOLS and not exec_ok)}
                                    for n, de in CLI_NATIVE_TOOLS]})
         refs.append({"origin": "skills", "label": "Skills installed in its workspace",
                      "note": ("`install_skills` writes them to <workspace>/.claude/skills/ before "
@@ -2982,9 +3195,10 @@ def inspect_node(ctx, node_id):
                               "they are knowledge (the schema of each diagram type)."),
                      "tools": [{"name": s["name"], "description": s["description"], "schema": {}}
                                for s in _skill_catalog()]})
-        off = list(CLI_DISALLOWED) + ([] if exec_ok else ["Bash"])
+        off = (list(CLI_DISALLOWED) + list(CLI_SHELL_TOOLS) if confinado else
+               list(CLI_DISALLOWED) + ([] if exec_ok else list(CLI_SHELL_TOOLS)))
         base.update({
-            "system": _cli_system(ctx, graph, node, notes),
+            "system": _cli_system(ctx, graph, node, notes, exec_ok),
             "systemNote": ("Passed as --append-system-prompt ON EVERY TURN, whole. The transcript "
                            "is NOT re-sent: Claude Code stores it and recovers it with "
                            "--resume <sessionId>. The MEMORY is not in here either: it is delivered "
@@ -3003,8 +3217,27 @@ def inspect_node(ctx, node_id):
                                     if _mem_on(node) else
                                     "Memory is off: every delegation starts a new session."),
                     "confinado": confinado, "permissionMode": "acceptEdits",
-                    "disallowed": [] if confinado else off,
+                    "disallowed": off,
                     "execOk": exec_ok,
+                    # el shell son DOS tools (Bash POSIX / PowerShell Windows) y va atado
+                    # al permiso `ejecutar`: con él se PRE-APRUEBAN (acceptEdits aprueba
+                    # ediciones, no comandos: sin esto headless los deniega uno por uno)
+                    "shell": {"tools": list(CLI_SHELL_TOOLS), "preApproved": bool(exec_ok and not confinado),
+                              "note": ("Its shell is `fs_exec` through the editor's MCP (with the "
+                                       "«ejecutar» permission); the native ones are denied."
+                                       if confinado else
+                                       "Pre-approved with --allowedTools because a resource of its own has "
+                                       "the «ejecutar» permission: --permission-mode acceptEdits only "
+                                       "auto-approves file EDITS, so without this every command it runs "
+                                       "gets auto-denied (headless = there is no dialog to approve)."
+                                       if exec_ok else
+                                       "Denied: no resource of its own has the «ejecutar» permission, so it "
+                                       "cannot run tests, builds or servers. Raise a resource to «ejecutar» "
+                                       "if it has to.")},
+                    # director con cabeza CLI: edita el organigrama como archivo, así que
+                    # su directorio va montado (si no, el CLI headless le DENIEGA el path
+                    # y el agente termina pidiendo un permiso que nadie puede aprobar)
+                    "orgDir": _cli_org_dir(ctx, node),
                     "warning": (
                         "Confined: the folder is not mounted. Every write to an editor goes "
                         "through editorfs (the same confinement as an API agent); the native file "
@@ -3013,8 +3246,9 @@ def inspect_node(ctx, node_id):
                         if confinado else
                         "Not confined: it uses its native tools, limited to the --add-dir below — "
                         "only the resources you wired. Careful: --add-dir does not distinguish "
-                        "read from write (a 'leer' resource is not mounted) and Bash can escape "
-                        "them, which is why it only has Bash if one of its resources is 'ejecutar'.")},
+                        "read from write (a 'leer' resource is not mounted) and the shell can escape "
+                        "them, which is why it only has Bash/PowerShell if one of its resources is "
+                        "'ejecutar'.")},
         })
         return base
 
