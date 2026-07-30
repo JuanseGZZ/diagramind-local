@@ -25,7 +25,14 @@ import quota
 import store
 from auth import current_user, require_admin
 from db import connect
-from models import EditorTargetBody, FsExecBody, FsPathBody, FsRenameBody, FsWriteBody
+from models import (
+    EditorTargetBody,
+    FsEditBody,
+    FsExecBody,
+    FsPathBody,
+    FsRenameBody,
+    FsWriteBody,
+)
 
 router = APIRouter(tags=["editor"])
 
