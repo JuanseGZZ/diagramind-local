@@ -24,7 +24,7 @@ if command -v systemctl >/dev/null 2>&1; then
 Description=DiagraMind Local backend
 
 [Service]
-ExecStart=$BIN
+ExecStart=$BIN --no-ui
 Restart=on-failure
 
 [Install]
@@ -40,13 +40,14 @@ else
 [Desktop Entry]
 Type=Application
 Name=DiagraMind Local
-Exec=$BIN
+Exec=$BIN --no-ui
 X-GNOME-Autostart-enabled=true
 EOF
-  "$BIN" >/dev/null 2>&1 &
+  "$BIN" --no-ui >/dev/null 2>&1 &
   echo "Auto-inicio configurado (autostart del escritorio)."
 fi
 
 echo ""
 echo "Listo. DiagraMind Local corre en http://127.0.0.1:8765 y arranca solo al iniciar sesión."
+command -v xdg-open >/dev/null 2>&1 && xdg-open "http://127.0.0.1:8765" >/dev/null 2>&1 || true
 echo "Volvé a la web y tocá 'Conectar local'."

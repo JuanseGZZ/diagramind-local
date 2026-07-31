@@ -3,6 +3,7 @@
 - run_cli(): el NÚCLEO reusado (Popen + loop de stdout + máquina de estados +
   cancelación + estado terminal). Cada adaptador (claude/codex/gemini) aporta lo
   propio (build_cmd / parse_line / finalize / install_instructions / find / ...)."""
+import glob
 import os
 import shutil
 import subprocess
@@ -80,6 +81,44 @@ def _headless_prompt(folder, focus_name, message):
     )
 
 
+# Carpetas de binarios globales de npm que NO están en el PATH del proceso cuando
+# el backend arranca por doble clic / LaunchAgent, ni en las rutas fijas de abajo:
+# nvm, fnm, volta o un `npm prefix -g` custom. Sin esto, un `claude` instalado con
+# nvm existe pero el backend jura que no está instalado.
+_NPM_BIN_CACHE = None
+
+
+def _extra_bin_dirs():
+    """Esas carpetas, resueltas una sola vez (el `npm prefix -g` spawnea node y
+    /health consulta seguido). panel.py invalida el caché al instalar un CLI."""
+    global _NPM_BIN_CACHE
+    if _NPM_BIN_CACHE is not None:
+        return _NPM_BIN_CACHE
+    home = os.path.expanduser("~")
+    dirs = [
+        os.path.join(home, ".local", "bin"), "/usr/local/bin", "/opt/homebrew/bin",
+        os.path.join(home, ".volta", "bin"),
+        os.path.join(os.environ.get("APPDATA", ""), "npm"),
+        os.path.join(os.environ.get("ProgramFiles", ""), "nodejs"),
+    ]
+    dirs += sorted(glob.glob(os.path.join(home, ".nvm", "versions", "node", "*", "bin")),
+                   reverse=True)
+    dirs += sorted(glob.glob(os.path.join(home, ".local", "share", "fnm", "node-versions",
+                                          "*", "installation", "bin")), reverse=True)
+    npm = shutil.which("npm") or shutil.which("npm.cmd")
+    if npm:
+        try:
+            out = subprocess.run([npm, "prefix", "-g"], capture_output=True, text=True,
+                                 timeout=10)
+            prefix = (out.stdout or "").strip()
+            if prefix:
+                dirs += [os.path.join(prefix, "bin"), prefix]   # unix: <prefix>/bin · win: <prefix>
+        except Exception:
+            pass
+    _NPM_BIN_CACHE = [d for d in dirs if d and os.path.isdir(d)]
+    return _NPM_BIN_CACHE
+
+
 def _find_bin(names):
     """Resuelve un binario probando which() + rutas conocidas (PATH no siempre está
     cuando se arranca por doble clic / LaunchAgent)."""
@@ -93,6 +132,9 @@ def _find_bin(names):
             os.path.join(home, ".local", "bin", n + ".exe"),
             os.path.join(os.environ.get("APPDATA", ""), "npm", n + ".cmd"),
         ]
+        for d in _extra_bin_dirs():
+            cands += [os.path.join(d, n), os.path.join(d, n + ".cmd"),
+                      os.path.join(d, n + ".exe")]
     for c in cands:
         if c and os.path.exists(c):
             return c

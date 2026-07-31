@@ -14,10 +14,18 @@ CÓMO INICIARLO
             (si dice que no se puede abrir: clic derecho -> Abrir)
   Linux   : en terminal ->  ./iniciar.command   (o  python3 server.py)
 
-Cuando arranca, vas a ver: "DiagraMind local backend -> http://127.0.0.1:8765".
-Dejá esa ventana abierta y volvé a la web: IA -> Conectar local.
+Cuando arranca, se abre solo el PANEL DE CONTROL en una ventana: ahí ves si
+tenés instalados los CLIs de IA (Claude Code / Codex / Gemini) con un botón de
+instalación rápida, la contraseña que te va a pedir la web, y tus proyectos.
 
-Para detenerlo: cerrá la ventana o apretá Ctrl+C.
+Dejá la ventana de la terminal abierta y volvé a la web: IA -> Conectar local.
+(Cerrar el panel NO detiene el backend; para volver a abrirlo, entrá a
+http://127.0.0.1:8765 o volvé a hacer doble clic en el lanzador.)
+
+Para detenerlo: cerrá la ventana de la terminal, apretá Ctrl+C, o usá el botón
+"Detener" del panel.
+
+Si no querés que se abra el panel al iniciar:  python3 server.py --no-ui
 
 ¿No querés depender de Python? Usá la versión "Ejecutable (sin Python)" desde
 el mismo botón de descarga en la web.

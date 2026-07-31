@@ -18,11 +18,14 @@ $lnk = Join-Path $startup "DiagraMind Local.lnk"
 $ws = New-Object -ComObject WScript.Shell
 $sc = $ws.CreateShortcut($lnk)
 $sc.TargetPath = $bin
+$sc.Arguments = "--no-ui"
 $sc.WindowStyle = 7   # minimizado
 $sc.Save()
 
 # arrancarlo ahora
-Start-Process -FilePath $bin
+Start-Process -FilePath $bin -ArgumentList "--no-ui"
+Start-Sleep -Seconds 2
+Start-Process "http://127.0.0.1:8765"
 
 Write-Host ""
 Write-Host "Listo. DiagraMind Local corre en http://127.0.0.1:8765 y arranca solo al iniciar Windows."

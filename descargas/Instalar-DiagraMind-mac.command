@@ -26,7 +26,7 @@ cat > "$PLIST" <<EOF
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.diagramind.local</string>
-  <key>ProgramArguments</key><array><string>$BIN</string></array>
+  <key>ProgramArguments</key><array><string>$BIN</string><string>--no-ui</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 </dict>
@@ -39,5 +39,7 @@ launchctl load "$PLIST"
 echo ""
 echo "Listo. DiagraMind Local quedó instalado y corriendo en http://127.0.0.1:8765"
 echo "Se va a iniciar solo cada vez que prendas la Mac."
+echo "Abriendo el panel de control..."
+open "http://127.0.0.1:8765" 2>/dev/null || true
 echo "Ahora podés volver a la web y tocar 'Conectar local'."
 read -r -p "Enter para cerrar esta ventana..." _

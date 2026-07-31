@@ -54,6 +54,8 @@ from runs import RUNS, RUNS_LOCK, SESSION_MAP, new_run, emit
 import docsfs
 import editorfs
 import orchestrator
+import panel
+import panel_ui
 import sourcever
 import svgit
 from skills import install_skills
@@ -66,7 +68,7 @@ DEFAULT_PORT = 8765
 # del orquestador necesitan la URL propia para hablarle al MCP del editor.
 PORT = DEFAULT_PORT
 NAME = "diagramind-local"
-VERSION = "0.30.1"   # orquestador: shell pre-aprobado con `ejecutar` + organigrama que revierte (doc 28 fase 17)
+VERSION = "0.31.0"   # panel de control: ventana propia con CLIs (instalación rápida), contraseña y proyectos
 
 # ===================== rutas / disco =====================
 
@@ -123,6 +125,20 @@ def _load_or_create_token():
     except OSError:
         pass
     return t
+
+
+def regenerate_token():
+    """Genera una contraseña nueva y la persiste (botón «Regenerar» del panel).
+    La web queda desconectada hasta que le peguen la nueva."""
+    global _TOKEN
+    _TOKEN = secrets.token_urlsafe(24)
+    try:
+        os.makedirs(app_dir(), exist_ok=True)
+        with open(token_path(), "w", encoding="utf-8") as f:
+            f.write(_TOKEN + "\n")
+    except OSError:
+        pass
+    return _TOKEN
 
 
 def _load_config():
@@ -637,6 +653,21 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _html(self, body):
+        """La página del panel. A propósito SIN cabeceras CORS: lleva el token
+        inyectado, y sin Access-Control-Allow-Origin el navegador no deja que otra
+        web lea la respuesta. frame-ancestors/X-Frame-Options evitan que la metan en
+        un iframe para robarle clics a los botones (detener, regenerar)."""
+        data = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _docs(self, pid, fn):
         """Resuelve el dir del proyecto documents y corre la operación."""
         err, pdir = docs_context(pid)
@@ -655,6 +686,13 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         q = parse_qs(parsed.query)
+
+        # Panel de control (doc 18 §Panel): la página se sirve SIN auth porque ES
+        # la que trae el token adentro; queda protegida por el loopback + la falta
+        # de CORS (ver _html). Todo lo que hace después va con token, como la web.
+        if path in ("/", "/panel", "/index.html"):
+            self._html(panel_ui.page(get_token()))
+            return
 
         if path == "/health":
             # /health es PÚBLICO (la web lo usa para detectar el server). No
@@ -694,6 +732,16 @@ class Handler(BaseHTTPRequestHandler):
             self._folders_read(q.get("path", [None])[0])
         elif path == "/config":
             self._json(200, {"root": projects_dir(), "base": app_dir()})
+        # --- panel de control (doc 18) ---
+        elif path == "/panel/status":
+            self._json(200, panel.status(
+                name=NAME, version=VERSION, port=PORT, token=get_token(),
+                root=projects_dir(), base=app_dir(), token_file=token_path(),
+                auto_stop=AUTO_STOP))
+        elif path == "/panel/install/stream":
+            self._stream(q.get("runId", [None])[0])   # mismo SSE de runs que el chat
+        elif path == "/panel/alive":
+            self._panel_alive()
         # --- modo editor (doc 27; contrato unificado con el conector externo) ---
         elif path == "/editor/target":
             self._json(200, {"path": editorfs.get_target(app_dir(), q.get("projectId", [None])[0])})
@@ -806,6 +854,13 @@ class Handler(BaseHTTPRequestHandler):
             self._folders_reveal(self._read_json())
         elif path == "/config/root":
             self._config_root(self._read_json())
+        # --- panel de control (doc 18) ---
+        elif path == "/panel/install":
+            self._panel_install(self._read_json())
+        elif path == "/panel/token/regenerate":
+            self._json(200, {"token": regenerate_token()})
+        elif path == "/panel/shutdown":
+            self._panel_shutdown()
         elif path == "/projects/manifest":
             self._manifest(self._read_json())
         elif path == "/state/write":
@@ -1143,6 +1198,52 @@ class Handler(BaseHTTPRequestHandler):
         ok = reveal_in_explorer(path)
         self._json(200, {"ok": ok, "path": path})
 
+    # --- panel de control (doc 18) -------------------------------------
+    def _panel_install(self, data):
+        """Instalación rápida de un CLI (npm i -g). Devuelve el runId: la salida
+        se lee en vivo por /panel/install/stream (el SSE de runs, igual que el chat)."""
+        key = (data or {}).get("cli")
+        if key not in panel.NPM_PKG:
+            self._json(400, {"error": f"CLI desconocido: {key}"})
+            return
+        run = panel.install_cli(key)
+        self._json(200, {"runId": run["id"]})
+
+    def _panel_alive(self):
+        """SSE de presencia del panel: vive mientras la ventana esté abierta. Al
+        cerrarse, el socket se cae y (si arrancamos con panel) apagamos el backend."""
+        global PANELS
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        with PANELS_LOCK:
+            PANELS += 1
+        try:
+            while True:
+                self.wfile.write(b": ping\n\n")
+                self.wfile.flush()
+                time.sleep(3)
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            with PANELS_LOCK:
+                PANELS -= 1
+                empty = PANELS == 0
+            if AUTO_STOP and empty:
+                threading.Thread(target=_panel_gone, daemon=True).start()
+
+    def _panel_shutdown(self):
+        """Botón «Detener» del panel: contestamos y recién ahí nos morimos."""
+        self._json(200, {"ok": True})
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
+        threading.Thread(target=lambda: (time.sleep(0.3), os._exit(0)), daemon=True).start()
+
     def _folders_pick(self, title):
         """Abre el diálogo nativo y devuelve la ruta elegida (o cancelado)."""
         path = pick_directory(title or "Elegí una carpeta")
@@ -1434,6 +1535,35 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[{self.log_date_time_string()}] {fmt % args}")
 
 
+# ===================== presencia del panel =====================
+# La ventana del panel mantiene abierto un SSE (/panel/alive). Cuando la cerrás, el
+# socket muere: si este proceso fue el que abrió la ventana (AUTO_STOP), se apaga —
+# "cerrar la ventana" ES cerrar el programa. Una instancia residente (--no-ui, la
+# del auto-inicio) NO se apaga: tiene que seguir viva para la web.
+PANELS = 0
+PANELS_LOCK = threading.Lock()
+AUTO_STOP = False
+PANEL_GRACE = 6.0        # margen para un F5 / reapertura antes de apagar
+
+
+def _panel_gone():
+    time.sleep(PANEL_GRACE)
+    with PANELS_LOCK:
+        if PANELS:
+            return                      # volvió (recarga): seguimos vivos
+    print("Panel cerrado → apagando el backend local.")
+    os._exit(0)
+
+
+def _instance_alive(port):
+    """¿Lo que ocupa el puerto es OTRA instancia de este backend? (/health es público)"""
+    try:
+        with urllib.request.urlopen(f"http://{HOST}:{port}/health", timeout=2) as r:
+            return (json.loads(r.read().decode("utf-8")) or {}).get("name") == NAME
+    except Exception:
+        return False
+
+
 def main():
     # modo MCP (doc 27, fase 4): re-ejecución de este mismo binario/script como
     # MCP server stdio de fs para editores EXTERNOS (lo lanza Claude Code).
@@ -1445,6 +1575,8 @@ def main():
     parser = argparse.ArgumentParser(description="DiagraMind backend local")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"puerto (default {DEFAULT_PORT})")
+    parser.add_argument("--no-ui", action="store_true",
+                        help="no abrir el panel de control (lo usan los auto-inicios)")
     args = parser.parse_args()
 
     # En Windows, si stdout es cp1252 (consola/redirección) los print con → o ·
@@ -1455,6 +1587,25 @@ def main():
         except Exception:
             pass
 
+    url = f"http://{HOST}:{args.port}"
+
+    global PORT
+    PORT = args.port
+    try:
+        server = ThreadingHTTPServer((HOST, args.port), Handler)
+    except OSError as e:
+        # El puerto está ocupado. Si es OTRA instancia NUESTRA, esto fue un segundo
+        # doble clic: el usuario quiere VER el panel, no levantar un server nuevo.
+        if _instance_alive(args.port):
+            print(f"DiagraMind local ya está corriendo en {url}"
+                  f"{' — abriendo el panel.' if not args.no_ui else '.'}")
+            if not args.no_ui:
+                panel.open_panel(url)
+        else:
+            print(f"No se pudo abrir el puerto {args.port}: {e}")
+            print(f"Probá otro puerto:  --port {args.port + 1}")
+        return
+
     os.makedirs(projects_dir(), exist_ok=True)
     cb = find_claude()
     sweep_temp_files()                       # limpiar adjuntos vencidos al arrancar
@@ -1463,18 +1614,29 @@ def main():
     # watcher del state mirror (poll de mtime → SSE)
     threading.Thread(target=watch_state, daemon=True).start()
 
-    global PORT
-    PORT = args.port
-    server = ThreadingHTTPServer((HOST, args.port), Handler)
-    print(f"DiagraMind local backend v{VERSION} → http://{HOST}:{args.port}")
+    print(f"DiagraMind local backend v{VERSION} → {url}")
     print(f"Claude Code: {'OK · ' + (claude_version(cb) or '') if cb else 'NO ENCONTRADO'}")
     print(f"Proyectos en: {projects_dir()}")
     print(f"Contraseña (token) de acceso: {tok}")
     print(f"  (guardada en {token_path()} — la web te la va a pedir al conectar)")
-    print("Endpoints: GET /health · POST /projects/sync · POST /files/upload · "
-          "POST /chat · GET /chat/stream · GET /projects/tree · POST /chat/cancel · "
-          "GET /state · GET /state/stream · POST /state/write · POST /fetch")
+    print(f"Panel de control: {url}  (CLIs, contraseña, proyectos)")
     print("Ctrl+C para detener.")
+
+    if not args.no_ui:
+        # arrancamos CON panel: cerrar esa ventana apaga el backend (ver _panel_alive).
+        global AUTO_STOP
+        AUTO_STOP = True
+        print("Cerrar la ventana del panel detiene el backend.")
+        # el panel se abre en un thread con un respiro: si lo abrimos antes del
+        # serve_forever() de abajo, el navegador llega a un puerto que todavía no
+        # contesta y muestra "no se pudo conectar".
+        def _launch():
+            time.sleep(0.5)
+            how = panel.open_panel(url)
+            if how is None:
+                print(f"No pude abrir una ventana: entrá vos a {url}")
+        threading.Thread(target=_launch, daemon=True).start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:

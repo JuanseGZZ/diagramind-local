@@ -2,14 +2,13 @@
 assistant/tool/result) y memoria de conversación nativa (--resume <sessionId>)."""
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 
 from runs import emit, set_status
 from skills import install_skills, SYSTEM_PREAMBLE
-from cli_base import _focus_note, _editor_note, _editor_relay_note
+from cli_base import _focus_note, _editor_note, _editor_relay_note, _find_bin
 
 # tools del MCP fs de editores externos (editor_mcp.py) — para --allowedTools
 MCP_FS_TOOLS = ["fs_tree", "fs_read", "fs_write", "fs_mkdir", "fs_rename",
@@ -46,21 +45,9 @@ EFFORT_THINK = {
 
 def find_claude():
     """Resuelve el binario `claude`. OJO: cuando el backend arranca por doble
-    clic / LaunchAgent, ~/.local/bin no está en el PATH, así que probamos rutas
-    conocidas además de which()."""
-    candidates = [shutil.which("claude")]
-    home = os.path.expanduser("~")
-    candidates += [
-        os.path.join(home, ".local", "bin", "claude"),
-        "/usr/local/bin/claude",
-        "/opt/homebrew/bin/claude",
-        os.path.join(home, ".local", "bin", "claude.exe"),
-        os.path.join(os.environ.get("APPDATA", ""), "npm", "claude.cmd"),
-    ]
-    for c in candidates:
-        if c and os.path.exists(c):
-            return c
-    return None
+    clic / LaunchAgent el PATH viene pelado, así que `_find_bin` prueba las rutas
+    conocidas (Homebrew, nvm, fnm, volta, npm prefix…) además de which()."""
+    return _find_bin(["claude"])
 
 
 def claude_version(claude_bin):
