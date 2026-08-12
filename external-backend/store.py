@@ -99,6 +99,14 @@ def list_projects(folder_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def rename_project(pid: str, name: str) -> bool:
+    """Cambia SOLO el nombre visible. El `dirname` es estable a propósito: renombrar no
+    mueve nada en disco ni rompe el historial de git del proyecto."""
+    with connect() as c:
+        r = c.execute("UPDATE projects SET name=? WHERE id=?", (name, pid))
+        return r.rowcount > 0
+
+
 def project_reldir(pid: str) -> str | None:
     """Ruta relativa `<folder.dirname>/<project.dirname>` de un proyecto, o None."""
     proj = get_project(pid)
@@ -164,19 +172,100 @@ def folder_permission(user: dict, folder_id: str) -> str:
     return r["permission"] if r else "none"
 
 
+_RANK = {"none": 0, "read": 1, "write": 2}
+
+
+def project_acl_permission(user: dict, project_id: str) -> str:
+    """Permiso otorgado DIRECTAMENTE sobre el proyecto (compartir un documento suelto),
+    ignorando el de su carpeta. 'none' si no hay."""
+    with connect() as c:
+        r = c.execute(
+            "SELECT permission FROM project_acl WHERE user_id=? AND project_id=?",
+            (user["id"], project_id),
+        ).fetchone()
+    return r["permission"] if r else "none"
+
+
 def project_permission(user: dict, project_id: str) -> str:
-    """Permiso efectivo sobre un proyecto = el de su carpeta. 'none' si no existe."""
+    """Permiso efectivo sobre un proyecto: el MAYOR entre el de su carpeta y el que le
+    hayan dado sobre ese proyecto puntual. 'none' si el proyecto no existe.
+
+    El máximo (y no un override) es a propósito: compartir un documento con permiso
+    `read` NO puede degradar al dueño, que tiene `write` por la carpeta."""
     proj = get_project(project_id)
     if not proj:
         return "none"
-    return folder_permission(user, proj["folder_id"])
+    if user["role"] == "admin":
+        return "write"
+    by_folder = folder_permission(user, proj["folder_id"])
+    by_project = project_acl_permission(user, project_id)
+    return by_folder if _RANK[by_folder] >= _RANK[by_project] else by_project
+
+
+def set_project_acl(user_id: int, project_id: str, permission: str,
+                    granted_by: int | None = None) -> None:
+    """Otorga (o revoca con 'none') el permiso de UN usuario sobre UN proyecto."""
+    with connect() as c:
+        if permission == "none":
+            c.execute("DELETE FROM project_acl WHERE user_id=? AND project_id=?",
+                      (user_id, project_id))
+        else:
+            c.execute(
+                "INSERT INTO project_acl (user_id, project_id, permission, granted_by) "
+                "VALUES (?,?,?,?) ON CONFLICT(user_id, project_id) DO UPDATE SET "
+                "permission=excluded.permission, granted_by=excluded.granted_by",
+                (user_id, project_id, permission, granted_by),
+            )
+
+
+def project_acl_list(project_id: str) -> list[dict]:
+    """Con quién está compartido un proyecto (para mostrarlo y poder revocar)."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT a.user_id, a.permission, a.created_at, u.username "
+            "FROM project_acl a JOIN users u ON u.id = a.user_id "
+            "WHERE a.project_id=? ORDER BY a.created_at", (project_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def shared_project_ids(user: dict) -> set[str]:
+    """Proyectos a los que el usuario llega SOLO por ACL de proyecto."""
+    with connect() as c:
+        rows = c.execute("SELECT project_id FROM project_acl WHERE user_id=?",
+                         (user["id"],)).fetchall()
+    return {r["project_id"] for r in rows}
 
 
 def visible_folders(user: dict) -> list[dict]:
-    """Carpetas que el usuario puede ver (permiso != none) + su permiso."""
+    """Carpetas que el usuario puede ver + su permiso.
+
+    Incluye dos casos:
+    - permiso de CARPETA != none (el de siempre);
+    - carpetas ajenas donde le compartieron ALGÚN proyecto suelto (`shared: True`).
+      Ahí se informa `read` para que el cliente la muestre como solo-lectura, pero eso
+      NO es un permiso de carpeta: `GET /projects` devuelve únicamente los proyectos
+      compartidos, `create_project` sigue exigiendo write real y `fs`/versiones se
+      autorizan por proyecto. La carpeta se lista solo para poder navegar hasta el
+      documento compartido.
+    """
+    shared = shared_project_ids(user)
+    shared_folders = set()
+    if shared:
+        with connect() as c:
+            qmarks = ",".join("?" * len(shared))
+            rows = c.execute(
+                f"SELECT DISTINCT folder_id FROM projects WHERE id IN ({qmarks})",
+                tuple(shared),
+            ).fetchall()
+        shared_folders = {r["folder_id"] for r in rows}
+
     out = []
     for f in list_folders():
         perm = folder_permission(user, f["id"])
         if perm != "none":
             out.append({"id": f["id"], "name": f["name"], "permission": perm})
+        elif f["id"] in shared_folders:
+            out.append({"id": f["id"], "name": f["name"], "permission": "read",
+                        "shared": True})
     return out

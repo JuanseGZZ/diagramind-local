@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.10.0"   # orquestador: borrar un run del historial (doc 28 fase 15)
+VERSION = "0.11.1"   # + ACL por PROYECTO: compartir un documento suelto (doc 26 §5)
 NAME = "DiagraMind Connector"
 
 

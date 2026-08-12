@@ -35,6 +35,19 @@ class SetAclBody(BaseModel):
     permission: str               # none | read | write
 
 
+class RenameBody(BaseModel):
+    """Renombrar un proyecto (solo el nombre visible; el dirname en disco no cambia)."""
+    id: str
+    name: str
+
+
+class SetProjectAclBody(BaseModel):
+    """Compartir UN documento (sin dar acceso a su carpeta)."""
+    projectId: str
+    userId: int
+    permission: str               # none (revoca) | read | write
+
+
 # ---- folders / projects (namespace canónico) ----
 
 class CreateFolderBody(BaseModel):

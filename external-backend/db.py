@@ -37,6 +37,18 @@ CREATE TABLE IF NOT EXISTS acl (
   PRIMARY KEY (user_id, folder_id)
 );
 
+-- ACL por PROYECTO: permite compartir UN documento sin dar acceso a su carpeta
+-- (el resto de la carpeta sigue invisible). El permiso efectivo sobre un proyecto es
+-- el MAYOR entre el de su carpeta y el de acá, así el dueño nunca pierde acceso.
+CREATE TABLE IF NOT EXISTS project_acl (
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  project_id TEXT    NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  permission TEXT    NOT NULL,                        -- read | write (ausencia = none)
+  granted_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+  created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (user_id, project_id)
+);
+
 CREATE TABLE IF NOT EXISTS refresh_tokens (
   jti        TEXT    PRIMARY KEY,
   user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
