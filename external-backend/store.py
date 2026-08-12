@@ -260,12 +260,28 @@ def visible_folders(user: dict) -> list[dict]:
             ).fetchall()
         shared_folders = {r["folder_id"] for r in rows}
 
+    owners = folder_owners()
     out = []
     for f in list_folders():
         perm = folder_permission(user, f["id"])
         if perm != "none":
-            out.append({"id": f["id"], "name": f["name"], "permission": perm})
+            out.append({"id": f["id"], "name": f["name"], "permission": perm,
+                        "owner": owners.get(f["id"], "")})
         elif f["id"] in shared_folders:
             out.append({"id": f["id"], "name": f["name"], "permission": "read",
-                        "shared": True})
+                        "shared": True, "owner": owners.get(f["id"], "")})
+    return out
+
+
+def folder_owners() -> dict:
+    """folder_id → username del DUEÑO (el primero con ACL `write`). Sirve para que el
+    cliente muestre de quién es cada carpeta y se note cuándo sos invitado."""
+    with connect() as c:
+        rows = c.execute(
+            "SELECT a.folder_id, u.username FROM acl a JOIN users u ON u.id = a.user_id "
+            "WHERE a.permission='write' ORDER BY a.folder_id, u.id",
+        ).fetchall()
+    out = {}
+    for r in rows:
+        out.setdefault(r["folder_id"], r["username"])
     return out

@@ -35,6 +35,10 @@ class SetAclBody(BaseModel):
     permission: str               # none | read | write
 
 
+class RenameUserBody(BaseModel):
+    username: str
+
+
 class RenameBody(BaseModel):
     """Renombrar un proyecto (solo el nombre visible; el dirname en disco no cambia)."""
     id: str

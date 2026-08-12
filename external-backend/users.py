@@ -9,7 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from auth import require_admin
 from db import connect
-from models import CreateUserBody, SetAclBody, SetRoleBody
+from models import CreateUserBody, RenameUserBody, SetAclBody, SetRoleBody
 from security import hash_password, random_password
 from store import get_folder
 
@@ -106,6 +106,24 @@ def delete_user(uid: int, admin: dict = Depends(require_admin)):
 
 
 # ---------------- ACL por carpeta ----------------
+
+@router.post("/{uid}/rename")
+def rename_user(uid: int, body: RenameUserBody, _: dict = Depends(require_admin)):
+    """Renombra un usuario (solo admin). El `id` es la identidad, así que cambiar el
+    username no rompe ACLs, tokens MCP ni autoría. Lo usa el back central para que la
+    presencia muestre el handle de la cuenta y no un `accN` interno."""
+    name = body.username.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="empty username")
+    with connect() as c:
+        if not c.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone():
+            raise HTTPException(status_code=404, detail="user not found")
+        clash = c.execute("SELECT id FROM users WHERE username=? AND id!=?", (name, uid)).fetchone()
+        if clash:
+            raise HTTPException(status_code=409, detail="username already taken")
+        c.execute("UPDATE users SET username=? WHERE id=?", (name, uid))
+    return {"ok": True, "id": uid, "username": name}
+
 
 @router.get("/{uid}/acl")
 def list_acl(uid: int, _: dict = Depends(require_admin)):
