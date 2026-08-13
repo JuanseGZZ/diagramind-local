@@ -1,0 +1,499 @@
+"""Conocimiento del dominio (formato de los diagramas) — ESPEJO de `local-backend/skills.py`.
+
+⚠️ **ESPEJO: si tocás uno, tocá el otro** (misma convención que
+`provisioner.py` ↔ `50-org-template.yaml`). Está duplicado y no importado porque el
+Dockerfile del conector solo tiene `external-backend/` como contexto de build.
+
+Acá lo consume la tool MCP `general_context` (mcp.py): en vez de redactar los esquemas
+a mano —que ya salió mal una vez y produjo proyectos vacíos— se sirven ESTAS skills,
+que son las mismas que leen Claude Code / Codex / Gemini en local.
+
+Original:
+- Claude Code lo lee de <carpeta>/.claude/skills (una skill por archivo).
+- Codex y Gemini CLI leen un único AGENTS.md / GEMINI.md armado con el MISMO
+  contenido (estándar compartido).
+Embebido acá para que el binario --onefile lo tenga sin archivos sueltos.
+
+IDIOMA: todo lo de este archivo va al MODELO, así que se escribe SIEMPRE en
+inglés (los modelos siguen mejor las instrucciones en inglés), sin importar el
+idioma de la app. La RESPUESTA al usuario sale en el idioma del usuario. Los
+nombres de campo del JSON (nodoRaiz, titulo, listaHijos…) NO se traducen: son las
+claves reales del formato. Ver doc 20 §L."""
+import os
+
+SYSTEM_PREAMBLE = (
+    "You are working in a DiagraMind WORKSPACE that holds SEVERAL projects. "
+    "Your working directory is the projects folder: ./index.json lists ALL the "
+    "projects [{id, name, type}] and which one is in focus (focusedId). Each project "
+    "lives in ./<Name>/tree.json (the folder is named after the project NAME, not its "
+    "id). The skills (diagramind-format and the one for each type) are in "
+    "./.claude/skills; read them before editing.\n\n"
+    "The FOCUSED PROJECT is your default WRITE target: edit "
+    "./<focusedName>/tree.json IN-PLACE, valid JSON, respecting the EXACT "
+    "schema of ITS type (each project can be of a different type: "
+    "cart/freestyle/treeQuestionary/activities/object/editor). Never change the tree id. When you are "
+    "done, re-read the file and check that it is valid JSON and matches the schema "
+    "(no extra or missing fields, unique ids); if something is off, fix it.\n\n"
+    "EXCEPTION — `editor` projects: they are NOT diagrams; their tree.json is a "
+    "pointer {type, target} to a REAL FOLDER (see diagramind-editor). If the focus "
+    "is an editor project, work directly on that folder and do NOT touch its tree.json.\n\n"
+    "You may READ any other project (./<Name>/tree.json, look it up in "
+    "./index.json) to base your work on it; only WRITE to another project if the user "
+    "explicitly asks you to.\n\n"
+    "CREATING A NEW PROJECT: if you are asked for a NEW diagram (instead of modifying "
+    "the focus), create a directory named after the project inside THIS folder, with its "
+    "`tree.json` inside, using the schema of the type you pick: ./<Project name>/tree.json. "
+    "Name: letters, digits, spaces, `-` and `_` (no `/`, no `.`, no punctuation). Write the "
+    "complete tree.json in one go (valid from the very first save). Do NOT touch "
+    "./index.json: the app maintains it, detects the new project in ~1 second, adds it to "
+    "the user's list and opens it. This requires the app to be OPEN and the local software "
+    "connected (otherwise the project will not survive the next sync): if you suspect it "
+    "is not, tell the user. Do NOT create `editor` projects (they need the user to pick a "
+    "real system folder by hand). After creating it, keep working there, not in the old focus.\n\n"
+    "RUNNING FETCHES (object projects): to 'run/test' a Fetch or Burst node of the "
+    "diagram do NOT use WebFetch or curl/Bash (they are disabled on purpose): "
+    "edit the `tree.json` putting a new `runReq` in the node's `data`, save and end "
+    "your turn; the app runs it and hands you the result on the next turn. See the "
+    "diagramind-object skill.\n\n"
+    "IMPORTANT: this is ONE continuous conversation. You remember what you did in "
+    "earlier turns even if the user changes the focused project. If the user refers "
+    "to 'that' or 'what you added', look at the conversation history.\n\n"
+    "Keep your answers short, and ALWAYS answer in the same language the user writes "
+    "to you in (these instructions are in English, but that does not mean the user "
+    "speaks English)."
+)
+
+
+def _skill(name, description, body):
+    return name, ("---\nname: %s\ndescription: %s\n---\n\n%s\n" %
+                  (name, description, body))
+
+
+SKILLS = dict([
+    _skill(
+        "diagramind-format",
+        "Format of a DiagraMind project: tree.json, types, ids and counters. "
+        "ALWAYS read this before editing a diagram.",
+        "# DiagraMind format\n\n"
+        "A project is a single `tree.json` file (the very object produced by "
+        "`tree.toJson()` in the web app). The root field `type` defines the structure:\n\n"
+        "- `cart` → see `diagramind-cart`\n"
+        "- `freestyle` → see `diagramind-freestyle`\n"
+        "- `treeQuestionary` → see `diagramind-treequestionary`\n"
+        "- `activities` → see `diagramind-activities`\n"
+        "- `object` → see `diagramind-object`\n"
+        "- `editor` → see `diagramind-editor` (NOT a diagram: it points at a real folder)\n"
+        "- `documents` → see `diagramind-documents` (NOT a diagram: a file library)\n\n"
+        "Common to every type:\n"
+        "- `attachments`: a map `{ \"<aid>\": { \"name\", \"mime\" } }` (attachments; "
+        "  the bytes live elsewhere, do NOT touch them).\n"
+        "- The fields `lastIdCharged` / `lastId` / `lastArrowId` / etc. are "
+        "  **counters** holding the last id used.\n\n"
+        "## Rules (important)\n"
+        "1. Edit `tree.json` IN-PLACE and leave it as **valid JSON** (check that it "
+        "   parses when you are done).\n"
+        "2. **Respect the EXACT field names** of the type's schema. Never invent or "
+        "   rename fields.\n"
+        "3. **ids are integers.** When adding a node use "
+        "   `<counter> + 1`, assign it as the new node's id and **bump the counter** "
+        "   to that value.\n"
+        "4. Never change the `type` nor mix in nodes of another type.\n"
+        "5. Keep the existing fields of every node (don't drop them when editing).\n"
+        "6. **Colors**: the `color` field (on nodes, arrows and cards) takes a "
+        "   **hex string** like `\"#e53935\"`, or `null` = default color. You ARE "
+        "   allowed to change them: put the hex in `color`. In freestyle, shapes use "
+        "   `fill`/`stroke` (hex too).",
+    ),
+    _skill(
+        "diagramind-cart",
+        "Hierarchical tree of cards (type `cart`, ltr/organigram layouts).",
+        "# Type cart (hierarchical)\n\n"
+        "A multi-level tree of cards. EXACT `tree.json` schema:\n\n"
+        "```json\n"
+        "{\n"
+        "  \"type\": \"cart\",\n"
+        "  \"lastIdCharged\": 3,\n"
+        "  \"attachments\": {},\n"
+        "  \"nodoRaiz\": {\n"
+        "    \"idCarta\": 0,\n"
+        "    \"idPadre\": null,\n"
+        "    \"tituloCarta\": \"Root\",\n"
+        "    \"descripcion\": \"body text\",\n"
+        "    \"color\": null,\n"
+        "    \"shape\": \"default\",\n"
+        "    \"collapsed\": false,\n"
+        "    \"listaHijos\": [ /* cards with the SAME shape */ ]\n"
+        "  }\n"
+        "}\n"
+        "```\n\n"
+        "## Fields per card\n"
+        "- `idCarta` (int, unique), `idPadre` (int of the parent, or null on the root).\n"
+        "- `tituloCarta` (str), `descripcion` (str, the body text).\n"
+        "- `color` (str|null), `shape` (\"default\"), `collapsed` (bool).\n"
+        "- `listaHijos` (array of cards).\n\n"
+        "## Editing\n"
+        "- **Add a child**: create a card with `idCarta = lastIdCharged + 1` and "
+        "  `idPadre = idCarta of the parent`; push it into the parent's `listaHijos`; "
+        "  bump `lastIdCharged`.\n"
+        "- **Move**: take the card out of one `listaHijos` and put it in another; "
+        "  update its `idPadre`.\n"
+        "- **Delete**: remove the card (with its subtree) from its `listaHijos`.\n"
+        "- WATCH OUT: the fields are `nodoRaiz`/`listaHijos`/`idCarta`/`tituloCarta` "
+        "(NOT raiz/hijos/id/titulo).",
+    ),
+    _skill(
+        "diagramind-freestyle",
+        "Free canvas (type `freestyle`): nodes with x/y, arrows and shapes.",
+        "# Type freestyle (free canvas)\n\n"
+        "Flat, no automatic layout. EXACT schema:\n\n"
+        "```json\n"
+        "{\n"
+        "  \"type\": \"freestyle\",\n"
+        "  \"lastIdCharged\": 2, \"lastArrowId\": 1, \"lastShapeId\": 0,\n"
+        "  \"attachments\": {},\n"
+        "  \"nodos\":  [{ \"id\":1, \"x\":100, \"y\":80, \"ancho\":160, \"alto\":90,\n"
+        "             \"titulo\":\"\", \"contenido\":\"\", \"color\":null,\n"
+        "             \"type\":\"basic\", \"data\":{} }],\n"
+        "  \"flechas\":[{ \"id\":1, \"fromId\":1, \"toId\":2,\n"
+        "             \"fromSide\":\"right\", \"toSide\":\"left\", \"label\":\"\", \"color\":null }],\n"
+        "  \"formas\": [{ \"id\":1, \"x\":0,\"y\":0,\"ancho\":120,\"alto\":120,\n"
+        "             \"rotation\":0, \"shape\":\"rect\", \"fill\":\"#fff\", \"stroke\":\"#000\",\n"
+        "             \"strokeWidth\":2, \"label\":\"\", \"imageSrc\":\"\",\n"
+        "             \"imgPosX\":50, \"imgPosY\":50, \"imgZoom\":1 }]\n"
+        "}\n"
+        "```\n\n"
+        "## Editing\n"
+        "- **Add a node**: id `lastIdCharged + 1`; x/y/ancho/alto are numbers; bump "
+        "  `lastIdCharged`.\n"
+        "- **Connect**: a new arrow in `flechas` with `fromId`/`toId` of existing "
+        "  nodes; `fromSide`/`toSide` ∈ left/right/top/bottom; bump `lastArrowId`.\n"
+        "- **Edit a node**: change `titulo`/`contenido`/`color` (hex) or `x`/`y`/`ancho`/`alto`.\n"
+        "- **Shape**: a new entry in `formas`; bump `lastShapeId` (`fill`/`stroke` are hex).\n"
+        "- **Delete a node**: remove it from `nodos` AND delete the arrows referencing it.\n"
+        "- Never duplicate ids within a list.",
+    ),
+    _skill(
+        "diagramind-treequestionary",
+        "Study questionnaire (type `treeQuestionary`): the same canvas as freestyle "
+        "but with study nodes (qa/mc/test/asking) in `type` + `data`.",
+        "# Type treeQuestionary (study questionnaire)\n\n"
+        "The same flat canvas as `freestyle` (nodes with x/y + arrows), but the nodes "
+        "are study nodes: what is specific to each one goes in `type` and in the `data` "
+        "object. EXACT schema:\n\n"
+        "```json\n"
+        "{\n"
+        "  \"type\": \"treeQuestionary\",\n"
+        "  \"lastIdCharged\": 4, \"lastArrowId\": 0, \"lastShapeId\": 0,\n"
+        "  \"attachments\": {},\n"
+        "  \"nodos\": [\n"
+        "    { \"id\":1, \"x\":80, \"y\":80, \"ancho\":250, \"alto\":150,\n"
+        "      \"titulo\":\"\", \"contenido\":\"\", \"color\":null,\n"
+        "      \"type\":\"qa\", \"data\":{ \"pregunta\":\"Capital of France?\", \"respuesta\":\"Paris\" } },\n"
+        "    { \"id\":2, \"x\":360, \"y\":80, \"ancho\":270, \"alto\":200,\n"
+        "      \"titulo\":\"\", \"contenido\":\"\", \"color\":null,\n"
+        "      \"type\":\"mc\", \"data\":{ \"consigna\":\"Which ones are even?\",\n"
+        "        \"opciones\":[ {\"texto\":\"2\",\"correcta\":true}, {\"texto\":\"3\",\"correcta\":false}, {\"texto\":\"4\",\"correcta\":true} ] } },\n"
+        "    { \"id\":3, \"x\":80, \"y\":300, \"ancho\":220, \"alto\":130,\n"
+        "      \"titulo\":\"My test\", \"contenido\":\"\", \"color\":null,\n"
+        "      \"type\":\"test\", \"data\":{ \"seleccion\":[1,2] } },\n"
+        "    { \"id\":4, \"x\":360, \"y\":300, \"ancho\":220, \"alto\":130,\n"
+        "      \"titulo\":\"Review\", \"contenido\":\"\", \"color\":null,\n"
+        "      \"type\":\"asking\", \"data\":{ \"seleccion\":[1] } }\n"
+        "  ],\n"
+        "  \"flechas\": [], \"formas\": []\n"
+        "}\n"
+        "```\n\n"
+        "## Node types (`type` + what goes in `data`)\n"
+        "- `qa` → question/answer: `data = { pregunta, respuesta }` (strings).\n"
+        "- `mc` → multiple choice: `data = { consigna, opciones:[{ texto, correcta }] }`. "
+        "  `correcta` is a bool; **there can be SEVERAL correct ones**.\n"
+        "- `test` → a quiz with a final score: `data = { seleccion:[ids of qa/mc nodes IN ORDER] }`.\n"
+        "- `asking` → Anki-style review: `data = { seleccion:[ids of qa nodes ONLY, in order] }`.\n\n"
+        "## Editing\n"
+        "- **Add a node**: id `lastIdCharged + 1`; set `type` and its `data`; x/y/ancho/alto "
+        "  are numbers; bump `lastIdCharged`.\n"
+        "- **`seleccion`** (test/asking) holds ids of OTHER nodes of the same tree (qa/mc for "
+        "  test; qa only for asking). Never reference yourself.\n"
+        "- The node's `titulo` is its visible name; the real content goes in `data`.\n"
+        "- **Connecting** with arrows works the same as freestyle (optional here).\n"
+        "- **Delete a node**: remove it from `nodos` AND take its id out of any `seleccion` using it.\n"
+        "- Don't invent fields in `data`; respect the keys of each type. Never duplicate ids.",
+    ),
+    _skill(
+        "diagramind-activities",
+        "Activity diagram (type `activities`): precedences / Gantt.",
+        "# Type activities\n\n"
+        "Activities with directed precedences. EXACT schema:\n\n"
+        "```json\n"
+        "{\n"
+        "  \"type\": \"activities\",\n"
+        "  \"lastId\": 3, \"seqCounter\": 3, \"timeUnit\": \"dias\",\n"
+        "  \"attachments\": {},\n"
+        "  \"nodes\": [{ \"id\":1, \"titulo\":\"Task\", \"contenido\":\"\",\n"
+        "             \"color\":null, \"isStart\":true, \"seq\":1, \"duracion\":2 }],\n"
+        "  \"edges\": [{ \"fromId\":1, \"toId\":2, \"color\":null }]\n"
+        "}\n"
+        "```\n\n"
+        "## Fields\n"
+        "- node: `id` (int), `titulo`, `contenido`, `color`, `isStart` (bool), "
+        "  `seq` (order), `duracion` (in `timeUnit`: horas/dias/semanas).\n"
+        "- `edges`: directed precedences `fromId → toId`.\n\n"
+        "## Editing\n"
+        "- **Add an activity**: id `lastId + 1`, `seq = seqCounter + 1`; bump "
+        "  both counters.\n"
+        "- **Precedence**: a new `edge` with existing ids. **Do not create cycles.**\n"
+        "- **Edit**: change `titulo`/`contenido`/`color` (hex)/`duracion`; `isStart` "
+        "  marks the starting node.\n"
+        "- **Delete an activity**: remove it from `nodes` AND delete the `edges` referencing it.\n"
+        "- Keep `timeUnit` consistent (horas/dias/semanas).",
+    ),
+    _skill(
+        "diagramind-object",
+        "Metamodel (type `object`): dynamic classes and objects. The GRAPH is the JSON; "
+        "references/arrays are modeled with typed ARROWS.",
+        "# Type object (dynamic classes and objects)\n\n"
+        "The same container as `freestyle` (nodes + arrows + shapes + counters), but "
+        "the nodes belong to the metamodel. **KEY IDEA: the graph IS the JSON** — "
+        "reference/array values do NOT live inside the node, they are **typed arrows**. "
+        "EXACT schema:\n\n"
+        "```json\n"
+        "{\n"
+        "  \"type\": \"object\",\n"
+        "  \"lastIdCharged\": 7, \"lastArrowId\": 3, \"lastShapeId\": 0, \"attachments\": {},\n"
+        "  \"nodos\": [\n"
+        "    { \"id\":1, \"x\":80,\"y\":40,\"ancho\":240,\"alto\":200, \"titulo\":\"Person\",\"contenido\":\"\",\"color\":null, \"type\":\"objclass\",\n"
+        "      \"data\":{ \"padre\":null, \"atributos\":[ {\"id\":\"a1\",\"nombre\":\"name\",\"tipo\":\"string\",\"esArray\":false},\n"
+        "                                              {\"id\":\"a2\",\"nombre\":\"car\",\"tipo\":{\"ref\":2},\"esArray\":false} ] } },\n"
+        "    { \"id\":2, \"x\":400,\"y\":40, \"titulo\":\"Car\", \"type\":\"objclass\",\n"
+        "      \"data\":{ \"padre\":null, \"atributos\":[ {\"id\":\"a3\",\"nombre\":\"brand\",\"tipo\":\"string\",\"esArray\":false} ] } },\n"
+        "    { \"id\":3, \"x\":80,\"y\":320, \"titulo\":\"john\", \"type\":\"objinstance\", \"data\":{ \"classId\":1, \"valores\":{ \"a1\":\"John\" } } },\n"
+        "    { \"id\":4, \"x\":400,\"y\":320, \"titulo\":\"bmw\", \"type\":\"objinstance\", \"data\":{ \"classId\":2, \"valores\":{ \"a3\":\"BMW\" } } },\n"
+        "    { \"id\":5, \"x\":700,\"y\":320, \"titulo\":\"cars\", \"type\":\"objcollection\", \"data\":{ \"kind\":\"list\", \"elementClass\":2 } },\n"
+        "    { \"id\":6, \"x\":80,\"y\":560, \"titulo\":\"send\", \"type\":\"objfetch\",\n"
+        "      \"data\":{ \"method\":\"POST\",\"url\":\"https://api/x\",\"headers\":[{\"k\":\"Authorization\",\"v\":\"Bearer ...\"}],\n"
+        "               \"webhook\":{ \"enabled\":false,\"expectStatus\":\"2xx\",\"expectContains\":\"\",\"trigger\":\"onMismatch\",\"action\":\"notify\",\"notifyMethod\":\"POST\",\"notifyUrl\":\"\",\"notifyBody\":\"\" } } },\n"
+        "    { \"id\":7, \"x\":400,\"y\":560, \"titulo\":\"sendAll\", \"type\":\"objburst\", \"data\":{ /* same as objfetch */ } }\n"
+        "  ],\n"
+        "  \"flechas\": [\n"
+        "    { \"id\":1, \"fromId\":1,\"toId\":2, \"fromSide\":\"right\",\"toSide\":\"left\", \"kind\":\"tiene\",\"attrId\":\"a2\",\"label\":\"car\",\"color\":null },\n"
+        "    { \"id\":2, \"fromId\":3,\"toId\":4, \"fromSide\":\"right\",\"toSide\":\"left\", \"kind\":\"value\",\"attrId\":\"a2\",\"label\":\"car\",\"color\":null },\n"
+        "    { \"id\":3, \"fromId\":5,\"toId\":4, \"fromSide\":\"right\",\"toSide\":\"left\", \"kind\":\"elem\",\"label\":\"\",\"color\":null }\n"
+        "  ], \"formas\": []\n"
+        "}\n"
+        "```\n\n"
+        "## Node types (`type` + `data`)\n"
+        "- `objclass` → a CLASS. `data = { padre: idOfAnotherClass|null, atributos:[{id(unique str), nombre, tipo, esArray(bool)}] }`. "
+        "  `tipo` = a primitive `\"string\"|\"number\"|\"bool\"|\"date\"` or a reference `{\"ref\": classId}`. The `titulo` is the class NAME.\n"
+        "- `objinstance` → an OBJECT. `data = { classId: classId|null, valores:{ [attrId]:value } }`. `valores` holds ONLY the PRIMITIVE attributes (by attrId). The `titulo` is just a label (it does NOT appear in the JSON).\n"
+        "- `objcollection` → `data = { kind:\"list\"|\"queue\"|\"stack\"|\"tree\", elementClass: classId|null, "
+        "order:[ids] (member order in list/queue/stack), edges:[{from,to}] (parent→child hierarchy in tree), layout:{} (positions, ignorable) }`. "
+        "Members = the objects the collection points to through `elem`. Serialization: list/queue/stack → an ARRAY (ordered by `order`; stack reversed = LIFO); "
+        "tree → NESTED from the root(s) (a root is a member with no parent), each node with `children:[...]`.\n"
+        "- `objfetch` / `objburst` → `data = { method, url, headers:[{k,v}], webhook:{...} }`. `objburst` also takes `data.sendOrder` for tree "
+        "(`\"depth-ltr\"|\"depth-rtl\"|\"breadth-ltr\"|\"breadth-rtl\"`) and sends one request per element.\n"
+        "  `webhook = { enabled, expectStatus, expectContains, trigger(onMismatch|onMatch|always), action(ignore|notify), notifyMethod, notifyUrl, notifyBody, stopOnTrigger(burst only) }`.\n\n"
+        "## Arrows (`kind` + `attrId`)\n"
+        "- `hereda` → inheritance child→parent (objclass→objclass); also set `padre` in the child's data. `attrId` null.\n"
+        "- `tiene`  → a reference attribute between classes (objclass→objclass); `attrId` = id of the attribute in the source class.\n"
+        "- `value`  → the VALUE of a reference attribute: object→object (single ref) or object→collection (array); `attrId` = id of the attribute.\n"
+        "- `elem`   → an element of a collection (objcollection→objinstance); `attrId` null.\n"
+        "- `body`   → the body of a fetch/burst (objfetch|objburst → objinstance|objcollection); `attrId` null.\n\n"
+        "## Rules\n"
+        "- node/arrow ids are integers (bump the counters). `attrId` = a unique string within the class (e.g. `\"a1\"`).\n"
+        "- A FILLED reference attribute on an object = a `value` arrow (it does NOT go in `valores`).\n"
+        "- If a class has an attribute `{ref:X}`, also add the `tiene` arrow class→X with that `attrId`.\n"
+        "- Inheritance: set `padre` AND add the `hereda` arrow. The object inherits the effective attributes (the whole parent chain): use those `attrId`s.\n"
+        "- Collection: members are defined by `elem` arrows (collection→object). The send order comes from `order` (list/queue/stack) or from `edges` (tree).\n"
+        "- The `titulo` is NOT data: the JSON comes out of the attributes + the arrows.\n\n"
+        "## Running a Fetch / Burst (testing endpoints)\n"
+        "**VERY IMPORTANT — do NOT use your `WebFetch` tool nor `Bash`/`curl` to "
+        "run a Fetch node of the diagram.** Those tools do NOT build the body from "
+        "the object graph, do NOT respect the node's method/headers, do NOT go through "
+        "the connector proxy (CORS) and are NOT visible on the canvas. The ONLY correct way "
+        "to run an `objfetch`/`objburst` node is through its state:\n"
+        "1. Put a `runReq` field in the node's `data` with a NEW marker (e.g. a "
+        "timestamp or a number different from the previous one).\n"
+        "2. SAVE the `tree.json` and **end your turn** (do NOT use sleeps or waiting loops).\n"
+        "3. The app runs the node and hands you the result (status + body + webhook) on "
+        "the NEXT turn AUTOMATICALLY. It also stays on the node as `data.lastResponse`.\n"
+        "To re-run it, change `runReq` again. You can request several nodes at once "
+        "(several `runReq`s). If you are asked to 'run/test a fetch' of an object project, "
+        "this is what you have to do — never WebFetch.",
+    ),
+    _skill(
+        "diagramind-editor",
+        "Type `editor`: the project opens a REAL FOLDER (it is not a diagram). "
+        "Read this if the focused project is of type editor.",
+        "# Type editor (a real folder)\n\n"
+        "An `editor` project (doc 27) opens a **real folder** on the machine. Its "
+        "`tree.json` is just a pointer:\n\n"
+        "```json\n"
+        "{ \"type\": \"editor\", \"target\": \"/path/to/the/folder\" }\n"
+        "```\n\n"
+        "## Rules\n"
+        "1. **Do NOT edit its `tree.json`** (and don't put nodes in there): the project "
+        "   files do NOT live in the workspace, they live in the `target`.\n"
+        "2. **LOCAL** editor: the chat gives you **direct access to the target** (the "
+        "   exact path comes in your system prompt): work on those files with your "
+        "   normal tools (read / edit / bash).\n"
+        "3. **EXTERNAL** editor (the target lives on a connector): the files are NOT "
+        "   on this disk — use the MCP tools of the «dmfs» server "
+        "   (mcp__dmfs__fs_tree / fs_read / fs_edit / fs_write / fs_mkdir / fs_rename / "
+        "   fs_delete / fs_grep / fs_exec), with paths relative to the project "
+        "   root. To change a few lines: **fs_edit({path, old, new})**, which replaces an "
+        "   EXACT piece of text (`old` copied verbatim and unique in the file). For a "
+        "   one-line change, fs_grep gives you that line WITH its indentation and you "
+        "   edit straight away — no need to pull the whole file into the conversation; "
+        "   fs_read is for when you have to understand the file. fs_write is for "
+        "   CREATING a file or rewriting it whole. Your system prompt tells you which of the two cases applies. You also "
+        "   have project VERSIONS: mcp__dmfs__sv_save({note}) BEFORE a batch of "
+        "   changes (it is signed as done by the AI), sv_list for the history and "
+        "   sv_restore({id}) to roll back ONLY if the user asks. If the "
+        "   project has GitHub connected: gh_push({message}) commits+pushes "
+        "   (annotated as the AI), gh_log lists commits and gh_pull({ref?}) brings the "
+        "   latest or an earlier version — push/pull ONLY when the user asks.\n"
+        "4. The diagramind-* schemas (ids, counters, node types) **do not apply** "
+        "   to these projects: they are plain code/files.\n"
+        "5. The other projects of the workspace keep following the usual rules.",
+    ),
+    _skill(
+        "diagramind-orchestrator",
+        "Type `orchestrator` (doc 28): the COMPANY of AI agents as a canvas. "
+        "Managing the org chart: creating/editing employees, resources, wiring.",
+        "# Type orchestrator (a company of agents)\n\n"
+        "A free-family container (`nodos` + `flechas` + `formas` + counters, like "
+        "freestyle: every node has id/x/y/ancho/alto/titulo/contenido/color/type/data). "
+        "ONE per folder. The graph IS the company: it can be EXECUTED (runs).\n\n"
+        "## Nodes (the `type` field + its `data`)\n"
+        "- `agAgent` → an AI employee. data={ preset, rol (str: the context prompt), "
+        "ia:{provider:'anthropic'|'google'|'openai'|'other'|'local'(Claude Code), model, "
+        "effort|null, credId|null (WHICH of the orchestrator's API keys it uses; null = the first "
+        "one loaded for that provider)}, "
+        "memoria:{enabled:bool}, director:bool (default false: ONLY the human turns it on — "
+        "it grants FULL authority to manage this company, do NOT set it yourself), "
+        "secuencial:bool (default false; true = that agent NEVER delegates in parallel: "
+        "one at a time, waiting for each answer), "
+        "confinado:bool (default false; applies ONLY to CLI heads: true = it writes "
+        "EXCLUSIVELY through its editor resources, with no mounted folder and no native "
+        "file tools — safer, but it loses Bash and cannot run tests) }. "
+        "The `titulo` is the employee's NAME.\n"
+        "- `agData` → STATIC CONTEXT: rules, conventions, clarifications. "
+        "data={ contenido:string }. The `titulo` is the name of the block. You connect "
+        "agent→agData with the `contexto` arrow and its text is injected INTO THE SYSTEM "
+        "prompt of that agent (always, not on demand). Use it for what EVERY turn must "
+        "respect; for long documents use an editor resource.\n"
+        "- `agResource` → a project of the SAME folder as a resource. "
+        "data={ projectId, permiso:'leer'|'editar'|'ejecutar' }.\n"
+        "- `agTask` → a work entry. data={ enunciado }.\n"
+        "- `agDept` → a department (a visual sector by geometry). data={ collapsed }.\n"
+        "- `agWebhook` → a REACTIVE entry from the outside (mail/server/api). "
+        "data={ tipo:'gmail'|'outlook'|'mail'|'api'|'mcp'|'otro', enabled:bool, "
+        "queueMax:int (default 50), plantilla?:str (how to read the payload) }. "
+        "The URI + token are generated by the connector (they do not go in the tree.json).\n"
+        "- `agMcp` → tooling towards the OUTSIDE (MCPs and external APIs). "
+        "data={ tipo:'mcp'|'api', preset:'notion'|'canva'|'mail'|'custom'|…, "
+        "config:{ url?, endpoints?:[{name,method,url,description}] } }. "
+        "Credentials do NOT go in the tree.json (they live in the connector).\n\n"
+        "## Sizes (`ancho` x `alto` when you CREATE a node)\n"
+        "Below these the node's own chips and buttons do not fit: `agAgent` 300x230, "
+        "`agData` 300x220, `agTask` 290x180, `agWebhook` 290x190, `agMcp` 290x190, "
+        "`agResource` 280x160. An `agDept` must COVER its members (560x400 or more). "
+        "Leave at least 60px between nodes.\n\n"
+        "## Arrows (the `kind` field)\n"
+        "- `delega` (agAgent→agAgent): who may call whom; cycles allowed. "
+        "label 'delega', color #6366f1.\n"
+        "- `usa` (agAgent→agResource or agAgent→agMcp): assigns the resource/service. "
+        "label 'usa', color #14b8a6.\n"
+        "- `task` (agTask→agAgent): the run's entry point. label 'tarea', color #f59e0b.\n"
+        "- `contexto` (agAgent→agData): adds that text to the agent's system prompt.\n"
+        "- `trigger` (agWebhook→agAgent): the external trigger comes in through that agent. "
+        "label 'trigger', color #f43f5e.\n"
+        "Any other combination is invalid.\n\n"
+        "## Running the company (good practice)\n"
+        "1. Every agent ONLY knows what it has wired (its arrows): don't build "
+        "   graphs where everyone talks to everyone — clear hierarchies (PM → devs → QA).\n"
+        "2. CONCRETE, verifiable roles in `rol` (what it does, what it does NOT do, when "
+        "   it asks the user). Cost cascade: the expensive model for the PM, mid-tier for devs, "
+        "   cheap for mechanical work.\n"
+        "3. Resources with the MINIMUM permission (leer if it only reads). Two agents "
+        "   writing the SAME resource get serialized by a lock: if you want real "
+        "   parallelism, split the resource.\n"
+        "4. Webhooks → point them at a dedicated 'receptionist' agent that delegates.\n"
+        "5. EDITING the graph NEVER executes anything (it triggers no runs): change what "
+        "   you were asked for and nothing else.\n"
+        "6. When editing, respect diagramind-format (unique integer ids, counters, "
+        "   exact fields) and keep whatever you were not asked to touch.",
+    ),
+    _skill(
+        "diagramind-documents",
+        "Type `documents`: the user's document library (PDF/text/images). "
+        "Read this if the focused project is of type documents or if you are asked "
+        "about its PDFs.",
+        "# Type documents (a document library)\n\n"
+        "A `documents` project (doc 30) is NOT a diagram: it is a **file library** "
+        "belonging to the user (PDFs, text, images, audio). Its `tree.json` is a "
+        "**manifest** — metadata, no bytes:\n\n"
+        "```json\n"
+        "{ \"type\": \"documents\",\n"
+        "  \"dirs\": [\"papers\"],\n"
+        "  \"docs\": [ { \"id\": 1, \"name\": \"report.pdf\", \"mime\": \"application/pdf\",\n"
+        "               \"size\": 182734, \"hash\": \"<sha256>\", \"dir\": \"papers\" } ] }\n"
+        "```\n\n"
+        "## Where the real files are\n\n"
+        "The bytes live **next to the tree.json**, inside the project folder:\n\n"
+        "- `documents/<sha256>` → the real file, named after the hash of its content "
+        "(that's how it is deduplicated and verified across mirrors). **No extension.**\n"
+        "- `documents/by-name/<virtual folder>/<real name>` → **the view you want**: "
+        "the same files with their real name and extension (hardlinks, they take no extra "
+        "space). It is regenerated on every sync.\n\n"
+        "**To read a user document use `documents/by-name/…`** — there, "
+        "`report.pdf` is a PDF with a name and an extension, and your reading tool handles "
+        "it normally. The `tree.json` tells you what exists and in which virtual folder.\n\n"
+        "## Rules\n\n"
+        "1. **Do not edit the manifest to add or remove files**: the user uploads them "
+        "from the web app (or they come down from the connector). If you are asked \"add this "
+        "PDF\", explain that they have to upload it themselves in Documents mode.\n"
+        "2. **Do not touch `documents/`**: don't rename or delete blobs. The web app owns "
+        "the content; the next sync would prune whatever is not in the manifest.\n"
+        "3. A **scanned** PDF has no extractable text (they are images): say so, don't "
+        "make up content.\n"
+        "4. If a document is listed in the manifest but is **not on disk** (it does not show "
+        "up in `documents/by-name/`), it means it HAS NOT SYNCED YET. In that case: **do NOT "
+        "look for it anywhere else** (not Google Drive, not the web, not other folders, and "
+        "don't ask for any permissions: the file is NOT on this machine). Tell the user and "
+        "ask them to open that project in the app with the local software connected — opening "
+        "it syncs it — and then ask you again. Never invent the content nor guess what it is "
+        "about from the name.\n"
+        "5. Cite documents by their **name** (and the page, in PDFs), never by hash.",
+    ),
+])
+
+
+def install_skills(project_dir):
+    """Claude Code: una skill por carpeta en <project_dir>/.claude/skills/<name>/SKILL.md."""
+    skills_dir = os.path.join(project_dir, ".claude", "skills")
+    for name, content in SKILLS.items():
+        d = os.path.join(skills_dir, name)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "SKILL.md"), "w", encoding="utf-8") as f:
+            f.write(content)
+
+
+def _agents_md():
+    """Mismo conocimiento que las skills de Claude, pero en un solo documento que
+    leen Codex y Gemini CLI (estándar compartido). Se arma de SKILLS + el preámbulo."""
+    parts = ["# DiagraMind — instructions for the agent\n", SYSTEM_PREAMBLE, "\n"]
+    for _name, content in SKILLS.items():
+        body = content.split("---\n", 2)[-1]   # saco el frontmatter YAML
+        parts.append("\n---\n\n" + body.strip() + "\n")
+    return "\n".join(parts)
+
+
+def install_agents_md(work_dir):
+    """Codex lee AGENTS.md; Gemini CLI lee GEMINI.md (y también AGENTS.md). Escribimos
+    ambos en la carpeta (cwd del agente) con el esquema de los diagramas."""
+    os.makedirs(work_dir, exist_ok=True)
+    md = _agents_md()
+    for fname in ("AGENTS.md", "GEMINI.md"):
+        with open(os.path.join(work_dir, fname), "w", encoding="utf-8") as f:
+            f.write(md)

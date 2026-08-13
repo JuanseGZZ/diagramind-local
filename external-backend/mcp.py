@@ -172,51 +172,39 @@ def _mark_tree_touched(ctx: dict, rel: str) -> None:
 
 
 # ---------------- contexto general (para que el modelo NO adivine) ----------------
-# Sin esto, un cliente MCP no sabe qué tipos de proyecto existen ni cómo se ve un
-# tree.json, y termina inventando estructuras que la web no puede abrir.
+# Los esquemas NO se redactan acá: se sirven las SKILLS del dominio
+# (`skills_domain.py`, espejo de local-backend/skills.py) — las mismas que leen
+# Claude Code / Codex / Gemini cuando trabajan en local. Escribirlas a mano ya salió
+# mal una vez: se documentó `{"nodes":[],"edges":[]}`, que no existe, y los proyectos
+# quedaban vacíos. Fuente única = las skills.
 
-PROJECT_TYPES = [
-    {"type": "cart", "label": "Cart",
-     "use": "Hierarchical card tree: each node is a card with title + rich description "
-            "and hangs from a parent. THE DEFAULT for breaking a topic into parts, "
-            "summaries, study material, org charts, taxonomies.",
-     "layouts": ["left-to-right", "organigram"]},
-    {"type": "freestyle", "label": "Freestyle",
-     "use": "Free canvas: loose nodes anywhere, arrows and shapes. Use when position "
-            "carries meaning (mind maps, sketches, flows without a strict hierarchy)."},
-    {"type": "treeQuestionary", "label": "Questionnaire",
-     "use": "Study questionnaire: questions with answers, to review a topic."},
-    {"type": "activities", "label": "Activities",
-     "use": "Activities with precedences (a task needs others to finish first). "
-            "Renders arrows or a Gantt-like view. Use for plans and schedules."},
-    {"type": "object", "label": "Object",
-     "use": "Dynamic classes and objects: build object graphs and generate JSON or "
-            "HTTP requests from them. Use to model data, not ideas."},
-    {"type": "orchestrator", "label": "AI Orchestrator",
-     "use": "A visual AI company: agents, resources, tasks and departments."},
-    {"type": "documents", "label": "Documents",
-     "use": "A library of documents (PDF, images, audio, text) with explorer + viewer."},
-    {"type": "editor", "label": "Editor",
-     "use": "Opens a real folder and edits its files, VSCode-style."},
-]
+import skills_domain
 
-TREE_SHAPE = """A project's content is a single `tree.json`. Minimum shape:
+# nombre de la skill por tipo de proyecto (las claves son `diagramind-<tipo>`)
+_SKILL_BY_TYPE = {
+    "cart": "diagramind-cart",
+    "freestyle": "diagramind-freestyle",
+    "treeQuestionary": "diagramind-treequestionary",
+    "activities": "diagramind-activities",
+    "object": "diagramind-object",
+    "editor": "diagramind-editor",
+    "orchestrator": "diagramind-orchestrator",
+    "documents": "diagramind-documents",
+}
 
-{"type": "<one of the types above>", "nodes": [ ... ], "edges": [ ... ]}
 
-For `cart` (the usual one) each node looks like:
+def _strip_front_matter(md: str) -> str:
+    """Las skills traen front-matter YAML (name/description) para Claude Code; por MCP
+    solo interesa el cuerpo."""
+    if md.startswith("---"):
+        end = md.find("---", 3)
+        if end != -1:
+            return md[end + 3:].strip()
+    return md.strip()
 
-{"id": "n1", "titulo": "Title", "descripcion": "<p>rich text, HTML allowed</p>",
- "padre": "<id of the parent, or null for the root>"}
 
-Rules that matter:
-- `id` must be unique inside the project; `padre` must point to an existing id.
-- Exactly one node with `padre: null` (the root).
-- `descripcion` accepts HTML: use <p>, <b>, <ul><li> to keep the source's detail.
-- DON'T flatten information: if the source has 5 bullet points, make 5 child nodes.
-  Losing detail is worse than having a deep tree.
-- Read an existing project with `read_project` before overwriting it: `write_project`
-  REPLACES the whole tree."""
+def _skill_body(key: str) -> str:
+    return _strip_front_matter(skills_domain.SKILLS.get(key, ""))
 
 
 # ---------------- tools ----------------
@@ -225,11 +213,16 @@ Rules that matter:
 
 _TOOLS = [
     ("general_context", "read",
-     "READ THIS FIRST, before anything else. Explains what DiagraMind projects are, "
-     "which project types exist and what each one is for, the exact tree.json shape "
-     "expected, and the recommended workflow. Call it once at the start of a session "
-     "so you don't have to guess the format.",
-     {}, []),
+     "READ THIS FIRST, before creating or editing anything. Returns the DiagraMind "
+     "domain knowledge: the common format rules and the EXACT tree.json schema of each "
+     "project type (cart, freestyle, treeQuestionary, activities, object, editor, "
+     "orchestrator, documents), plus the recommended workflow. Pass `projectType` to "
+     "get only that type's schema and save tokens. Never guess the schema: the field "
+     "names are literal and a wrong shape produces an EMPTY project.",
+     {"projectType": {"type": "string",
+                      "description": "optional: cart | freestyle | treeQuestionary | "
+                                     "activities | object | editor | orchestrator | "
+                                     "documents. Omit to get them all."}}, []),
     ("list_projects", "read",
      "Lists the projects (diagrams) of the folder.",
      {}, []),
@@ -298,21 +291,37 @@ def _call_tool(ctx: dict, name: str, a: dict):
     fid, user = ctx["folder"]["id"], ctx["user"]
 
     if name == "general_context":
+        want = (a.get("projectType") or "").strip()
+        types = {}
+        for t, key in _SKILL_BY_TYPE.items():
+            if want and t != want:
+                continue
+            types[t] = _skill_body(key)
         return {
             "folder": {"id": fid, "name": ctx["folder"]["name"], "permission": ctx["perm"]},
             "whatIsThis": "DiagraMind projects are visual diagrams. Each project is one "
-                          "tree.json. This folder is one user's workspace in the "
-                          "DiagraMinder cloud.",
-            "projectTypes": PROJECT_TYPES,
-            "treeShape": TREE_SHAPE,
+                          "tree.json whose root field `type` decides the schema. This "
+                          "folder is one user's workspace in the DiagraMinder cloud.",
+            # Reglas comunes a TODOS los tipos (ids enteros, bumpear contadores, nunca
+            # cambiar `type`, colores hex, <br> para saltos de línea, …).
+            "format": _skill_body("diagramind-format"),
+            # Esquema EXACTO por tipo. Con `projectType` viene solo ese (menos tokens).
+            "schemas": types,
             "workflow": [
                 "1. `list_projects` to see what already exists.",
-                "2. `create_project` with a clear name (pick the type when you write the tree).",
-                "3. `write_project` with the full tree.json.",
-                "4. `save_project` to commit a version with a message.",
+                "2. If you are unsure, `read_project` on an existing project OF THE SAME "
+                "TYPE: a real example never lies.",
+                "3. `create_project`, then `write_project` following the schema of the "
+                "type EXACTLY (never invent or rename fields).",
+                "4. `read_project` again to confirm what got stored is what you meant.",
+                "5. `save_project` to commit a version with a message.",
                 "The user sees every change LIVE in the web; no reload needed.",
             ],
+            "commonMistake": "Inventing a shape like {\"nodes\":[...],\"edges\":[...]}. "
+                             "It does NOT exist in DiagraMind and produces a project "
+                             "that opens completely EMPTY. Follow `schemas` literally.",
         }
+
     if name == "list_projects":
         return {"projects": [{"id": p["id"], "name": p["name"]}
                              for p in store.list_projects(fid)]}
