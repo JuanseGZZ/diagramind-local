@@ -139,7 +139,7 @@ def _auth(token: str) -> dict:
         raise HTTPException(status_code=429, detail="rate limited — slow down")
     stamps.append(now)
     _RATE[row["id"]] = stamps
-    return {"folder": folder, "user": user, "perm": perm, "push": []}
+    return {"folder": folder, "user": user, "perm": perm, "push": [], "repo": []}
 
 
 def _resolve(ctx: dict, rel: str | None) -> tuple[str, str]:
@@ -170,11 +170,66 @@ def _mark_tree_touched(ctx: dict, rel: str) -> None:
             return
 
 
+
+# ---------------- contexto general (para que el modelo NO adivine) ----------------
+# Sin esto, un cliente MCP no sabe qué tipos de proyecto existen ni cómo se ve un
+# tree.json, y termina inventando estructuras que la web no puede abrir.
+
+PROJECT_TYPES = [
+    {"type": "cart", "label": "Cart",
+     "use": "Hierarchical card tree: each node is a card with title + rich description "
+            "and hangs from a parent. THE DEFAULT for breaking a topic into parts, "
+            "summaries, study material, org charts, taxonomies.",
+     "layouts": ["left-to-right", "organigram"]},
+    {"type": "freestyle", "label": "Freestyle",
+     "use": "Free canvas: loose nodes anywhere, arrows and shapes. Use when position "
+            "carries meaning (mind maps, sketches, flows without a strict hierarchy)."},
+    {"type": "treeQuestionary", "label": "Questionnaire",
+     "use": "Study questionnaire: questions with answers, to review a topic."},
+    {"type": "activities", "label": "Activities",
+     "use": "Activities with precedences (a task needs others to finish first). "
+            "Renders arrows or a Gantt-like view. Use for plans and schedules."},
+    {"type": "object", "label": "Object",
+     "use": "Dynamic classes and objects: build object graphs and generate JSON or "
+            "HTTP requests from them. Use to model data, not ideas."},
+    {"type": "orchestrator", "label": "AI Orchestrator",
+     "use": "A visual AI company: agents, resources, tasks and departments."},
+    {"type": "documents", "label": "Documents",
+     "use": "A library of documents (PDF, images, audio, text) with explorer + viewer."},
+    {"type": "editor", "label": "Editor",
+     "use": "Opens a real folder and edits its files, VSCode-style."},
+]
+
+TREE_SHAPE = """A project's content is a single `tree.json`. Minimum shape:
+
+{"type": "<one of the types above>", "nodes": [ ... ], "edges": [ ... ]}
+
+For `cart` (the usual one) each node looks like:
+
+{"id": "n1", "titulo": "Title", "descripcion": "<p>rich text, HTML allowed</p>",
+ "padre": "<id of the parent, or null for the root>"}
+
+Rules that matter:
+- `id` must be unique inside the project; `padre` must point to an existing id.
+- Exactly one node with `padre: null` (the root).
+- `descripcion` accepts HTML: use <p>, <b>, <ul><li> to keep the source's detail.
+- DON'T flatten information: if the source has 5 bullet points, make 5 child nodes.
+  Losing detail is worse than having a deep tree.
+- Read an existing project with `read_project` before overwriting it: `write_project`
+  REPLACES the whole tree."""
+
+
 # ---------------- tools ----------------
 # (name, permiso requerido, description, propiedades del inputSchema, required)
 # Las descriptions van al MODELO (MCP) → en inglés, ver doc 20 §L.
 
 _TOOLS = [
+    ("general_context", "read",
+     "READ THIS FIRST, before anything else. Explains what DiagraMind projects are, "
+     "which project types exist and what each one is for, the exact tree.json shape "
+     "expected, and the recommended workflow. Call it once at the start of a session "
+     "so you don't have to guess the format.",
+     {}, []),
     ("list_projects", "read",
      "Lists the projects (diagrams) of the folder.",
      {}, []),
@@ -242,6 +297,22 @@ def _call_tool(ctx: dict, name: str, a: dict):
         raise ToolError("este MCP es de solo lectura (ACL read)")
     fid, user = ctx["folder"]["id"], ctx["user"]
 
+    if name == "general_context":
+        return {
+            "folder": {"id": fid, "name": ctx["folder"]["name"], "permission": ctx["perm"]},
+            "whatIsThis": "DiagraMind projects are visual diagrams. Each project is one "
+                          "tree.json. This folder is one user's workspace in the "
+                          "DiagraMinder cloud.",
+            "projectTypes": PROJECT_TYPES,
+            "treeShape": TREE_SHAPE,
+            "workflow": [
+                "1. `list_projects` to see what already exists.",
+                "2. `create_project` with a clear name (pick the type when you write the tree).",
+                "3. `write_project` with the full tree.json.",
+                "4. `save_project` to commit a version with a message.",
+                "The user sees every change LIVE in the web; no reload needed.",
+            ],
+        }
     if name == "list_projects":
         return {"projects": [{"id": p["id"], "name": p["name"]}
                              for p in store.list_projects(fid)]}
@@ -253,6 +324,7 @@ def _call_tool(ctx: dict, name: str, a: dict):
         return {"commits": git_ops.log(_project(ctx, a["projectId"])["id"])}
     if name == "create_project":
         p = store.create_project(fid, a["name"], user["id"])
+        ctx["repo"].append({"action": "created", "projectId": p["id"], "name": p["name"]})
         return {"id": p["id"], "name": p["name"]}
     if name == "write_project":
         pid = _project(ctx, a["projectId"])["id"]
@@ -274,6 +346,7 @@ def _call_tool(ctx: dict, name: str, a: dict):
             res["pushed"] = github.push()
         return res
     if name == "delete_project":
+        ctx["repo"].append({"action": "deleted", "projectId": a.get("projectId", "")})
         proj = _project(ctx, a["projectId"])
         if user["role"] != "admin" and proj["created_by"] != user["id"]:
             raise ToolError("solo el creador o un admin borran un proyecto")
@@ -416,6 +489,12 @@ async def mcp_endpoint(token: str, request: Request):
     if method == "tools/call":
         name, args = params.get("name") or "", params.get("arguments") or {}
         try:
+            # Cartelito "la IA está trabajando" en la web: se manda ANTES de ejecutar
+            # para que el usuario vea la ruedita durante la operación, no después.
+            await realtime.manager.notify_folder(ctx["folder"]["id"], {
+                "t": "mcp", "folderId": ctx["folder"]["id"], "tool": name,
+                "user": ctx["user"]["username"],
+            })
             res = _call_tool(ctx, name, args)
         except (ToolError, quota.QuotaExceeded) as e:
             return {"jsonrpc": "2.0", "id": rpc_id, "result": {
@@ -424,6 +503,12 @@ async def mcp_endpoint(token: str, request: Request):
             return _rpc_error(rpc_id, -32602, f"missing argument {e}")
         for pid in ctx["push"]:                                  # cambios de tree.json → EN VIVO
             await realtime.push_canonical(pid)
+        # Avisos a NIVEL CARPETA: la lista de proyectos cambió (crear/borrar/renombrar).
+        # Los rooms son por proyecto, así que uno recién creado no tiene a nadie
+        # suscrito: sin esto había que refrescar la página para verlo.
+        for ev in ctx.get("repo", []):
+            await realtime.manager.notify_folder(ctx["folder"]["id"],
+                                                 {"t": "repo", "folderId": ctx["folder"]["id"], **ev})
         text = res if isinstance(res, str) else json.dumps(res, ensure_ascii=False)
         return {"jsonrpc": "2.0", "id": rpc_id, "result": {
             "content": [{"type": "text", "text": text}]}}

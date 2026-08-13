@@ -51,6 +51,32 @@ class Room:
 class RoomManager:
     def __init__(self):
         self.rooms: dict[str, Room] = {}
+        # Registro GLOBAL de sockets (ws -> user). Los rooms son POR PROYECTO, así que
+        # sin esto no había forma de avisar cosas de CARPETA: "se creó un proyecto"
+        # (nadie está suscrito a uno que no existía) ni "el MCP está trabajando".
+        self.sockets: dict[WebSocket, dict] = {}
+
+    def register(self, ws: WebSocket, user: dict) -> None:
+        self.sockets[ws] = user
+
+    def unregister(self, ws: WebSocket) -> None:
+        self.sockets.pop(ws, None)
+
+    async def notify_folder(self, folder_id: str, msg: dict) -> None:
+        """Manda `msg` a todos los sockets cuyo usuario VE esa carpeta. Se re-chequea
+        el permiso en el momento (no se cachea): si alguien perdió el acceso, no le
+        llega."""
+        import store as _store
+        dead = []
+        for ws, user in list(self.sockets.items()):
+            try:
+                if _store.folder_permission(user, folder_id) == "none":
+                    continue
+                await ws.send_text(json.dumps(msg))
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.sockets.pop(ws, None)
 
     def _room(self, project_id: str) -> Room:
         r = self.rooms.get(project_id)
@@ -125,6 +151,7 @@ async def ws_endpoint(ws: WebSocket):
 
     member = {"id": user["id"], "username": user["username"],
               "color": _color_for(user["id"])}
+    manager.register(ws, user)          # canal de carpeta (proyecto nuevo / actividad MCP)
     joined: dict[str, str] = {}             # pid -> permiso efectivo ('read' | 'write')
 
     async def do_presence(pid: str):
@@ -217,6 +244,7 @@ async def ws_endpoint(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
+        manager.unregister(ws)
         for pid in list(joined):
             manager.leave(ws, pid)
             await do_presence(pid)

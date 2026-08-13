@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.12.0"   # + ACL por PROYECTO: compartir un documento suelto (doc 26 §5)
+VERSION = "0.13.0"   # + ACL por PROYECTO: compartir un documento suelto (doc 26 §5)
 NAME = "DiagraMind Connector"
 
 
