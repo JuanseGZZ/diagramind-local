@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.14.0"   # general_context servido desde las SKILLS del dominio
+VERSION = "0.15.0"   # el conector COMPARTIDO rechaza alojar editor/orchestrator
 NAME = "DiagraMind Connector"
 
 

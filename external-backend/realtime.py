@@ -26,7 +26,7 @@ import json
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from auth import consume_ws_ticket
-from projects import read_tree, write_tree
+from projects import TypeNotAllowed, read_tree, write_tree
 from quota import QuotaExceeded
 from store import project_permission
 
@@ -207,6 +207,15 @@ async def ws_endpoint(ws: WebSocket):
                     except QuotaExceeded as e:
                         # cuota llena: rechazar + reenviar el canónico → revierte lo optimista
                         await _send(ws, {"t": "error", "code": "quota_exceeded", "detail": str(e)})
+                        await _send(ws, {"t": "state", "projectId": pid,
+                                         "tree": read_tree(pid), "seq": room.seq})
+                        continue
+                    except TypeNotAllowed as e:
+                        # Tipo no alojable acá (Editor/Orchestrator en el free). Mismo
+                        # patrón que la cuota: se rechaza Y se reenvía el canónico,
+                        # para que el cliente revierta lo que puso optimista.
+                        await _send(ws, {"t": "error", "code": "type_not_allowed",
+                                         "detail": str(e), "treeType": e.tree_type})
                         await _send(ws, {"t": "state", "projectId": pid,
                                          "tree": read_tree(pid), "seq": room.seq})
                         continue

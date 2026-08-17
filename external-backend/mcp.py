@@ -39,7 +39,7 @@ from config import REPO_ROOT
 from db import connect
 from fs import GREP_FILE_CAP, MAX_ENTRIES, MAX_MATCHES, MAX_READ
 from models import McpTokenCreateBody, McpTokenRevokeBody
-from projects import read_tree, write_tree
+from projects import TypeNotAllowed, read_tree, write_tree
 
 router = APIRouter(tags=["mcp"])
 
@@ -342,6 +342,10 @@ def _call_tool(ctx: dict, name: str, a: dict):
             tree = json.dumps(tree)
         try:
             write_tree(pid, tree)
+        except TypeNotAllowed as e:
+            # Un asistente de IA tampoco puede meter un Editor/Orchestrator en una
+            # instancia compartida: el gate vive en write_tree, así que vale igual acá.
+            raise ToolError(str(e))
         except ValueError:
             raise ToolError("tree is not valid JSON")
         ctx["push"].append(pid)
