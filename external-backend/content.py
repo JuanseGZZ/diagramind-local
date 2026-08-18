@@ -109,6 +109,15 @@ def set_project_acl(body: SetProjectAclBody, user: dict = Depends(current_user))
     if not target or target["disabled"]:
         raise HTTPException(status_code=404, detail="user not found")
     store.set_project_acl(body.userId, body.projectId, body.permission, user["id"])
+    # Avisarle EN VIVO al afectado. Sin esto el revoke no era inmediato: el que perdía
+    # el acceso seguía viendo (y editando en su copia local) el documento hasta que
+    # recargaba la página. El aviso es best-effort — si no llega, el próximo sync lo
+    # corrige igual — pero en el caso normal el documento le desaparece al instante.
+    import realtime
+    realtime.manager.notify_user_soon(body.userId, {
+        "t": "acl", "projectId": body.projectId, "permission": body.permission,
+        "projectName": proj["name"],
+    })
     return {"ok": True, "projectId": body.projectId, "userId": body.userId,
             "permission": body.permission}
 

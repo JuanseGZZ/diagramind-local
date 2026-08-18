@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.15.0"   # el conector COMPARTIDO rechaza alojar editor/orchestrator
+VERSION = "0.16.0"   # aviso EN VIVO de cambio de ACL (revoke inmediato)
 NAME = "DiagraMind Connector"
 
 

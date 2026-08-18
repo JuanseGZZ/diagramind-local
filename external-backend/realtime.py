@@ -51,6 +51,7 @@ class Room:
 class RoomManager:
     def __init__(self):
         self.rooms: dict[str, Room] = {}
+        self.loop: asyncio.AbstractEventLoop | None = None   # ver register()
         # Registro GLOBAL de sockets (ws -> user). Los rooms son POR PROYECTO, así que
         # sin esto no había forma de avisar cosas de CARPETA: "se creó un proyecto"
         # (nadie está suscrito a uno que no existía) ni "el MCP está trabajando".
@@ -58,6 +59,39 @@ class RoomManager:
 
     def register(self, ws: WebSocket, user: dict) -> None:
         self.sockets[ws] = user
+        # El loop se captura acá porque `ws_endpoint` SÍ corre en él. Los endpoints
+        # REST de content.py son `def` (threadpool) y no pueden await: para avisarles
+        # algo a los clientes necesitan `notify_user_soon`, que usa esta referencia.
+        # Si nunca se conectó nadie, tampoco hay a quién avisar.
+        try:
+            self.loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+
+    async def notify_user(self, user_id: int, msg: dict) -> None:
+        """Manda `msg` a TODOS los sockets de ese usuario (puede tener varias pestañas)."""
+        data = json.dumps(msg)
+        dead = []
+        for ws, user in list(self.sockets.items()):
+            if user.get("id") != user_id:
+                continue
+            try:
+                await ws.send_text(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.sockets.pop(ws, None)
+
+    def notify_user_soon(self, user_id: int, msg: dict) -> None:
+        """Versión llamable desde código SÍNCRONO (los endpoints REST). Best-effort:
+        si el aviso no sale, el cliente igual se entera en el próximo sync."""
+        loop = getattr(self, "loop", None)
+        if loop is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self.notify_user(user_id, msg), loop)
+        except Exception:
+            pass
 
     def unregister(self, ws: WebSocket) -> None:
         self.sockets.pop(ws, None)
