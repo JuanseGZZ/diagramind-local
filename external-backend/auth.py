@@ -10,6 +10,7 @@ Flujo (ver [[25 - Conector Externo v2]] §3):
 import time
 
 from fastapi import APIRouter, Depends, Header, HTTPException
+from pydantic import BaseModel
 
 from db import connect
 from models import ChangePasswordBody, LoginBody, RefreshBody
@@ -21,6 +22,7 @@ from security import (
     new_ws_ticket,
     verify_password,
 )
+import config
 from config import WS_TICKET_TTL
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -44,11 +46,29 @@ def get_user_by_name(username: str) -> dict | None:
         return dict(r) if r else None
 
 
+def purge_refresh_tokens(conn, user_id=None) -> int:
+    """Barre los refresh que ya no sirven: EXPIRADOS y revocados hace rato.
+
+    Antes no se borraba ninguno —ni al rotar ni al salir— y la tabla solo crecía (§43).
+    Las revocadas se conservan `REVOKED_KEEP` para poder detectar el reuso de un token
+    robado; después no aportan nada.
+    """
+    now = int(time.time())
+    sql = ("DELETE FROM refresh_tokens WHERE (CAST(expires_at AS INTEGER) < ? "
+           "OR (revoked=1 AND CAST(strftime('%s', created_at) AS INTEGER) < ?))")
+    args = [now, now - config.REVOKED_KEEP]
+    if user_id is not None:
+        sql += " AND user_id = ?"
+        args.append(user_id)
+    return conn.execute(sql, args).rowcount
+
+
 def _issue_pair(user: dict) -> dict:
     """Emite access + refresh y persiste el jti del refresh."""
     access = make_access_token(user["id"], user["role"], user["token_version"])
     refresh, jti, exp = make_refresh_token(user["id"], user["token_version"])
     with connect() as c:
+        purge_refresh_tokens(c, user["id"])     # cada sesión nueva limpia lo suyo
         c.execute(
             "INSERT INTO refresh_tokens (jti, user_id, token_version, expires_at) VALUES (?,?,?,?)",
             (jti, user["id"], user["token_version"], str(exp)),
@@ -108,7 +128,8 @@ def refresh(body: RefreshBody):
         if not row or row["revoked"] or int(row["expires_at"]) < _now():
             raise HTTPException(status_code=401, detail="refresh not active")
         # rotación: revoca el viejo antes de emitir el nuevo
-        c.execute("UPDATE refresh_tokens SET revoked=1 WHERE jti=?", (jti,))
+        # BORRAR, no marcar: una sesión activa = UNA fila (§43).
+        c.execute("DELETE FROM refresh_tokens WHERE jti=?", (jti,))
     pair = _issue_pair(user)
     return {**pair, "role": user["role"], "mustChangePassword": bool(user["must_change_pw"])}
 
@@ -130,6 +151,40 @@ def change_password(body: ChangePasswordBody, user: dict = Depends(current_user)
     fresh = get_user_by_id(user["id"])
     pair = _issue_pair(fresh)            # devuelve un par nuevo para no desloguear
     return {**pair, "role": fresh["role"], "mustChangePassword": False}
+
+
+class LogoutBody(BaseModel):
+    refresh: str | None = None
+    all: bool = False
+
+
+@router.post("/logout")
+def logout(body: LogoutBody, authorization: str | None = Header(default=None)):
+    """Cierra sesión de verdad: borra el refresh en el server (§43).
+
+    Idempotente y sin fallar: si el token ya expiró igual queremos limpiar y contestar
+    OK — cerrar sesión no puede depender de que la sesión siga viva.
+    """
+    borrados = 0
+    uid = None
+    payload = decode_token(body.refresh) if body.refresh else None
+    if payload and payload.get("type") == "refresh":
+        uid = int(payload["sub"])
+        with connect() as c:
+            borrados = c.execute("DELETE FROM refresh_tokens WHERE jti=?",
+                                 (payload.get("jti"),)).rowcount
+    if body.all and authorization and authorization.lower().startswith("bearer "):
+        p2 = decode_token(authorization.split(" ", 1)[1].strip())
+        if p2 and p2.get("type") == "access":
+            uid = int(p2["sub"])
+            with connect() as c:
+                borrados += c.execute("DELETE FROM refresh_tokens WHERE user_id=?",
+                                      (uid,)).rowcount
+                c.execute("UPDATE users SET token_version = token_version + 1 WHERE id=?", (uid,))
+    if uid is not None:
+        with connect() as c:
+            purge_refresh_tokens(c, uid)
+    return {"ok": True, "closed": borrados}
 
 
 @router.post("/ws-ticket")

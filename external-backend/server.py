@@ -83,6 +83,18 @@ async def lifespan(app: FastAPI):
     config.ensure_home()
     init_db()
     bootstrap_admin()
+    # Barrido de arranque: hasta la §43 los refresh nunca se borraban (ni al rotar ni
+    # al salir), así que la tabla arrastra filas muertas.
+    try:
+        from db import connect as _c
+        from auth import purge_refresh_tokens as _purge
+        with _c() as _conn:
+            _n = _purge(_conn)
+        if _n:
+            print(f"[refresh] barridos {_n} tokens expirados/revocados", flush=True)
+    except Exception as _e:
+        print("[refresh] no se pudo barrer:", _e, flush=True)
+
     root = init_repo()
     orch.set_loop(asyncio.get_running_loop())   # broadcasts WS desde los threads del motor
     print(f"[connector] {config.NAME} v{config.VERSION}", flush=True)

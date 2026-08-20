@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.18.4"   # no-store en las respuestas de la API
+VERSION = "0.18.5"   # logout real + limpieza de refresh + TTL 5 días
 NAME = "DiagraMind Connector"
 
 
@@ -63,7 +63,12 @@ SHARED = os.environ.get("DMC_SHARED", "") not in ("", "0")
 
 # ---- tiempos (segundos) ----
 ACCESS_TTL = 15 * 60            # access JWT corto
-REFRESH_TTL = 30 * 24 * 60 * 60  # refresh largo (con rotación)
+# 5 días (era 30): un refresh es una llave de sesión larga; si se filtra, un mes de
+# acceso es demasiado. Ajustable por env sin rebuild.
+REFRESH_TTL = int(os.environ.get("DMC_REFRESH_TTL_DAYS", "5")) * 24 * 60 * 60
+# Las filas revocadas NO se borran al instante: un refresh que llega ya revocado es la
+# señal de que alguien reusa uno viejo (robo). Se conservan un rato y después se barren.
+REVOKED_KEEP = int(os.environ.get("DMC_REVOKED_KEEP_HOURS", "24")) * 60 * 60
 WS_TICKET_TTL = 30             # ticket de WS: muy corto, un solo uso
 
 JWT_ALG = "HS256"
