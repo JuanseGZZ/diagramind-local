@@ -105,6 +105,47 @@ app.add_middleware(
 )
 
 
+# ---------------- cabeceras de seguridad ----------------
+# Esto sirve JSON, no HTML, así que el riesgo es menor que en la web — pero las tres
+# de abajo corresponden igual y son gratis (auditoría del 2026-08-19, bitácora §41):
+#   • nosniff        : que un navegador no "adivine" que un JSON es HTML y lo ejecute.
+#   • frame-ancestors: una API no se embebe en ningún lado.
+#   • HSTS           : detrás de traefik esto siempre viaja por HTTPS.
+# `Referrer-Policy` va en no-referrer: las URLs de la API llevan ids de proyecto y no
+# tienen por qué salir en el Referer hacia terceros.
+# La CSP depende de QUÉ se responde. Esto sirve JSON casi siempre, pero también
+# devuelve HTML de verdad: el callback del SSO (que se completa con un <script>
+# INLINE que hace postMessage y cierra el popup) y el panel del operador (que carga
+# su propio CSS/JS). Una CSP `default-src 'none'` sobre esas páginas las deja muertas
+# —el login se queda en "Signing you in…" y el panel sin estilos— y así se rompieron
+# las dos en producción el 2026-08-20 (bitácora §41).
+_CSP_JSON = "default-src 'none'; frame-ancestors 'none'"
+# `static.cloudflareinsights.com`: Cloudflare inyecta su beacon de Web Analytics
+# también en este dominio. Bloquearlo no suma (ya está en el camino) y ensucia la
+# consola del panel.
+_CSP_HTML = ("default-src 'self'; "
+             "script-src 'self' 'unsafe-inline' https://static.cloudflareinsights.com; "
+             "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+             "connect-src 'self' https://cloudflareinsights.com; "
+             "base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+
+
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    resp = await call_next(request)
+    es_html = "text/html" in (resp.headers.get("content-type") or "")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Content-Security-Policy", _CSP_HTML if es_html else _CSP_JSON)
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    # Nada de esto se cachea: son respuestas con datos de sesión, y el panel es HTML
+    # sin `?v=`. Sin esto, un cambio de CABECERA (una CSP, por ejemplo) queda pegado en
+    # el navegador de quien ya cargó la página, y el arreglo "no llega" — pasó el
+    # 2026-08-20 con el panel (§42).
+    resp.headers.setdefault("Cache-Control", "no-store")
+    return resp
+
+
 @app.get("/health")
 def health():
     """Público: detección del conector + esquema de auth (+ flags SaaS, doc 26 §3)."""

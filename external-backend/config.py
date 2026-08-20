@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.16.0"   # aviso EN VIVO de cambio de ACL (revoke inmediato)
+VERSION = "0.18.4"   # no-store en las respuestas de la API
 NAME = "DiagraMind Connector"
 
 

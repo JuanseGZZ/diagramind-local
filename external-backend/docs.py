@@ -19,6 +19,7 @@ Además:
 - **Cuota por carpeta** (`quota.ensure_room`) antes de escribir: en un despliegue
   compartido (SaaS, doc 26) los documentos son el contenido más pesado.
 """
+import ratelimit
 import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -81,6 +82,7 @@ def docs_get(projectId: str = Query(...), hash: str = Query(...),
 async def docs_put(request: Request, projectId: str = Query(...), hash: str = Query(...),
                    user: dict = Depends(current_user)):
     _need(user, projectId, "write")
+    ratelimit.check("docs_put", user["id"])
     data = await request.body()
     pdir = _project_dir(projectId)
     proj = store.get_project(projectId)

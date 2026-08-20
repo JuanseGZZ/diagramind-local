@@ -20,6 +20,7 @@ import config
 import git_ops
 import github
 import realtime
+import ratelimit
 import store
 from auth import current_user, require_admin
 from models import CommitBody, GithubConnectBody, IdBody, RollbackBody
@@ -60,6 +61,7 @@ def versions_status(id: str = Query(...), user: dict = Depends(current_user)):
 @router.post("/versions/commit")
 def versions_commit(body: CommitBody, user: dict = Depends(current_user)):
     _need(user, body.id, "write")
+    ratelimit.check("commit", user["id"])     # el botón Guardar es spameable (429)
     name, email = _author(user)
     msg = body.message or f"save {store.get_project(body.id)['name']} by {name}"
     try:
@@ -88,6 +90,7 @@ def versions_diff(id: str = Query(...), a: str | None = None, b: str | None = No
 @router.post("/versions/rollback")
 async def versions_rollback(body: RollbackBody, user: dict = Depends(current_user)):
     _need(user, body.id, "write")
+    ratelimit.check("restore", user["id"])
     name, email = _author(user)
     try:
         res = git_ops.rollback(body.id, body.commit, name, email)

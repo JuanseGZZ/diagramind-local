@@ -23,10 +23,11 @@ Protocolo JSON (campo `t` = tipo):
 import asyncio
 import json
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 
 from auth import consume_ws_ticket
 from projects import TypeNotAllowed, read_tree, write_tree
+import ratelimit
 from quota import QuotaExceeded
 from store import project_permission
 
@@ -224,6 +225,18 @@ async def ws_endpoint(ws: WebSocket):
             elif t == "edit":
                 if not pid or pid not in joined:
                     await _send(ws, {"t": "error", "code": "not_open", "detail": "open the project first"})
+                    continue
+                # Cada `edit` ESCRIBE el árbol en disco y lo difunde a la sala: es la
+                # operación más cara del socket. La web manda con debounce (unas pocas
+                # por minuto), así que 120/min es holgado — y corta a quien tenga el
+                # socket abierto mandando en bucle. Los `cursor` NO se limitan: son
+                # baratos, no tocan disco, y limitarlos rompería la colaboración.
+                try:
+                    ratelimit.check("ws_edit", user["id"])
+                except HTTPException as e:
+                    await _send(ws, {"t": "error", "code": "rate_limited",
+                                     "detail": e.detail,
+                                     "retryAfter": int((e.headers or {}).get("Retry-After", 0) or 0)})
                     continue
                 if joined[pid] != "write":
                     # read-only: rechazar y reenviar el estado canónico → revierte lo optimista
