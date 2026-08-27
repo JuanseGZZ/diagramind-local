@@ -68,7 +68,7 @@ DEFAULT_PORT = 8765
 # del orquestador necesitan la URL propia para hablarle al MCP del editor.
 PORT = DEFAULT_PORT
 NAME = "diagramind-local"
-VERSION = "0.31.0"   # panel de control: ventana propia con CLIs (instalación rápida), contraseña y proyectos
+VERSION = "0.32.0"   # editor: verifica el repo al conectar, historial real del remoto, sin versiones vacías
 
 # ===================== rutas / disco =====================
 
