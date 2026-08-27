@@ -1509,7 +1509,15 @@ def snapshot_resources(ctx, run, graph, node):
                 svd = ctx["sv_dir_of"](rpid)
                 target = editorfs.get_target(ctx["app_dir"], rpid)
                 if svd and target:
-                    sourcever.sv_save(svd, target, f"IA ({name})", f"(auto) run {run['id']}: turno de {name}")
+                    try:
+                        sourcever.sv_save(svd, target, f"IA ({name})",
+                                          f"(auto) run {run['id']}: turno de {name}")
+                    except sourcever.SvError as e:
+                        # sin cambios desde la última versión no hay nada que
+                        # guardar: ESA versión ya es el estado previo al turno.
+                        # No es un fallo — loguearlo como tal asustaba de gratis.
+                        if e.msg != sourcever.NOTHING_NEW:
+                            raise
             else:
                 src = ctx["tree_path_of"](rpid)
                 if src and os.path.isfile(src):

@@ -155,15 +155,24 @@ def svgit_log(projectId: str = Query(...), n: int = 20, user: dict = Depends(cur
 @router.post("/svgit/connect")
 def svgit_connect(body: GhConnectBody, user: dict = Depends(require_admin)):
     _, target = _ctx(body.projectId)
+    remote = body.remoteUrl.strip()
+    token = (body.token or "").strip()
+    branch = (body.branch or "main").strip() or "main"
+    # El remoto se VERIFICA contra el servidor real antes de guardar nada: conectar
+    # a un repo que no existe dejaba la UI diciendo "conectado" y el error recién
+    # aparecía en el primer push. Va acá, en el SERVIDOR: una guarda en el cliente
+    # se saltea llamando la API directo.
+    chk = _gh_run(lambda: svgit.gh_verify(remote, token, branch, target))
     with connect() as c:
         c.execute(
             "INSERT INTO editor_github (project_id, remote_url, token, branch) VALUES (?,?,?,?) "
             "ON CONFLICT(project_id) DO UPDATE SET remote_url=excluded.remote_url, "
             "token=excluded.token, branch=excluded.branch",
-            (body.projectId, body.remoteUrl.strip(), (body.token or "").strip(),
-             (body.branch or "main").strip() or "main"),
+            (body.projectId, remote, token, branch),
         )
-    return svgit.gh_status(_gh_conn(body.projectId), target)
+    out = svgit.gh_status(_gh_conn(body.projectId), target)
+    out["branchExists"] = chk["branchExists"]
+    return out
 
 
 @router.post("/svgit/disconnect")

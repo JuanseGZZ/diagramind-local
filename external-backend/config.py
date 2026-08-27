@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.18.5"   # logout real + limpieza de refresh + TTL 5 días
+VERSION = "0.18.6"   # presencia por persona + verificación del repo + sin versiones vacías
 NAME = "DiagraMind Connector"
 
 

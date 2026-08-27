@@ -918,15 +918,27 @@ class Handler(BaseHTTPRequestHandler):
             if not pid or not b.get("remoteUrl"):
                 self._json(400, {"error": "faltan projectId o remoteUrl"})
                 return
-            if not editorfs.get_target(app_dir(), pid):
+            target = editorfs.get_target(app_dir(), pid)
+            if not target:
                 self._json(400, {"error": "editor target not set"})
                 return
+            # El remoto se VERIFICA antes de guardar: conectar a un repo que no
+            # existe dejaba la UI diciendo "conectado" y el error aparecía recién
+            # en el primer push.
+            remote = b["remoteUrl"].strip()
+            token = (b.get("token") or "").strip()
+            branch = (b.get("branch") or "main").strip() or "main"
+            try:
+                chk = svgit.gh_verify(remote, token, branch, target)
+            except svgit.GitError as e:
+                self._json(e.code, {"error": e.msg})
+                return
             data = gh_conn_read()
-            data[pid] = {"remoteUrl": b["remoteUrl"].strip(),
-                         "token": (b.get("token") or "").strip(),
-                         "branch": (b.get("branch") or "main").strip() or "main"}
+            data[pid] = {"remoteUrl": remote, "token": token, "branch": branch}
             gh_conn_write(data)
-            self._json(200, svgit.gh_status(data[pid], editorfs.get_target(app_dir(), pid)))
+            out = svgit.gh_status(data[pid], target)
+            out["branchExists"] = chk["branchExists"]
+            self._json(200, out)
         elif path == "/svgit/disconnect":
             b = self._read_json()
             data = gh_conn_read()

@@ -134,11 +134,25 @@ class RoomManager:
         return room
 
     def presence(self, project_id: str) -> list[dict]:
+        """Quiénes están en la sala: PERSONAS, no sockets.
+
+        Una persona con dos pestañas abiertas son dos WebSockets, y la lista salía
+        con el mismo nombre repetido ("juan · juan · 2 en línea"). Se agrupa por
+        usuario y se informa cuántas sesiones tiene (`sessions`), que es lo que de
+        verdad quiere saber quien mira: cuánta gente hay.
+        """
         room = self.rooms.get(project_id)
         if not room:
             return []
-        return [{"id": m["id"], "username": m["username"], "color": m["color"]}
-                for m in room.members.values()]
+        por_usuario: dict = {}
+        for m in room.members.values():
+            uid = m["id"]
+            if uid in por_usuario:
+                por_usuario[uid]["sessions"] += 1
+            else:
+                por_usuario[uid] = {"id": uid, "username": m["username"],
+                                    "color": m["color"], "sessions": 1}
+        return list(por_usuario.values())
 
     async def broadcast(self, project_id: str, msg: dict, exclude: WebSocket | None = None) -> None:
         room = self.rooms.get(project_id)

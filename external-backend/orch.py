@@ -1525,7 +1525,15 @@ def snapshot_resources(ctx, run, graph, node):
         try:
             if meta.get("type") == "editor":
                 svd, target = _sv_ctx(rpid)
-                sourcever.sv_save(svd, target, f"IA ({name})", f"(auto) run {run['id']}: turno de {name}")
+                try:
+                    sourcever.sv_save(svd, target, f"IA ({name})",
+                                      f"(auto) run {run['id']}: turno de {name}")
+                except sourcever.SvError as e:
+                    # sin cambios desde la última versión no hay nada que guardar:
+                    # ESA versión ya es el estado previo al turno. Es el mismo
+                    # criterio que la rama de git_ops de acá abajo.
+                    if e.msg != sourcever.NOTHING_NEW:
+                        raise
             elif git_ops.has_changes(rpid):
                 # commit del estado SIN guardar: eso ES el snapshot previo (si no hay
                 # cambios, HEAD ya es el estado previo y no hace falta nada)

@@ -70,7 +70,7 @@ def _walk(target):
                 continue
             out[os.path.relpath(fp, base)] = fp
             if len(out) > MAX_FILES:
-                raise SvError(400, f"el proyecto tiene más de {MAX_FILES} archivos versionables")
+                raise SvError(400, f"the project has more than {MAX_FILES} versionable files")
     return out
 
 
@@ -114,13 +114,30 @@ def _get(sv_dir, vid):
     for m in _read_index(sv_dir):
         if m["id"] == vid:
             return m
-    raise SvError(404, f"no existe la versión {vid}")
+    raise SvError(404, f"version {vid} does not exist")
 
 
 # ---------------- API ----------------
 
-def sv_save(sv_dir, target, author, note):
-    """Snapshot de todos los archivos del target. Devuelve la metadata."""
+NOTHING_NEW = "Nothing to save: the project hasn't changed since the last version."
+
+
+def sv_save(sv_dir, target, author, note, force=False):
+    """Snapshot de todos los archivos del target. Devuelve la metadata.
+
+    SIN CAMBIOS no se guarda: una versión idéntica a la anterior es ruido que
+    hace más difícil encontrar la que importa (y con un par de clics distraídos
+    el historial se llena de copias iguales). La regla vive acá, en el servidor,
+    no en el botón: la web, la IA por tools y el MCP entran todos por esta puerta.
+
+    `force` la saltea, y lo usa UNA sola cosa: el snapshot de seguridad de
+    `sv_restore`, que corre justo antes de pisar los archivos y tiene que existir
+    aunque no haya nada nuevo — es la red para deshacer el propio restore.
+    """
+    if not force:
+        st = sv_status(sv_dir, target)
+        if st["versionId"] and not st["changes"]:
+            raise SvError(400, NOTHING_NEW)
     files = _walk(target)
     vid = f"v{int(time.time() * 1000):x}"
     dest = os.path.join(sv_dir, vid)
@@ -181,7 +198,7 @@ def sv_diff(sv_dir, target, vid, path):
         raise SvError(404, "el archivo no existe ni en el snapshot ni en el target")
     lines = difflib.unified_diff(
         (old or "").splitlines(keepends=True), (new or "").splitlines(keepends=True),
-        fromfile=f"{vid or '(sin versión)'}/{path}", tofile=f"actual/{path}",
+        fromfile=f"{vid or '(no version)'}/{path}", tofile=f"current/{path}",
     )
     return {"diff": "".join(lines) or "(sin cambios)"}
 
@@ -190,7 +207,7 @@ def sv_restore(sv_dir, target, vid, author):
     """Vuelve el target al snapshot `vid`. ANTES hace un snapshot de seguridad
     (para poder deshacer el propio restore). Devuelve {restored, pre}."""
     _get(sv_dir, vid)
-    pre = sv_save(sv_dir, target, author, f"(auto) antes de restaurar {vid}")
+    pre = sv_save(sv_dir, target, author, f"(auto) before restoring {vid}", force=True)
     base = os.path.realpath(target)
     snap = _snap_files(sv_dir, vid)
     cur = _walk(target)

@@ -119,8 +119,25 @@ def _get(sv_dir, vid):
 
 # ---------------- API ----------------
 
-def sv_save(sv_dir, target, author, note):
-    """Snapshot de todos los archivos del target. Devuelve la metadata."""
+NOTHING_NEW = "Nothing to save: the project hasn't changed since the last version."
+
+
+def sv_save(sv_dir, target, author, note, force=False):
+    """Snapshot de todos los archivos del target. Devuelve la metadata.
+
+    SIN CAMBIOS no se guarda: una versión idéntica a la anterior es ruido que
+    hace más difícil encontrar la que importa (y con un par de clics distraídos
+    el historial se llena de copias iguales). La regla vive acá, en el servidor,
+    no en el botón: la web, la IA por tools y el MCP entran todos por esta puerta.
+
+    `force` la saltea, y lo usa UNA sola cosa: el snapshot de seguridad de
+    `sv_restore`, que corre justo antes de pisar los archivos y tiene que existir
+    aunque no haya nada nuevo — es la red para deshacer el propio restore.
+    """
+    if not force:
+        st = sv_status(sv_dir, target)
+        if st["versionId"] and not st["changes"]:
+            raise SvError(400, NOTHING_NEW)
     files = _walk(target)
     vid = f"v{int(time.time() * 1000):x}"
     dest = os.path.join(sv_dir, vid)
@@ -190,7 +207,7 @@ def sv_restore(sv_dir, target, vid, author):
     """Vuelve el target al snapshot `vid`. ANTES hace un snapshot de seguridad
     (para poder deshacer el propio restore). Devuelve {restored, pre}."""
     _get(sv_dir, vid)
-    pre = sv_save(sv_dir, target, author, f"(auto) antes de restaurar {vid}")
+    pre = sv_save(sv_dir, target, author, f"(auto) before restoring {vid}", force=True)
     base = os.path.realpath(target)
     snap = _snap_files(sv_dir, vid)
     cur = _walk(target)
