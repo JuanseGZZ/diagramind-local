@@ -62,7 +62,7 @@ Los binarios oficiales los hace el CI; ver [COMPILAR.md](COMPILAR.md).
 
 | Método | Ruta      | Respuesta |
 |--------|-----------|-----------|
-| GET    | `/health` | `{ "status": "ok", "name": "diagramind-local", "version": "0.1.0" }` |
+| GET    | `/health` | `{ "status": "ok", "name": "diagramind-local", "version": "0.32.0" }` |
 
 ## Seguridad
 

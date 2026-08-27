@@ -85,9 +85,25 @@ El conector **comparte el repo** `diagramind-local` con el backend local, pero t
   en `external-backend/config.py`.
 
 ```bash
-# parado en el repo, para publicar el conector:
-git tag connector-v0.6.0 && git push origin connector-v0.6.0
+# parado en el repo, para publicar el conector (el tag = la VERSION de config.py):
+git tag connector-v0.18.6 && git push origin connector-v0.18.6
 ```
+
+### Tests (antes de taggear)
+
+Levantan **servers reales** con HOME temporal y puerto libre: no hace falta docker
+ni cluster, y no tocan datos de nadie.
+
+```bash
+.venv/bin/python tests/test_project_acl.py      # 24 · permisos por proyecto
+.venv/bin/python tests/test_shared_types.py     # 15 · el compartido no aloja editor/orch
+.venv/bin/python tests/test_acl_live.py         # 11 · revoke en vivo por WS
+.venv/bin/python tests/test_editor_github.py    # 42 · versiones + GitHub del proyecto editor
+.venv/bin/python tests/test_presence.py         #  5 · presencia por PERSONA, no por socket
+.venv/bin/python tests/pentest_connector.py     # 32 · ataques (JWT, IDOR, traversal, WS)
+```
+
+Un tag publica binarios y un Release público: correlos antes.
 
 Los releases del conector se marcan **`prerelease: true`**. Motivo: GitHub
 `releases/latest` apunta al release más nuevo **no-prerelease** del repo; el backend
