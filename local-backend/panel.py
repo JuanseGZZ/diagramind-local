@@ -48,10 +48,16 @@ START_TS = time.time()
 SH_SCRIPT = {                     # macOS / Linux
     "claude": "curl -fsSL https://claude.ai/install.sh | bash",
     "codex": "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+    # Antigravity CLI (`agy`). Binario compilado, sin Node ni Python: cae en
+    # ~/.local/bin, que ya está en las rutas que prueba `_find_bin`. Verificado que la
+    # URL sirve el script de verdad (application/x-sh con shebang), no la SPA del sitio
+    # — un `curl | bash` que se traga un HTML es la clase de bug que no avisa.
+    "antigravity": "curl -fsSL https://antigravity.google/cli/install.sh | bash",
 }
 PS_SCRIPT = {                     # Windows (PowerShell)
     "claude": "irm https://claude.ai/install.ps1 | iex",
     "codex": "irm https://chatgpt.com/codex/install.ps1 | iex",
+    "antigravity": "irm https://antigravity.google/cli/install.ps1 | iex",
 }
 GEMINI_REPO = "google-gemini/gemini-cli"
 GEMINI_NPM = "npm install -g @google/gemini-cli"
@@ -61,6 +67,7 @@ DOCS = {
     "claude": "https://docs.claude.com/en/docs/claude-code/setup",
     "codex": "https://developers.openai.com/codex/cli/",
     "gemini": "https://github.com/google-gemini/gemini-cli",
+    "antigravity": "https://antigravity.google/docs/cli/install/",
 }
 
 
