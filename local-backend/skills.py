@@ -96,8 +96,8 @@ SKILLS = dict([
     ),
     _skill(
         "diagramind-cart",
-        "Hierarchical tree of cards (type `cart`, ltr/organigram layouts).",
-        "# Type cart (hierarchical)\n\n"
+        "The Organigram mode: hierarchical tree of cards (type `cart`), drawn top-down.",
+        "# Type cart — the Organigram mode (hierarchical)\n\n"
         "A multi-level tree of cards. EXACT `tree.json` schema:\n\n"
         "```json\n"
         "{\n"
