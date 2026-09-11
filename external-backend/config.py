@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.18.7"   # presencia por persona + verificación del repo + sin versiones vacías
+VERSION = "0.18.8"   # el tipo cart se presenta como "the Organigram mode" en las skills
 NAME = "DiagraMind Connector"
 
 
