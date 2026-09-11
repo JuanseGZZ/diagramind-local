@@ -50,7 +50,8 @@ from urllib.parse import urlparse, parse_qs
 
 # módulos desacoplados (ver claude.py / codex.py / gemini.py / cli_base.py / etc.)
 from util import safe_name, safe_file_name
-from runs import RUNS, RUNS_LOCK, SESSION_MAP, new_run, emit
+from runs import (RUNS, RUNS_LOCK, SESSION_MAP, new_run, emit,
+                  perm_ask, perm_answer)
 import docsfs
 import editorfs
 import orchestrator
@@ -68,7 +69,7 @@ DEFAULT_PORT = 8765
 # del orquestador necesitan la URL propia para hablarle al MCP del editor.
 PORT = DEFAULT_PORT
 NAME = "diagramind-local"
-VERSION = "0.33.1"   # "Elegir ubicación" anda en el binario (--pick-dir en vez de sys.executable -c)
+VERSION = "0.33.2"   # permisos en vivo: el chat headless pregunta y vos aceptás en la web
 
 # ===================== rutas / disco =====================
 
@@ -884,6 +885,10 @@ class Handler(BaseHTTPRequestHandler):
             self._state_write(self._read_json())
         elif path == "/chat":
             self._chat(self._read_json())
+        elif path == "/chat/permission/ask":
+            self._perm_ask(self._read_json())
+        elif path == "/chat/permission/answer":
+            self._perm_answer(self._read_json())
         elif path == "/chat/cancel":
             self._cancel(parse_qs(urlparse(self.path).query).get("runId", [None])[0])
         elif path == "/fetch":
@@ -1449,6 +1454,9 @@ class Handler(BaseHTTPRequestHandler):
         effort = body.get("effort")
 
         run = new_run()
+        # cómo el subproceso MCP de permisos vuelve a hablarnos (claude.py lo cablea)
+        run["local_url"] = f"http://{HOST}:{PORT}"
+        run["local_token"] = get_token()
 
         def worker():
             run_cli(run, adapter, work_dir, message, mode, model, resume, name, folder,
@@ -1458,6 +1466,31 @@ class Handler(BaseHTTPRequestHandler):
 
         threading.Thread(target=worker, daemon=True).start()
         self._json(200, {"runId": run["id"]})
+
+    def _perm_ask(self, body):
+        """Lo llama permission_mcp.py (el subproceso MCP): emite el pedido al chat y
+        BLOQUEA hasta que el usuario conteste. El server es ThreadingHTTPServer, así
+        que esta espera no frena al resto."""
+        with RUNS_LOCK:
+            run = RUNS.get(body.get("runId"))
+        if not run:
+            self._json(404, {"error": "run no encontrado"})
+            return
+        ans = perm_ask(run, body.get("tool") or "", body.get("input") or {},
+                       body.get("toolUseId") or "")
+        self._json(200, ans)
+
+    def _perm_answer(self, body):
+        """Lo llama la WEB cuando apretás Permitir / Rechazar en la tarjeta."""
+        with RUNS_LOCK:
+            run = RUNS.get(body.get("runId"))
+        if not run:
+            self._json(404, {"error": "run no encontrado"})
+            return
+        ok = perm_answer(run, body.get("id") or "", body.get("decision") or "deny",
+                         body.get("message"), body.get("input"))
+        self._json(200 if ok else 409,
+                   {"ok": ok} if ok else {"error": "ese pedido ya no espera respuesta"})
 
     def _cancel(self, rid):
         with RUNS_LOCK:
@@ -1596,6 +1629,10 @@ def _instance_alive(port):
 def main():
     # modo MCP (doc 27, fase 4): re-ejecución de este mismo binario/script como
     # MCP server stdio de fs para editores EXTERNOS (lo lanza Claude Code).
+    if "--mcp-permission" in sys.argv:
+        import permission_mcp
+        permission_mcp.main()
+        return
     if "--mcp-fs" in sys.argv:
         import editor_mcp
         editor_mcp.main()

@@ -139,25 +139,47 @@ class ClaudeAdapter:
         ]
         if editor_target:
             cmd += ["--add-dir", editor_target]
+
+        # ---- servidores MCP (UN solo --mcp-config: la CLI toma el último) ----
+        servers = {}
         if editor_relay:
             # editor EXTERNO: MCP server stdio (este mismo backend con --mcp-fs) con
-            # las credenciales del conector. El config va a un temp file 0600 (tiene
-            # el token) que se borra en finalize().
-            mcp = {"mcpServers": {"dmfs": {
+            # las credenciales del conector.
+            servers["dmfs"] = {
                 **_self_cmd(),
                 "env": {
                     "DMFS_URL": editor_relay["url"],
                     "DMFS_TOKEN": editor_relay["token"],
                     "DMFS_PROJECT": editor_relay["projectId"],
                 },
-            }}}
-            fd, cfg = tempfile.mkstemp(prefix=f"dmfs-mcp-{run['id']}-", suffix=".json")
+            }
+        # PERMISOS EN VIVO: sin esto, headless, todo lo que pida aprobación se
+        # auto-deniega y el modelo lo cuenta como que "no puede" (bitácora §66).
+        # Con esto la CLI nos pregunta y la pregunta sale en el chat de la web.
+        perm = bool(run.get("local_url") and run.get("local_token"))
+        if perm:
+            servers["dmperm"] = {
+                "command": _self_cmd()["command"],
+                "args": [a if a != "--mcp-fs" else "--mcp-permission" for a in _self_cmd()["args"]],
+                "env": {
+                    "DMPERM_URL": run["local_url"],
+                    "DMPERM_TOKEN": run["local_token"],
+                    "DMPERM_RUN": run["id"],
+                },
+            }
+        if servers:
+            # el config va a un temp file 0600 (tiene tokens) que se borra en finalize()
+            fd, cfg = tempfile.mkstemp(prefix=f"dm-mcp-{run['id']}-", suffix=".json")
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(mcp, f)
+                json.dump({"mcpServers": servers}, f)
             os.chmod(cfg, 0o600)
             run["_mcp_cfg"] = cfg
-            allowed = ",".join(f"mcp__dmfs__{t}" for t in MCP_FS_TOOLS)
-            cmd += ["--mcp-config", cfg, "--allowedTools", allowed]
+            cmd += ["--mcp-config", cfg]
+            if editor_relay:
+                allowed = ",".join(f"mcp__dmfs__{t}" for t in MCP_FS_TOOLS)
+                cmd += ["--allowedTools", allowed]
+            if perm:
+                cmd += ["--permission-prompt-tool", "mcp__dmperm__approve"]
         if resume:
             cmd += ["--resume", str(resume)]
         return cmd, {}
