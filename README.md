@@ -6,7 +6,7 @@ y su CI independientes**:
 
 | Pieza | Carpeta | Qué es | Versión en | Tag que compila |
 |---|---|---|---|---|
-| **Backend local** | `local-backend/` | el programita de escritorio (un usuario, su PC) | `server.py` → `VERSION` | `v*` (ej. `v0.33.0`) |
+| **Backend local** | `local-backend/` | el programita de escritorio (un usuario, su PC) | `server.py` → `VERSION` | `v*` (ej. `v0.33.1`) |
 | **Conector externo** | `external-backend/` | server multiusuario (carpetas, proyectos, WS en vivo, MCP) | `config.py` → `VERSION` | `connector-v*` (ej. `connector-v0.18.7`) |
 
 Los dos números **no** van juntos: el local puede ir en 0.32 y el conector en

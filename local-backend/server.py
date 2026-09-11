@@ -68,7 +68,7 @@ DEFAULT_PORT = 8765
 # del orquestador necesitan la URL propia para hablarle al MCP del editor.
 PORT = DEFAULT_PORT
 NAME = "diagramind-local"
-VERSION = "0.33.0"   # CLI Antigravity (agy) + fix chat/loop + entornos {{}} del modo object en la skill
+VERSION = "0.33.1"   # "Elegir ubicación" anda en el binario (--pick-dir en vez de sys.executable -c)
 
 # ===================== rutas / disco =====================
 
@@ -361,9 +361,12 @@ def resolve_tree_id(folder, dirname):
 # El navegador no expone la ruta real del sistema; el conector sí. Abrimos un
 # diálogo nativo (tkinter askdirectory) en un SUBPROCESO (Tk no es thread-safe y
 # el server es multi-thread) y devolvemos la ruta absoluta elegida.
-# NOTA: con el binario --onefile (sys.frozen) sys.executable es el binario, no
-# python, así que el subproceso -c no aplica; ahí habría que embeber un modo
-# "--pick-dir". Por ahora (dev: `python server.py`) funciona.
+# El subproceso es ESTE mismo programa en modo `--pick-dir` (ver main()). Antes era
+# `sys.executable -c "<script>"`, que solo anda con `python server.py`: en el binario
+# --onefile (sys.frozen) sys.executable ES el binario, el `-c` moría en el argparse
+# y la web recibía `cancelled` al instante sin que se abriera nada (0.33.0). Y como
+# tkinter solo aparecía dentro de ese string, PyInstaller ni lo empaquetaba: el
+# `import tkinter` de _pick_directory_dialog() tiene que ser un import de verdad.
 
 def reveal_in_explorer(path):
     """Abre el explorador del SO en `path`."""
@@ -380,19 +383,33 @@ def reveal_in_explorer(path):
         return False
 
 
-def pick_directory(title="Elegí una carpeta"):
-    script = (
-        "import tkinter, tkinter.filedialog as fd\n"
-        "r = tkinter.Tk(); r.withdraw()\n"
-        "try: r.attributes('-topmost', True)\n"
-        "except Exception: pass\n"
-        "p = fd.askdirectory(title=%r)\n"
-        "print(p or '')\n" % title
-    )
+def _pick_directory_dialog(title):
+    """Modo `--pick-dir`: abre el diálogo en ESTE proceso y devuelve la ruta ('' si cancela)."""
+    import tkinter
+    import tkinter.filedialog as fd
+    r = tkinter.Tk()
+    r.withdraw()
     try:
-        out = subprocess.run([sys.executable, "-c", script],
-                             capture_output=True, text=True, timeout=300,
-                             encoding="utf-8", errors="replace")
+        r.attributes("-topmost", True)
+    except Exception:
+        pass
+    p = fd.askdirectory(title=title)
+    r.destroy()
+    return p or ""
+
+
+def pick_directory(title="Elegí una carpeta"):
+    if getattr(sys, "frozen", False):
+        argv = [sys.executable, "--pick-dir", title]
+    else:
+        argv = [sys.executable, os.path.abspath(__file__), "--pick-dir", title]
+    # PyInstaller >= 6.9: que el hijo --onefile se desempaque solo en vez de heredar
+    # la carpeta temporal del padre.
+    env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")
+    kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=300,
+                             encoding="utf-8", errors="replace", env=env, **kw)
         path = (out.stdout or "").strip()
         return path or None
     except Exception:
@@ -1582,6 +1599,17 @@ def main():
     if "--mcp-fs" in sys.argv:
         import editor_mcp
         editor_mcp.main()
+        return
+
+    # modo selector de carpeta: lo lanza pick_directory() como subproceso.
+    if "--pick-dir" in sys.argv:
+        i = sys.argv.index("--pick-dir")
+        title = sys.argv[i + 1] if i + 1 < len(sys.argv) else "Elegí una carpeta"
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")   # rutas con acentos
+        except Exception:
+            pass
+        print(_pick_directory_dialog(title))
         return
 
     parser = argparse.ArgumentParser(description="DiagraMind backend local")
