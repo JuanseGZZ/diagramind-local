@@ -6,8 +6,8 @@ y su CI independientes**:
 
 | Pieza | Carpeta | Qué es | Versión en | Tag que compila |
 |---|---|---|---|---|
-| **Backend local** | `local-backend/` | el programita de escritorio (un usuario, su PC) | `server.py` → `VERSION` | `v*` (ej. `v0.32.0`) |
-| **Conector externo** | `external-backend/` | server multiusuario (carpetas, proyectos, WS en vivo, MCP) | `config.py` → `VERSION` | `connector-v*` (ej. `connector-v0.18.6`) |
+| **Backend local** | `local-backend/` | el programita de escritorio (un usuario, su PC) | `server.py` → `VERSION` | `v*` (ej. `v0.33.0`) |
+| **Conector externo** | `external-backend/` | server multiusuario (carpetas, proyectos, WS en vivo, MCP) | `config.py` → `VERSION` | `connector-v*` (ej. `connector-v0.18.7`) |
 
 Los dos números **no** van juntos: el local puede ir en 0.32 y el conector en
 0.18. Cada tag dispara **su** workflow y publica **sus** binarios.

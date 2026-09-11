@@ -68,7 +68,7 @@ DEFAULT_PORT = 8765
 # del orquestador necesitan la URL propia para hablarle al MCP del editor.
 PORT = DEFAULT_PORT
 NAME = "diagramind-local"
-VERSION = "0.32.0"   # editor: verifica el repo al conectar, historial real del remoto, sin versiones vacías
+VERSION = "0.33.0"   # CLI Antigravity (agy) + fix chat/loop + entornos {{}} del modo object en la skill
 
 # ===================== rutas / disco =====================
 
