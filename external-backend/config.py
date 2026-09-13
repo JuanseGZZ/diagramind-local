@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.18.9"   # las skills del canvas libre: todos los tipos de nodo y los grupos
+VERSION = "0.18.10"  # las skills: dónde va el texto de cada tipo y cómo se agrupa
 NAME = "DiagraMind Connector"
 
 

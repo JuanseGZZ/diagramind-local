@@ -69,7 +69,7 @@ DEFAULT_PORT = 8765
 # del orquestador necesitan la URL propia para hablarle al MCP del editor.
 PORT = DEFAULT_PORT
 NAME = "diagramind-local"
-VERSION = "0.33.4"   # el chat cuenta QUÉ hace, y las skills conocen todos los nodos
+VERSION = "0.33.5"   # la skill dice dónde va el texto de cada tipo y cómo se agrupa
 
 # ===================== rutas / disco =====================
 
