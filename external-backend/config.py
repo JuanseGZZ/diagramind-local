@@ -22,7 +22,7 @@ import shutil
 import sys
 from pathlib import Path
 
-VERSION = "0.18.8"   # el tipo cart se presenta como "the Organigram mode" en las skills
+VERSION = "0.18.9"   # las skills del canvas libre: todos los tipos de nodo y los grupos
 NAME = "DiagraMind Connector"
 
 

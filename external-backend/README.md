@@ -86,7 +86,7 @@ El conector **comparte el repo** `diagramind-local` con el backend local, pero t
 
 ```bash
 # parado en el repo, para publicar el conector (el tag = la VERSION de config.py):
-git tag connector-v0.18.8 && git push origin connector-v0.18.8
+git tag connector-v0.18.9 && git push origin connector-v0.18.9
 ```
 
 ### Tests (antes de taggear)

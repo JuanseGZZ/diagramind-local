@@ -73,9 +73,49 @@ def map_model(m):
     return m
 
 
+# Lo IMPORTANTE de lo que la tool va a hacer, en UNA línea: el comando, el archivo,
+# la URL. Es lo que la web muestra mientras el turno corre para que se vea que está
+# pasando algo (antes solo se decía "Running commands…" y un turno de 5 minutos parecía
+# colgado). Mismo criterio que la tarjeta de permisos. Bitácora §68.
+DETAIL_KEYS = ("command", "file_path", "path", "url", "pattern", "query",
+               "description", "prompt")
+DETAIL_MAX = 300
+
+
+def tool_detail(inp):
+    if not isinstance(inp, dict):
+        return ""
+    for k in DETAIL_KEYS:
+        v = inp.get(k)
+        if isinstance(v, str) and v.strip():
+            v = v.strip()
+            return v[:DETAIL_MAX] + ("…" if len(v) > DETAIL_MAX else "")
+    return ""
+
+
+def _result_text(block):
+    """El texto de un tool_result, que puede venir como str o como bloques."""
+    c = block.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(b.get("text", "") for b in c if isinstance(b, dict))
+    return ""
+
+
 def handle_event(run, obj):
     """Traduce los eventos JSONL de Claude Code a eventos simples para la web."""
     t = obj.get("type")
+
+    # resultado de una tool: la web tacha el paso (✓ / ✗). Va pareado por tool_use_id.
+    if t == "user":
+        for block in (obj.get("message", {}).get("content") or []):
+            if block.get("type") != "tool_result":
+                continue
+            ok = not block.get("is_error")
+            err = "" if ok else _result_text(block).strip()[:DETAIL_MAX]
+            emit(run, "tool-done", useId=block.get("tool_use_id"), ok=ok, error=err)
+        return
 
     if t == "system" and obj.get("subtype") == "init":
         run["claude_session_id"] = obj.get("session_id")
@@ -86,7 +126,8 @@ def handle_event(run, obj):
             if block.get("type") == "text" and block.get("text"):
                 emit(run, "assistant", text=block["text"])
             elif block.get("type") == "tool_use":
-                emit(run, "tool", name=block.get("name", "tool"))
+                emit(run, "tool", name=block.get("name", "tool"),
+                     detail=tool_detail(block.get("input")), useId=block.get("id"))
         return
 
     if t == "result":
