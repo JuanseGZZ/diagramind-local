@@ -50,7 +50,7 @@ from urllib.parse import urlparse, parse_qs
 
 # módulos desacoplados (ver claude.py / codex.py / gemini.py / cli_base.py / etc.)
 from util import safe_name, safe_file_name
-from runs import (RUNS, RUNS_LOCK, SESSION_MAP, new_run, emit,
+from runs import (RUNS, RUNS_LOCK, SESSION_MAP, new_run, emit, set_status,
                   perm_ask, perm_answer)
 import docsfs
 import editorfs
@@ -69,7 +69,7 @@ DEFAULT_PORT = 8765
 # del orquestador necesitan la URL propia para hablarle al MCP del editor.
 PORT = DEFAULT_PORT
 NAME = "diagramind-local"
-VERSION = "0.33.2"   # permisos en vivo: el chat headless pregunta y vos aceptás en la web
+VERSION = "0.33.3"   # un run SIEMPRE termina: los pipes de los MCP no cuelgan el turno
 
 # ===================== rutas / disco =====================
 
@@ -1459,10 +1459,16 @@ class Handler(BaseHTTPRequestHandler):
         run["local_token"] = get_token()
 
         def worker():
-            run_cli(run, adapter, work_dir, message, mode, model, resume, name, folder,
-                    effort, editor_target, editor_relay)
-            if adapter.supports_resume and run.get("claude_session_id") and skey:
-                SESSION_MAP[skey] = run["claude_session_id"]
+            # el estado TERMINAL lo garantiza run_cli (bitácora §67): la web espera ese
+            # evento por el SSE y no tiene otra forma de saber que el turno terminó.
+            # Acá solo queda que este hilo —daemon, se muere en silencio— no se lleve
+            # puesta la anotación de la sesión para el --resume.
+            try:
+                run_cli(run, adapter, work_dir, message, mode, model, resume, name, folder,
+                        effort, editor_target, editor_relay)
+            finally:
+                if adapter.supports_resume and run.get("claude_session_id") and skey:
+                    SESSION_MAP[skey] = run["claude_session_id"]
 
         threading.Thread(target=worker, daemon=True).start()
         self._json(200, {"runId": run["id"]})
@@ -1498,14 +1504,17 @@ class Handler(BaseHTTPRequestHandler):
         if not run:
             self._json(404, {"error": "run no encontrado"})
             return
-        run["status"] = "cancelled"
         proc = run.get("proc")
         if proc and proc.poll() is None:
             try:
                 proc.terminate()
             except Exception:
                 pass
-        emit(run, "status", status="cancelled")
+        # por set_status (y no a mano): es el que llama a perm_release. Si había un
+        # pedido de permiso esperando, el subproceso MCP que lo hizo quedaba colgado
+        # hasta el timeout de 15 min — y mientras tanto TIENE los pipes del CLI, así
+        # que el run no podía terminar nunca (bitácora §67).
+        set_status(run, "cancelled")
         self._json(200, {"ok": True})
 
     # --- proxy de fetch (resuelve CORS: el request lo hace el server, no el browser) ---

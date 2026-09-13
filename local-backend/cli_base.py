@@ -7,9 +7,15 @@ import glob
 import os
 import shutil
 import subprocess
+import threading
+import time
 
 from util import safe_name
 from runs import set_status
+
+# cuánto se espera a los pipes DESPUÉS de que el CLI ya murió (ver run_cli): si un
+# nieto los tiene tomados no se espera para siempre: el run tiene que poder terminar.
+PIPE_GRACE = 5.0
 
 
 # IDIOMA: estas notas van al MODELO (system prompt / prompt del CLI) → SIEMPRE en
@@ -149,7 +155,7 @@ def _bin_version(b):
         return None
 
 
-def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, folder,
+def _run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, folder,
             effort=None, editor_target=None, editor_relay=None):
     """Núcleo compartido: lanza el CLI, lee stdout línea a línea (cada adaptador
     parsea lo suyo), maneja cancelación y estado terminal.
@@ -189,17 +195,45 @@ def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, fo
     run["proc"] = proc
     set_status(run, "streaming")
 
-    for line in proc.stdout:
-        line = line.rstrip("\r\n")
-        if not line.strip():
-            continue
+    # stdout y stderr se leen en HILOS, y lo que da por terminado el turno es
+    # proc.wait() — NO el EOF de los pipes. No es cosmético: los servidores MCP que
+    # lanza Claude Code (editor_mcp / permission_mcp) son NIETOS que HEREDAN estos
+    # pipes, así que el pipe no da EOF hasta que muere el último nieto, aunque el
+    # `claude` ya haya terminado. Leyendo en este mismo hilo, un nieto colgado (un
+    # pedido de permiso esperando sus 15 minutos, por ejemplo) dejaba el run sin
+    # estado terminal PARA SIEMPRE, y el chat de la web ocupado sin salida (§67).
+    # De paso stderr ahora se drena: sin leerlo, a los ~64 KB se llena el pipe y el
+    # que se traba es el propio CLI.
+    errbuf = []
+
+    def _leer_stdout():
         try:
-            adapter.parse_line(run, line)
+            for line in proc.stdout:
+                line = line.rstrip("\r\n")
+                if not line.strip():
+                    continue
+                try:
+                    adapter.parse_line(run, line)
+                except Exception:
+                    pass
         except Exception:
             pass
 
-    proc.wait()
-    stderr = (proc.stderr.read() or "").strip()
+    def _leer_stderr():
+        try:
+            errbuf.append(proc.stderr.read() or "")
+        except Exception:
+            pass
+
+    hilos = [threading.Thread(target=f, daemon=True) for f in (_leer_stdout, _leer_stderr)]
+    for h in hilos:
+        h.start()
+
+    proc.wait()                      # el CLI terminó: los pipes pueden seguir abiertos
+    limite = time.monotonic() + PIPE_GRACE     # el margen es del conjunto, no por hilo
+    for h in hilos:
+        h.join(max(0.0, limite - time.monotonic()))
+    stderr = "".join(errbuf).strip()
     try:
         adapter.finalize(run)
     except Exception:
@@ -211,3 +245,19 @@ def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, fo
         set_status(run, "error", stderr or f"{adapter.label} exited with code {proc.returncode}")
     elif run["status"] not in ("done", "error"):
         set_status(run, "done")
+
+
+def run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, folder,
+            effort=None, editor_target=None, editor_relay=None):
+    """El núcleo, con la garantía que necesita el chat: un run SIEMPRE termina en un
+    estado terminal. La web espera ese evento por el SSE y no tiene otra forma de
+    enterarse de que el turno terminó: si no llega, el composer queda ocupado para
+    siempre (bitácora §67). Por eso ningún camino de _run_cli puede salir sin estado."""
+    try:
+        _run_cli(run, adapter, work_dir, message, mode, model, resume, focus_name, folder,
+                 effort, editor_target, editor_relay)
+    except Exception as e:
+        set_status(run, "error", f"The turn failed unexpectedly: {e}")
+    finally:
+        if run["status"] not in ("done", "error", "cancelled"):
+            set_status(run, "error", "The turn ended without a final status.")
