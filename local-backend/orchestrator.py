@@ -53,8 +53,11 @@ import tempfile
 
 import editorfs
 import sourcever
-from claude import EFFORT_THINK, find_claude, map_model, _self_cmd
-from skills import SKILLS as TYPE_SKILLS, install_skills
+from orch_cli import (CLI_DIAGRAM_TOOLS, CLI_DISALLOWED, CLI_SHELL_TOOLS, MCP_FS_EXEC,
+                      MCP_FS_READ, MCP_FS_WRITE, ORCH_CLIS, CliTurnError)
+from orch_cli import new_state as new_cli_state
+from orch_cli import result_of as cli_result
+from skills import SKILLS as TYPE_SKILLS
 from util import safe_name
 
 MEM_HEAVY_CHARS = 8000
@@ -94,10 +97,10 @@ def _arg(inp, *names):
             return v
     return None
 CLI_PROVIDERS = {"local", "local-codex", "local-gemini", "local-antigravity"}
-# …pero el MOTOR solo ejecuta Claude Code (`_run_cli_turn` → `find_claude()`). Los otros
-# tres entran igual por la rama CLI para que el turno falle con un mensaje que se
-# entiende, en vez de irse por la rama API a buscar una credencial que no existe.
-CLI_ENGINE_OK = {"local"}
+# …pero el MOTOR ejecuta los que tienen un perfil en `orch_cli.py` (hoy Claude Code y
+# Antigravity). Codex y Gemini entran igual por la rama CLI para que el rechazo hable del
+# CLI, en vez de irse por la rama API a buscar una credencial que no existe.
+CLI_ENGINE_OK = set(ORCH_CLIS)
 CLI_TIMEOUT = 15 * 60        # tope de un turno CLI
 
 
@@ -899,15 +902,25 @@ def _cli_sessions_path(ctx):
     return os.path.join(orch_dir(ctx["app_dir"], ctx["pid"]), "cli_sessions.json")
 
 
-def cli_session_get(ctx, node_id):
-    return (_read_json(_cli_sessions_path(ctx), {}) or {}).get(str(node_id))
+def cli_session_get(ctx, node_id, cli_key=None):
+    """La sesión guardada de ese agente, SI es del CLI que va a correr ahora.
+
+    Una sesión es de su CLI: el id de `--resume` de Claude Code no significa nada para el
+    `--conversation` de agy. Si al nodo le cambiaron el CLI, se arranca en frío en vez de
+    mandarle a un binario el id del otro (lo salvaba el reintento, pero gastando un turno).
+    Formato viejo (un string suelto) = sesión de Claude Code."""
+    v = (_read_json(_cli_sessions_path(ctx), {}) or {}).get(str(node_id))
+    if isinstance(v, dict):
+        return None if (cli_key and v.get("cli") != cli_key) else v.get("id")
+    return None if (cli_key and cli_key != "local") else v
 
 
-def cli_session_set(ctx, node_id, session_id):
+def cli_session_set(ctx, node_id, session_id, cli_key="local"):
     d = _read_json(_cli_sessions_path(ctx), {}) or {}
-    if d.get(str(node_id)) == session_id:
+    nuevo = {"cli": cli_key, "id": session_id}
+    if d.get(str(node_id)) == nuevo:
         return
-    d[str(node_id)] = session_id
+    d[str(node_id)] = nuevo
     _write_json(_cli_sessions_path(ctx), d)
 
 
@@ -1578,16 +1591,19 @@ def _new_frame(ctx, graph, run, node, entry_kind, initial_text, parent_id=None):
     # responder, y no queremos memoria dentro de la memoria.
     mem_b = mem_block(ctx, node)
     if provider in CLI_PROVIDERS:
-        if provider != "local":
-            raise OrchError(400, f"node «{node.get('titulo')}» uses '{provider}': as a CLI head "
-                                 "only Claude Code is supported for now (phase 4 v1)")
+        # valida acá —al crear el frame, antes de gastar un turno— que ese CLI se pueda
+        # ejecutar y que el confinamiento del nodo sea posible con él. El mismo chequeo
+        # está en `_run_cli_turn`, que es el que lanza el proceso.
+        cli = _cli_for(node)
         # retoma la sesión del AGENTE (no del frame): si ya laburó antes y no le
-        # limpiaron la memoria, sigue donde iba en vez de arrancar en frío
-        prev = cli_session_get(ctx, node["id"]) if _mem_on(node) else None
-        frame = {**base, "kind": "cli", "sessionId": prev}
+        # limpiaron la memoria, sigue donde iba en vez de arrancar en frío. La sesión es
+        # POR CLI: un `--resume` de Claude no vale como `--conversation` de agy.
+        prev = cli_session_get(ctx, node["id"], cli.key) if _mem_on(node) else None
+        frame = {**base, "kind": "cli", "cli": cli.key, "sessionId": prev}
         if prev:
             emit(run, "log", nodeId=node["id"],
-                 text=f"«{node.get('titulo') or node['id']}» resumes its CLI session (--resume)")
+                 text=f"«{node.get('titulo') or node['id']}» resumes its {cli.label} session "
+                      f"({cli.resume_flag})")
             mem_b = None          # ya está TODO en la sesión: mandarla sería duplicarla
     else:
         make_adapter(ctx, node)   # valida ya mismo que la key del proveedor esté
@@ -2291,17 +2307,8 @@ def _parse_control(text):
     return limpiar, final, "\n".join(visibles).strip()
 
 
-# tools que expone el MCP del editor (editor_mcp.py) según el permiso del recurso
-MCP_FS_READ = ["fs_tree", "fs_read", "fs_grep", "sv_list"]
-MCP_FS_WRITE = ["fs_write", "fs_edit", "fs_mkdir", "fs_rename", "fs_delete", "sv_save", "sv_restore"]
-MCP_FS_EXEC = ["fs_exec"]
-# nativas mínimas para tocar un diagrama-recurso cuando el agente está confinado:
-# su único --add-dir es el subdirectorio de ESE diagrama, así que quedan encerradas ahí
-CLI_DIAGRAM_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep"]
-# el shell de Claude Code son DOS tools según el sistema: `Bash` (POSIX) y `PowerShell`
-# (Windows). Nombrar solo Bash dejaba el shell abierto en Windows — y al revés, la
-# pre-aprobación del permiso `ejecutar` tiene que cubrir las dos.
-CLI_SHELL_TOOLS = ["Bash", "PowerShell"]
+# Las listas de tools y la detección de permisos denegados viven en `orch_cli.py`: son
+# "qué sabe hacer cada CLI", no reglas del motor. Se importan arriba.
 
 
 def _rm(path):
@@ -2312,135 +2319,91 @@ def _rm(path):
             pass
 
 
-# frases con las que Claude Code contesta un tool_use rechazado por permisos (headless:
-# la denegación es automática, no hay diálogo). Se buscan en minúsculas.
-CLI_DENIED_PATH = ("requested permissions", "haven't granted", "have not granted",
-                   "has not been granted", "permission denied", "not allowed to use",
-                   "permission to use")
-# un COMANDO denegado es otra cosa que un path denegado: `acceptEdits` auto-aprueba las
-# ediciones de archivo pero NO los comandos, y para los compuestos el CLI parte la línea
-# y marca la parte que necesita aprobación ("the following part requires approval: …")
-CLI_DENIED_CMD = ("requires approval", "contains multiple operations")
-
-
-def _denied_text(block):
-    """Si el bloque es un `tool_result` rechazado por permisos, devuelve
-    `(motivo, texto)` con motivo `"cmd"` (un comando sin aprobar) o `"path"`."""
-    if (block or {}).get("type") != "tool_result":
-        return None
-    c = block.get("content")
-    if isinstance(c, list):
-        c = " ".join(x.get("text", "") for x in c if isinstance(x, dict))
-    txt = (c if isinstance(c, str) else "").strip()
-    low = txt.lower()
-    if any(h in low for h in CLI_DENIED_CMD):
-        return "cmd", txt
-    if any(h in low for h in CLI_DENIED_PATH):
-        return "path", txt
-    return None
-
-
-def _cli_cmd(ctx, graph, node, frame, message, cli_bin):
+def _cli_cmd(ctx, graph, node, frame, message, cli_bin, cli=None):
     """(cmd, cwd, mcp_cfg_path) del turno CLI. Acá vive la decisión X: qué alcanza a
-    tocar el agente. El cwd ya NO es la carpeta del mirror (ver `_cli_workspace`)."""
+    tocar el agente. El cwd ya NO es la carpeta del mirror (ver `_cli_workspace`).
+
+    Lo que es del AGENTE (sus recursos, su system, su workspace) se calcula acá y viaja
+    en un `spec` neutral; cómo se dice eso en flags lo decide el perfil del CLI
+    (`orch_cli.py`), porque no todos aceptan lo mismo."""
+    cli = cli or ORCH_CLIS["local"]
     d = node.get("data") or {}
     confinado = bool(d.get("confinado"))
     notes, add_dirs, mcp, exec_ok = _cli_resource_notes(ctx, graph, node)
     system = _cli_system(ctx, graph, node, notes, exec_ok)
     ia = d.get("ia") or {}
-    kw = EFFORT_THINK.get(ia.get("effort") or "", "")
-    msg = message + (f"\n\n{kw}" if kw else "")
     cwd = _cli_workspace(ctx, node["id"])
     try:
-        install_skills(cwd)               # las skills viven en SU workspace, no en el mirror
+        # cada CLI lee las instrucciones en su formato: Claude en <workspace>/.claude/
+        # skills/, los demás en AGENTS.md. Van al workspace, no al mirror.
+        cli.install(cwd)
     except Exception:
         pass
-    cmd = [cli_bin, "-p", msg, "--output-format", "stream-json", "--verbose",
-           "--model", map_model(ia.get("model")), "--permission-mode", "acceptEdits",
-           "--append-system-prompt", system]
-    for x in add_dirs:
-        cmd += ["--add-dir", x]
-
-    cfg = None
-    if confinado:
-        # whitelist: SOLO las tools del MCP (una por editor, según permiso) y, si tiene
-        # diagramas cableados —o es un director, que alcanza su organigrama—, las nativas
-        # de archivo, que solo llegan a sus add_dirs.
-        servers, allowed = {}, []
-        for name, info in mcp.items():
-            servers[name] = {
-                **_self_cmd(),
-                "env": {"DMFS_URL": ctx.get("local_url") or "http://127.0.0.1:8765",
-                        "DMFS_TOKEN": ctx.get("local_token") or "",
-                        "DMFS_PROJECT": info["projectId"], "DMFS_AUTH": "local"},
-            }
-            tools = list(MCP_FS_READ)
-            if info["perm"] >= 1:
-                tools += MCP_FS_WRITE
-            if info["perm"] >= 2:
-                tools += MCP_FS_EXEC
-            allowed += [f"mcp__{name}__{t}" for t in tools]
-        if add_dirs:
-            allowed += CLI_DIAGRAM_TOOLS
-        if servers:
-            fd, cfg = tempfile.mkstemp(prefix=f"dmorch-mcp-{node['id']}-", suffix=".json")
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump({"mcpServers": servers}, f)
-            os.chmod(cfg, 0o600)          # tiene el token del backend local
-            cmd += ["--mcp-config", cfg]
-        # sin tools permitidas el agente no puede hacer NADA con archivos: igual puede
-        # razonar y responder, que es lo correcto para un nodo sin recursos cableados.
-        cmd += ["--allowedTools", ",".join(allowed)]
-        # `--allowedTools` es una lista de PRE-APROBACIÓN, no la lista de tools que
-        # existen (eso es `--tools`): sin reglas de negación el confinado igual tiene el
-        # shell nativo a mano. Se lo negamos explícitamente — su shell es `fs_exec`.
-        cmd += ["--disallowedTools"] + CLI_DISALLOWED + CLI_SHELL_TOOLS
-    else:
-        # blacklist: conserva su toolbelt nativo, acotado por los --add-dir de arriba.
-        # El shell es la vía de escape de los --add-dir, así que se lo damos SOLO si algún
-        # recurso suyo tiene permiso `ejecutar` — y son DOS tools (Bash y PowerShell:
-        # nombrar solo Bash dejaba el shell abierto en Windows).
-        off = list(CLI_DISALLOWED) + ([] if exec_ok else list(CLI_SHELL_TOOLS))
-        cmd += ["--disallowedTools"] + off
-        if exec_ok:
-            # tener la tool no alcanza: `acceptEdits` auto-aprueba las EDICIONES, no los
-            # comandos, así que headless cada comando que no sea de solo-lectura se
-            # auto-DENIEGA (un tester no podía ni levantar su server). El permiso
-            # `ejecutar` es justamente "puede correr comandos" ⇒ se pre-aprueban.
-            cmd += ["--allowedTools", ",".join(CLI_SHELL_TOOLS)]
-    if frame.get("sessionId"):
-        cmd += ["--resume", str(frame["sessionId"])]
+    spec = {
+        "node_id": node["id"],
+        "msg": message,
+        "system": system,
+        "model": ia.get("model"),
+        "effort": ia.get("effort"),
+        "add_dirs": add_dirs,
+        "confinado": confinado,
+        "mcp": mcp,
+        "mcp_env": {"url": ctx.get("local_url") or "http://127.0.0.1:8765",
+                    "token": ctx.get("local_token") or ""},
+        "exec_ok": exec_ok,
+        "session": frame.get("sessionId"),
+    }
+    cmd, cfg = cli.build(cli_bin, spec)
     return cmd, cwd, cfg
 
 
-def _run_cli_turn(ctx, graph, run, node, frame, message):
-    """Lanza `claude -p` para un turno del agente y devuelve (texto, session_id, costo)."""
-    # El motor corre SOLO Claude Code. Un nodo con otro CLI llegaba hasta acá igual y se
-    # lanzaba `claude --model gpt-5-codex` (o el id de Gemini/Antigravity, que map_model
-    # deja pasar tal cual porque no es opus/haiku/sonnet): el binario responde
-    # `unrecognized_model` y el run moría con "Claude Code returned an error: There's an
-    # issue with the selected model" — verificado contra claude 2.1.263. Nadie podía
-    # deducir de ahí que el problema era el CLI elegido en el nodo.
+def _cli_for(node):
+    """El perfil de CLI del nodo (`orch_cli.py`). Levanta OrchError si su provider no es
+    uno que el motor pueda EJECUTAR: la lista de la web ofrece los cuatro CLIs que el chat
+    sabe manejar, y el orquestador corre dos (ver el cuadro de capacidades del módulo)."""
     prov = ((node.get("data") or {}).get("ia") or {}).get("provider") or "local"
-    if prov not in CLI_ENGINE_OK:
-        raise OrchError(400, f"node «{node.get('titulo')}» is set to '{prov}', but the orchestrator "
-                             "runs its turns with Claude Code only. Pick «Claude Code (local CLI)» "
-                             "in the node, or an API provider. (The other CLIs do work in the chat.)")
-    cli_bin = find_claude()
+    cli = ORCH_CLIS.get(prov)
+    if not cli:
+        ok = ", ".join(f"«{c.label}»" for c in ORCH_CLIS.values())
+        raise OrchError(400, f"node «{node.get('titulo')}» is set to '{prov}', which the orchestrator "
+                             f"cannot run as a head: it needs a CLI that can mount the node's "
+                             f"resources (--add-dir). Supported: {ok}. (All four CLIs do work in the "
+                             f"chat, where the working folder is the project itself.)")
+    if (node.get("data") or {}).get("confinado") and not cli.can_confine:
+        raise OrchError(400, f"node «{node.get('titulo')}» is CONFINED, and confinement is built on "
+                             f"--mcp-config + --allowedTools, which {cli.label} does not have. Use "
+                             f"«Claude Code», or turn confinement off for this node.")
+    return cli
+
+
+def _run_cli_turn(ctx, graph, run, node, frame, message):
+    """Corre un turno del agente con SU CLI y devuelve (texto, session_id, costo).
+
+    El loop es común a todos (proceso, tope de tiempo, cancelación, limpieza del config
+    MCP); lo que cambia por CLI —los flags y cómo se lee su stream— vive en el perfil."""
+    cli = _cli_for(node)
+    cli_bin = cli.find()
     if not cli_bin:
-        raise OrchError(400, f"node «{node.get('titulo')}» uses Claude Code and the `claude` binary "
-                             "is not on this machine")
-    cmd, cwd, cfg = _cli_cmd(ctx, graph, node, frame, message, cli_bin)
+        raise OrchError(400, f"node «{node.get('titulo')}» uses {cli.label} and the "
+                             f"`{cli.bin_names[0]}` binary is not on this machine")
+    cmd, cwd, cfg = _cli_cmd(ctx, graph, node, frame, message, cli_bin, cli)
     try:
         proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, bufsize=1, encoding="utf-8", errors="replace")
     except Exception as e:
         _rm(cfg)
-        raise OrchError(400, f"no pude lanzar Claude Code: {e}")
+        raise OrchError(400, f"no pude lanzar {cli.label}: {e}")
     frame["_mcpCfg"] = cfg
     rt = _rt(ctx["pid"])
     rt["procs"][frame["id"]] = proc
-    session_id, result_text, texts, cost, deadline = None, None, [], 0.0, time.time() + CLI_TIMEOUT
+
+    def log(text, full=None):
+        with LOCK:
+            emit(run, "log", nodeId=node["id"], text=text,
+                 full=full[:FULL_CHARS] if full and len(full) > 200 else None)
+
+    st = new_cli_state()
+    deadline = time.time() + CLI_TIMEOUT
     try:
         for line in proc.stdout:
             if time.time() > deadline:
@@ -2453,48 +2416,26 @@ def _run_cli_turn(ctx, graph, run, node, frame, message):
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if obj.get("type") == "system" and obj.get("subtype") == "init":
-                session_id = obj.get("session_id") or session_id
-            elif obj.get("type") == "assistant":
-                for b in (obj.get("message", {}).get("content") or []):
-                    if b.get("type") == "text" and b.get("text"):
-                        texts.append(b["text"])
-                    elif b.get("type") == "tool_use":
-                        with LOCK:
-                            emit(run, "log", nodeId=node["id"], text=f"cli tool {b.get('name', '?')}")
-            elif obj.get("type") == "user":
-                # una tool DENEGADA por permisos no se ve en ningún lado: el CLI corre
-                # headless, así que no hay diálogo, el modelo recibe el rechazo y suele
-                # terminar preguntándole al humano que le "apruebe el permiso" (turnos
-                # pagados a cambio de nada). Se registra en el timeline con el porqué.
-                for b in (obj.get("message", {}).get("content") or []):
-                    hit = _denied_text(b)
-                    if hit:
-                        why, txt = hit
-                        head = ("cli COMMAND denied (headless: no dialog to approve; a command needs a "
-                                "resource with the «ejecutar» permission)" if why == "cmd" else
-                                "cli permission DENIED (headless: nobody can approve it — the path is "
-                                "outside its --add-dir)")
-                        with LOCK:
-                            emit(run, "log", nodeId=node["id"], text=f"{head}: {txt[:200]}",
-                                 full=txt[:FULL_CHARS] if len(txt) > 200 else None)
-            elif obj.get("type") == "result":
-                session_id = obj.get("session_id") or session_id
-                result_text = obj.get("result")
-                cost = obj.get("total_cost_usd") or 0.0
-                if obj.get("is_error"):
-                    proc.wait()
-                    raise OrchError(502, f"Claude Code returned an error: {result_text or '?'}")
+            try:
+                cli.feed(obj, st, log)
+            except CliTurnError as e:
+                # el CLI reportó el error DENTRO de su stream: se cierra el proceso antes
+                # de propagarlo (si no, queda el hijo escribiendo en un pipe que nadie lee)
+                proc.wait()
+                raise OrchError(e.status, e.message)
         proc.wait()
     finally:
         rt["procs"].pop(frame["id"], None)
         _rm(frame.pop("_mcpCfg", None))   # el config MCP lleva el token del backend local
     if run.get("_kill"):
         raise OrchError(400, "turno CLI cancelado")
-    if proc.returncode not in (0, None) and result_text is None:
+    text, session_id, cost = cli_result(st, cli)
+    # misma condición que antes del despacho por perfil: sin un `result` del CLI y con
+    # salida distinta de 0, el turno no llegó a terminar (el texto suelto no alcanza)
+    if proc.returncode not in (0, None) and st["result_text"] is None and not st["texts"]:
         err = (proc.stderr.read() or "").strip()[:400]
-        raise OrchError(502, f"Claude Code exited with code {proc.returncode}: {err}")
-    return (result_text or "\n\n".join(texts) or ""), session_id, cost
+        raise OrchError(502, f"{cli.label} exited with code {proc.returncode}: {err}")
+    return text, session_id, cost
 
 
 def _org_warn(run, node_id, text):
@@ -2607,9 +2548,10 @@ def _turn_cli(ctx, graph, run, frame):
         run["turns"] += 1
         if session_id:
             frame["sessionId"] = session_id
-            # persistida a nivel NODO: la próxima delegación la retoma
+            # persistida a nivel NODO (y con SU CLI): la próxima delegación la retoma
             if _mem_on(node):
-                cli_session_set(ctx, node["id"], session_id)
+                cli_session_set(ctx, node["id"], session_id,
+                                ((node.get("data") or {}).get("ia") or {}).get("provider") or "local")
         add_spend(run, node["id"], {"in": 0, "out": 0})
         if cost:
             for key in (str(node["id"]), "total"):
@@ -2962,7 +2904,7 @@ CLI_NATIVE_TOOLS = [
     ("WebFetch", "Fetches a URL."),
     ("WebSearch", "Searches the web."),
 ]
-CLI_DISALLOWED = ["WebFetch", "WebSearch"]
+# (CLI_DISALLOWED vive en orch_cli.py, junto al resto de las listas de tools)
 
 
 def _skill_catalog():
@@ -3175,9 +3117,10 @@ def inspect_node(ctx, node_id):
         "rearmed": True,          # system y tools se recalculan EN CADA TURNO
     }
     if is_cli:
-        # Cabeza CLI: no le mandamos tools JSON — usa las NATIVAS de Claude Code y
-        # el control va por protocolo de texto. El transcript vive en la sesión del
-        # CLI (--resume), no acá: por eso los frames CLI no tienen `messages`.
+        # Cabeza CLI: no le mandamos tools JSON — usa las NATIVAS de SU CLI y el control
+        # va por protocolo de texto. El transcript vive en la sesión del CLI (--resume /
+        # --conversation), no acá: por eso los frames CLI no tienen `messages`.
+        cli_prof = ORCH_CLIS.get(provider) or ORCH_CLIS["local"]
         confinado = bool(d.get("confinado"))
         notes, add_dirs, mcp, exec_ok = _cli_resource_notes(ctx, graph, node)
         cwd = _cli_workspace(ctx, node["id"])
@@ -3204,38 +3147,56 @@ def inspect_node(ctx, node_id):
                                       "subdirectories, so they reach nothing else."),
                              "tools": [{"name": n, "schema": {}, "description": "",
                                         "disabled": False} for n in CLI_DIAGRAM_TOOLS]})
-        else:
-            refs.append({"origin": "cli", "label": "Claude Code native tools",
+        elif cli_prof.can_confine:
+            refs.append({"origin": "cli", "label": f"{cli_prof.label} native tools",
                          "note": ("Declared by the CLI, not the engine, so they can change with its "
                                   "version — this is a reference. What the engine does fix are the "
                                   "flags: --permission-mode acceptEdits and --disallowedTools."),
                          "tools": [{"name": n, "description": de, "schema": {},
                                     "disabled": n in CLI_DISALLOWED or (n in CLI_SHELL_TOOLS and not exec_ok)}
                                    for n, de in CLI_NATIVE_TOOLS]})
+        else:
+            # un CLI sin --allowedTools/--disallowedTools: el motor NO puede apagarle
+            # tools sueltas, así que listar las de Claude acá sería mentir sobre lo que
+            # este agente tiene a mano. Se dice lo que sí es cierto.
+            refs.append({"origin": "cli", "label": f"{cli_prof.label} native tools",
+                         "note": (f"{cli_prof.label} has no per-tool flags, so the engine cannot turn "
+                                  "individual tools off: the agent keeps its whole toolbelt, bounded "
+                                  "by its --add-dir. Without a resource holding the «ejecutar» "
+                                  "permission it runs with --sandbox (restricted terminal)."),
+                         "tools": []})
         refs.append({"origin": "skills", "label": "Skills installed in its workspace",
-                     "note": ("`install_skills` writes them to <workspace>/.claude/skills/ before "
-                              "every turn: the agent reads them when it needs them. Not tools — "
+                     "note": (("`install_skills` writes them to <workspace>/.claude/skills/ before "
+                               "every turn" if cli_prof.can_confine else
+                               "written as AGENTS.md/GEMINI.md in its workspace before every turn") +
+                              ": the agent reads them when it needs them. Not tools — "
                               "they are knowledge (the schema of each diagram type)."),
                      "tools": [{"name": s["name"], "description": s["description"], "schema": {}}
                                for s in _skill_catalog()]})
-        off = (list(CLI_DISALLOWED) + list(CLI_SHELL_TOOLS) if confinado else
+        # sin flags por tool (agy) el motor no apaga ninguna: decirlo vacío es lo honesto
+        off = ([] if not cli_prof.can_confine else
+               list(CLI_DISALLOWED) + list(CLI_SHELL_TOOLS) if confinado else
                list(CLI_DISALLOWED) + ([] if exec_ok else list(CLI_SHELL_TOOLS)))
         base.update({
             "system": _cli_system(ctx, graph, node, notes, exec_ok),
-            "systemNote": ("Passed as --append-system-prompt ON EVERY TURN, whole. The transcript "
-                           "is NOT re-sent: Claude Code stores it and recovers it with "
-                           "--resume <sessionId>. The MEMORY is not in here either: it is delivered "
-                           "with the first message of a delegation, and NOT AT ALL when the session "
-                           "is resumed (it is already inside the session)."),
+            "systemNote": (("Passed as --append-system-prompt ON EVERY TURN, whole."
+                            if cli_prof.can_confine else
+                            f"{cli_prof.label} has no --append-system-prompt: it goes at the TOP OF "
+                            "THE PROMPT on every turn, whole.") +
+                           f" The transcript is NOT re-sent: the CLI stores it and recovers it with "
+                           f"{cli_prof.resume_flag} <sessionId>. The MEMORY is not in here either: it "
+                           "is delivered with the first message of a delegation, and NOT AT ALL when "
+                           "the session is resumed (it is already inside the session)."),
             # `toolGroups` es SOLO lo que el motor declara (para una cabeza CLI, nada).
             # Lo demás va en `refGroups`: existe y el agente lo usa, pero no lo manda
             # el motor — mantener la distinción es lo que hace confiable a este modal.
             "toolGroups": [],
             "refGroups": refs,
             "cli": {"addDirs": add_dirs, "workDir": cwd, "protocol": CLI_PROTOCOL,
+                    "bin": cli_prof.bin_names[0], "label": cli_prof.label,
                     # sesión del AGENTE: si hay una guardada, la próxima delegación la
                     # retoma con --resume en vez de arrancar en frío (y pagarlo)
-                    "session": cli_session_get(ctx, node["id"]) if _mem_on(node) else None,
+                    "session": cli_session_get(ctx, node["id"], cli_prof.key) if _mem_on(node) else None,
                     "sessionNote": ("The session is kept across delegations and is cut by «clear memory»."
                                     if _mem_on(node) else
                                     "Memory is off: every delegation starts a new session."),

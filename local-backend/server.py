@@ -69,7 +69,7 @@ DEFAULT_PORT = 8765
 # del orquestador necesitan la URL propia para hablarle al MCP del editor.
 PORT = DEFAULT_PORT
 NAME = "diagramind-local"
-VERSION = "0.33.6"   # el orquestador dice qué CLI corre en vez de morir con unrecognized_model
+VERSION = "0.33.7"   # el orquestador corre Claude Code y Antigravity, mezclados
 
 # ===================== rutas / disco =====================
 
