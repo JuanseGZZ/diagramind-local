@@ -93,7 +93,11 @@ def _arg(inp, *names):
         if v not in (None, ""):
             return v
     return None
-CLI_PROVIDERS = {"local", "local-codex", "local-gemini"}
+CLI_PROVIDERS = {"local", "local-codex", "local-gemini", "local-antigravity"}
+# …pero el MOTOR solo ejecuta Claude Code (`_run_cli_turn` → `find_claude()`). Los otros
+# tres entran igual por la rama CLI para que el turno falle con un mensaje que se
+# entiende, en vez de irse por la rama API a buscar una credencial que no existe.
+CLI_ENGINE_OK = {"local"}
 CLI_TIMEOUT = 15 * 60        # tope de un turno CLI
 
 
@@ -2411,6 +2415,17 @@ def _cli_cmd(ctx, graph, node, frame, message, cli_bin):
 
 def _run_cli_turn(ctx, graph, run, node, frame, message):
     """Lanza `claude -p` para un turno del agente y devuelve (texto, session_id, costo)."""
+    # El motor corre SOLO Claude Code. Un nodo con otro CLI llegaba hasta acá igual y se
+    # lanzaba `claude --model gpt-5-codex` (o el id de Gemini/Antigravity, que map_model
+    # deja pasar tal cual porque no es opus/haiku/sonnet): el binario responde
+    # `unrecognized_model` y el run moría con "Claude Code returned an error: There's an
+    # issue with the selected model" — verificado contra claude 2.1.263. Nadie podía
+    # deducir de ahí que el problema era el CLI elegido en el nodo.
+    prov = ((node.get("data") or {}).get("ia") or {}).get("provider") or "local"
+    if prov not in CLI_ENGINE_OK:
+        raise OrchError(400, f"node «{node.get('titulo')}» is set to '{prov}', but the orchestrator "
+                             "runs its turns with Claude Code only. Pick «Claude Code (local CLI)» "
+                             "in the node, or an API provider. (The other CLIs do work in the chat.)")
     cli_bin = find_claude()
     if not cli_bin:
         raise OrchError(400, f"node «{node.get('titulo')}» uses Claude Code and the `claude` binary "

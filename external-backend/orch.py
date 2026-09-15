@@ -87,7 +87,7 @@ def _arg(inp, *names):
         if v not in (None, ""):
             return v
     return None
-CLI_PROVIDERS = {"local", "local-codex", "local-gemini"}
+CLI_PROVIDERS = {"local", "local-codex", "local-gemini", "local-antigravity"}
 
 LOOP = None                   # event loop de FastAPI (para push_canonical desde threads)
 
